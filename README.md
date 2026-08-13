@@ -1,0 +1,139 @@
+# Refract
+
+**A protocol-first LLM aggregation API gateway.** A request enters as one protocol and exits as another — the four mainstream LLM protocols work interchangeably as both entry and exit, and upstream channels are modeled by protocol rather than by vendor.
+
+English · [简体中文](./README.zh-Hans.md)
+
+## Why not new-api
+
+new-api models channel types as a flat enum: OpenAI, Anthropic, Gemini, every cloud vendor, every relay site… each new upstream adds one enum value and one adapter. Channel type equals vendor, so a single relay that speaks two protocols needs two channels, and protocol translation logic is scattered across if/else branches in the relay layer.
+
+Refract's model is: **channel type = protocol**. There are only five:
+
+| Kind | Meaning |
+|---|---|
+| `chat` | OpenAI Chat Completions (`/v1/chat/completions`) |
+| `responses` | OpenAI Responses API (`/v1/responses`) |
+| `messages` | Anthropic Messages (`/v1/messages`) |
+| `gemini` | Google Gemini (`/v1beta/models/{model}:generateContent`) |
+| `aggregate` | Aggregate channel: mounts 1–4 protocol endpoints in one channel |
+
+Aggregate channels can express things new-api cannot: *"My relay offers both OpenAI and Anthropic protocols; the Anthropic line uses a different domain and a different key; claude models should always hit the native Anthropic endpoint first."*
+
+## Core features
+
+- **Protocol transcoding**: all four protocols convert through a unified IR (hub-and-spoke, not pairwise). Native requests only decode the `model`/`stream` routing fields; the full IR is built only for transcoding. With no alias or parameter override, request, response, and SSE bytes pass through unchanged. Each endpoint explicitly declares accepted inbound protocols.
+- **Flexible address construction**: each channel/endpoint can toggle "unofficial address" (custom base URL + version prefix + path, joined in three segments) and "full address" (the final URL is used verbatim — no joining, no validation).
+- **Per-endpoint configuration**: each protocol endpoint of an aggregate channel has its own address, credential, model set (with `alias=upstream_name` mapping), transcode policy, and priority order.
+- **Native-first routing**: a global switch. Off: routing semantics match new-api (pure priority). On: native protocol endpoints always outrank transcoded ones.
+- **Circuit breaking & health**: endpoints that fail consecutively are suspended with exponential backoff; upstream `Retry-After` headers are honored. State survives restarts and can be reset manually from the UI. Threshold and cooldown windows are configurable at runtime from Settings (threshold 0 disables the breaker).
+- **Request logs**: inbound/upstream protocol, transcoding, selected channel, retries, time-to-first-byte, and token usage are persisted, with per-model and per-key aggregation. Retention defaults to 30 days and is configurable from 1–3650 days. Every response carries an `x-refract-request-id` header that matches the log record.
+- **HTTP semantic passthrough**: native successes preserve the upstream status and end-to-end response headers while filtering hop-by-hop headers and stale streaming `Content-Length` values. A whitelist of client headers (`anthropic-beta`, `anthropic-version`, `openai-beta`, `x-title`, `http-referer`) is forwarded on native calls — never on transcoded ones.
+- **Soft token quotas per key**: each gateway API key can carry a token quota; exhausted keys are rejected at authentication time while in-flight requests finish normally.
+- **Operational probes & metrics**: public `/health/live`, `/health/ready` and Prometheus text-format `/metrics`.
+- **Configuration backup**: export/import channels, gateway keys and settings as one JSON document; restored keys keep working across instances. Merge and replace import modes.
+- **Single-binary deployment**: the built frontend is embedded into the binary; deploying is copying one file.
+- **Designed for one user, not hard-wired to one user**: every business table carries `owner_id`, authentication is a trait — adding multi-user later doesn't touch business logic.
+
+## Quick start
+
+Building requires Rust (2024-edition toolchain) and Node.js (pnpm):
+
+```sh
+# 1. Build the frontend (output in web/dist, embedded into the binary)
+cd web && pnpm install && pnpm run build && cd ..
+
+# 2. Build and run the gateway
+cargo run --release -p refract-server
+```
+
+Open http://127.0.0.1:3939 to reach the admin UI. After configuring a channel, point your clients at the gateway:
+
+```sh
+curl http://127.0.0.1:3939/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "your-model", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+The same model is reachable through other protocols too (as long as the serving endpoint has transcoding enabled for them):
+
+```sh
+# Anthropic Messages shape → gateway → Chat upstream
+curl http://127.0.0.1:3939/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model": "your-model", "max_tokens": 256, "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+Or run the production container with Compose:
+
+```sh
+cp .env.example .env
+# Replace REFRACT_ADMIN_TOKEN in .env
+docker compose up -d --build
+curl --fail http://127.0.0.1:3939/health/ready
+```
+
+Compose binds the host port to loopback only, runs as a non-root user with a read-only root filesystem, and stores SQLite in a named volume. See [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) for backup, restore, and upgrade procedures.
+
+## Gateway endpoints
+
+| Endpoint | Protocol |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/responses` | OpenAI Responses |
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1beta/models/{model}:generateContent` | Gemini (`...:streamGenerateContent` for streaming) |
+| `POST /v1/embeddings` | OpenAI Embeddings (passthrough to chat-protocol endpoints) |
+| `GET /v1/models` | Model list (derived from enabled channels) |
+| `GET /metrics` | Prometheus metrics (no auth, like the health probes) |
+
+Both streaming and non-streaming are supported. Gateway endpoints send permissive CORS headers so browser-based clients can call them directly. The admin UI lives under `/api/...`, uses a separate credential system from the gateway endpoints, and deliberately sends **no** CORS headers — the management surface is same-origin only.
+
+Embeddings have no cross-protocol translation (Anthropic has no such API and Gemini's shape differs), so they route only to chat-protocol endpoints: add the embedding model to a chat endpoint's model list and it becomes routable. Aliases, parameter overrides, retries and circuit breaking behave exactly like chat traffic.
+
+## Configuration
+
+`refract.toml` in the working directory (see [`refract.toml.example`](./refract.toml.example)); `REFRACT_*` environment variables take precedence:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `listen` | `127.0.0.1:3939` | Listen address. Localhost-only by default |
+| `database` | `refract.db` | SQLite file path |
+| `require_auth` | `false` | Whether gateway endpoints require an API key |
+| `admin_token` | none | Set or rotate the admin token at startup; inject it with `REFRACT_ADMIN_TOKEN` |
+| `upstream_timeout_secs` | `300` | Overall upstream request timeout (non-streaming) |
+| `stream_idle_timeout_secs` | `120` | Streaming: max wait for response headers, then max gap between frames |
+| `shutdown_grace_secs` | `30` | Graceful shutdown window before in-flight connections are aborted |
+| `proxy` | none | Outbound proxy (http/socks5) |
+
+**Security note**: the service refuses a non-loopback listener unless an admin token is configured and `require_auth=true`. `REFRACT_ADMIN_TOKEN` declaratively sets that token on every start; never commit its plaintext value.
+
+## Development
+
+One command starts both halves with hot reload (requires [`cargo-watch`](https://github.com/watchexec/cargo-watch): `cargo install cargo-watch`):
+
+```sh
+pnpm install   # first time only
+pnpm dev
+```
+
+- Backend on `127.0.0.1:3939` — recompiles and restarts on Rust/SQL changes.
+- Frontend on `localhost:5173` — Vite HMR, with `/api`, `/v1`, `/v1beta`, `/health` and `/metrics` proxied to the backend. Open this one in the browser.
+
+Commit gating is handled by [lefthook](https://lefthook.dev) (installed into `.git/hooks` automatically by `pnpm install`): every `git commit` runs a privacy scan (real emails / API keys / machine paths, see `scripts/privacy-check.sh`), auto-formatting for both ends (fixes are re-staged into the commit), and the quality gates (`vp check` + `clippy -D warnings`). For intentional demo values, mark the line with a `privacy-allow` comment.
+
+Full regression (hooks skip tests; run manually before releasing):
+
+```sh
+cargo test --workspace --all-targets --all-features --locked
+cd web
+pnpm run test:unit              # frontend unit tests
+pnpm run build
+pnpm run test:e2e               # full flows against the real server binary
+```
+
+Architecture details in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md); implementation rationale in [`docs/research/FOUNDATIONS.md`](./docs/research/FOUNDATIONS.md).
+
+## License
+
+[AGPL-3.0-only](./LICENSE). You are free to use and modify it; if you modify it and offer it to others as a network service, you must release your modifications under the same license.

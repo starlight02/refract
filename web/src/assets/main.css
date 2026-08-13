@@ -1,0 +1,576 @@
+@import 'tailwindcss';
+
+/*
+ * Refract 设计系统 —— macOS 26 液态玻璃。
+ *
+ * 液态玻璃不是「加个毛玻璃背景」那么简单。Apple 的实现有四个可分辨的层次，
+ * 缺任何一层看起来都会「像但不对」：
+ *
+ * 1. **折射**：材质会弯曲背后的内容，边缘尤其明显。用 backdrop-filter 的
+ *    blur + saturate 近似，再用内阴影模拟边缘的光线聚集。
+ * 2. **镜面高光**：顶部一道极淡的白色渐变，模拟环境光打在弧面上。
+ * 3. **深度**：外阴影不是灰色的，而是带环境色的 —— 纯灰阴影会让元素
+ *    看起来是贴在屏幕上，而不是浮在内容之上。
+ * 4. **响应**：hover/active 时高光位置与强度变化，暗示材质在物理上被按下。
+ *
+ * 这里把这四层做成可组合的工具类，而不是一个庞大的 `.glass` 类 ——
+ * 不同场景需要不同强度（侧栏要厚重，提示气泡要轻薄）。
+ */
+
+@theme {
+  /* ── 色板 ──
+   * 用 OKLCH 而非 HSL：OKLCH 的亮度是感知均匀的，调色阶时不会出现
+   * 「同样降 10% 亮度，蓝色看着掉一档、黄色掉三档」的问题。
+   *
+   * 画布是 Apple 的标准浅灰 #f5f5f7 —— 液态玻璃是「中性材质」，
+   * 画布一旦带彩色倾向，所有半透明层都会被染色，整体就从
+   * 「macOS 材质」滑向「web 渐变风」。色彩只允许出现在极光色斑里，
+   * 且强度必须收敛到「隐约可辨」。
+   */
+  --color-canvas: oklch(96.8% 0.003 260);
+  --color-canvas-deep: oklch(94% 0.005 260);
+  --color-ink: oklch(24% 0.012 260);
+  --color-ink-soft: oklch(48% 0.012 260);
+  --color-ink-faint: oklch(66% 0.01 260);
+
+  --color-accent: oklch(62% 0.19 264);
+  --color-accent-soft: oklch(72% 0.14 264);
+  --color-accent-deep: oklch(52% 0.2 264);
+
+  --color-success: oklch(68% 0.16 152);
+  --color-warning: oklch(76% 0.16 76);
+  --color-danger: oklch(62% 0.2 22);
+
+  /* 四种协议各有固定色，让用户在渠道列表里靠颜色扫读而不必读文字。 */
+  --color-proto-chat: oklch(68% 0.15 152);
+  --color-proto-responses: oklch(66% 0.17 264);
+  --color-proto-messages: oklch(70% 0.16 40);
+  --color-proto-gemini: oklch(68% 0.16 320);
+
+  /* ── 圆角 ──
+   * Apple 用的是连续曲率（squircle），不是标准圆角。CSS 没有原生支持，
+   * 但把圆角取得比直觉更大能逼近那种柔和感。
+   */
+  --radius-glass: 1rem;
+  --radius-glass-lg: 1.375rem;
+  --radius-pill: 999px;
+
+  /* ── 动效 ──
+   * 三条曲线覆盖全部场景。统一曲线是「感觉像一个产品」的最低成本手段。
+   */
+  --ease-glass: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+
+  --duration-fast: 150ms;
+  --duration-base: 260ms;
+  --duration-slow: 420ms;
+}
+
+/* ── 材质 token ──
+ * 液态玻璃的质感不是「一层毛玻璃背景」，而是一组光学层的叠加。
+ * 每块玻璃由六层构成（自内向外）：
+ *   edge-top  顶部 1px 白线 —— 光源从上方打在弧面顶部
+ *   edge      全周 0.5px 白描边 —— 玻璃切面的受光边缘
+ *   glow      底部内侧的白色泛光 —— 环境光从下方透入材质
+ *   rim       全周 1px 暗轮廓 —— 材质与空气的折射率分界
+ *   shadow    近距离小阴影 —— 贴地的接触阴影
+ *   shadow-far 远距离大扩散阴影 —— 悬浮高度
+ * 深色下白光全部大幅收暗但不消失（材质仍然透光），暗轮廓与阴影加深。
+ */
+@layer base {
+  :root {
+    --glass-bg: oklch(100% 0 0 / 0.5);
+    --glass-bg-thick: oklch(100% 0 0 / 0.62);
+    --glass-edge-top: oklch(100% 0 0 / 0.95);
+    --glass-edge: oklch(100% 0 0 / 0.6);
+    --glass-glow: oklch(100% 0 0 / 0.7);
+    --glass-rim: oklch(0% 0 0 / 0.04);
+    --glass-shadow: oklch(0% 0 0 / 0.06);
+    --glass-shadow-far: oklch(0% 0 0 / 0.15);
+    --glass-sheen: oklch(100% 0 0 / 0.55);
+    --glass-sheen-foot: oklch(100% 0 0 / 0.1);
+  }
+
+  .dark {
+    --color-canvas: oklch(17% 0.008 260);
+    --color-canvas-deep: oklch(13% 0.01 260);
+    --color-ink: oklch(94% 0.006 260);
+    --color-ink-soft: oklch(72% 0.01 260);
+    --color-ink-faint: oklch(58% 0.01 260);
+
+    --glass-bg: oklch(30% 0.012 260 / 0.5);
+    --glass-bg-thick: oklch(26% 0.014 260 / 0.68);
+    --glass-edge-top: oklch(100% 0 0 / 0.16);
+    --glass-edge: oklch(100% 0 0 / 0.08);
+    --glass-glow: oklch(100% 0 0 / 0.05);
+    --glass-rim: oklch(0% 0 0 / 0.4);
+    --glass-shadow: oklch(0% 0 0 / 0.35);
+    --glass-shadow-far: oklch(0% 0 0 / 0.5);
+    --glass-sheen: oklch(100% 0 0 / 0.1);
+    --glass-sheen-foot: oklch(100% 0 0 / 0.03);
+  }
+
+  html {
+    color-scheme: light dark;
+    font-size: 100%;
+    line-height: 1.5;
+  }
+
+  body {
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family:
+      -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', 'PingFang SC', 'Hiragino Sans GB',
+      system-ui, sans-serif;
+    /* 光学字重补偿：SF 在深色背景上视觉偏粗，抗锯齿设置能拉回来。 */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* 禁止横向滚动：玻璃元素的阴影会溢出，不锁的话会出现莫名的滚动条。 */
+    overflow-x: hidden;
+    letter-spacing: 0;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    letter-spacing: 0;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  /* 数字用等宽字形：日志和统计表里的数字必须能竖直对齐，
+   * 否则扫读时对不上列。 */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+  }
+}
+
+@layer components {
+  /* ── 画布背景：极光色斑 ──
+   * 液态玻璃的前提是背后有东西可「透」—— 纯色画布上 backdrop-filter 的
+   * blur 与 saturate 完全不可见。但色斑只能「隐约可辨」：一旦抢眼，
+   * 整个界面就从「中性材质浮在壁纸上」变成「粉彩渐变海报」。
+   * 静态而非动画：背景一动，前景所有半透明层都在闪，读不了内容。 */
+  .canvas-aurora {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(50% 58% at 12% 14%, oklch(90% 0.05 264 / 0.4) 0%, transparent 100%),
+      radial-gradient(44% 50% at 88% 12%, oklch(91% 0.042 320 / 0.32) 0%, transparent 100%),
+      radial-gradient(54% 60% at 78% 88%, oklch(91% 0.04 210 / 0.32) 0%, transparent 100%),
+      radial-gradient(46% 52% at 16% 88%, oklch(92% 0.032 152 / 0.28) 0%, transparent 100%),
+      var(--color-canvas);
+  }
+
+  .dark .canvas-aurora {
+    background:
+      radial-gradient(50% 58% at 12% 14%, oklch(30% 0.05 270 / 0.5) 0%, transparent 100%),
+      radial-gradient(44% 50% at 88% 12%, oklch(28% 0.045 320 / 0.4) 0%, transparent 100%),
+      radial-gradient(54% 60% at 78% 88%, oklch(27% 0.04 220 / 0.42) 0%, transparent 100%),
+      radial-gradient(46% 52% at 16% 88%, oklch(27% 0.035 160 / 0.35) 0%, transparent 100%),
+      var(--color-canvas);
+  }
+
+  /* ── 基础玻璃材质（卡片、列表项）──
+   * 描边不用 border 而用两层 inset shadow：0.5px 白描边是玻璃切面的
+   * 受光边，1px 暗轮廓是折射率分界。border 只能给一层且最小 1px，
+   * 表现出来是一圈呆板的白框 —— 这正是「像但不对」的主要来源。 */
+  .glass {
+    position: relative;
+    isolation: isolate;
+    background: var(--glass-bg);
+    /* saturate 是关键：只 blur 会让背后的颜色发灰，
+     * 提饱和才有「透过一层有厚度的介质看东西」的感觉。 */
+    backdrop-filter: blur(16px) saturate(180%);
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+    border-radius: var(--radius-glass);
+    box-shadow:
+      inset 0 1px 0 var(--glass-edge-top),
+      inset 0 0 0 0.5px var(--glass-edge),
+      inset 0 0 0 1px var(--glass-rim),
+      0 3px 8px var(--glass-shadow),
+      0 12px 28px -10px var(--glass-shadow-far);
+  }
+
+  /* 厚玻璃：侧栏、顶栏、模态这类结构性表面。比卡片多一层
+   * 底部内侧泛光（环境光从下方透入），悬浮高度也更高。 */
+  .glass-thick {
+    position: relative;
+    isolation: isolate;
+    background: var(--glass-bg-thick);
+    backdrop-filter: blur(32px) saturate(190%);
+    -webkit-backdrop-filter: blur(32px) saturate(190%);
+    border-radius: var(--radius-glass-lg);
+    box-shadow:
+      inset 0 1px 0 var(--glass-edge-top),
+      inset 0 0 0 0.5px var(--glass-edge),
+      inset 0 -20px 40px -32px var(--glass-glow),
+      inset 0 0 0 1px var(--glass-rim),
+      0 2px 6px var(--glass-shadow),
+      0 24px 64px -18px var(--glass-shadow-far);
+  }
+
+  /* 镜面高光层：不是单向的「顶部一道光」，而是上亮下微亮的双向
+   * 渐变 —— 弧面顶部受直射光，底部接收环境反光，中段最透。
+   * z-index: -1 让它画在容器背景之上、内容之下（容器 isolation:
+   * isolate 保证 -1 不会穿到画布层）。 */
+  .glass-specular::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: linear-gradient(
+      180deg,
+      var(--glass-sheen) 0%,
+      oklch(from var(--glass-sheen) l c h / calc(alpha * 0.25)) 12%,
+      transparent 34%,
+      transparent 82%,
+      var(--glass-sheen-foot) 100%
+    );
+    pointer-events: none;
+    transition: opacity var(--duration-base) var(--ease-glass);
+  }
+
+  /* 可交互的玻璃：hover 抬升、active 压下。
+   * 位移量刻意很小（1px）—— 大了就从「材质响应」变成「元素在跳」。 */
+  .glass-interactive {
+    transition:
+      transform var(--duration-base) var(--ease-glass),
+      box-shadow var(--duration-base) var(--ease-glass),
+      background var(--duration-base) var(--ease-glass);
+    will-change: transform;
+  }
+
+  .glass-interactive:hover {
+    transform: translateY(-1px);
+    box-shadow:
+      inset 0 1px 0 var(--glass-edge-top),
+      inset 0 0 0 0.5px var(--glass-edge),
+      inset 0 0 0 1px var(--glass-rim),
+      0 6px 14px var(--glass-shadow),
+      0 18px 40px -12px var(--glass-shadow-far);
+  }
+
+  .glass-interactive:active {
+    transform: translateY(0) scale(0.995);
+    transition-duration: var(--duration-fast);
+  }
+
+  /* 输入控件：与浮起的玻璃相反，输入框是「凹进材质里的槽」——
+   * 内阴影下压，底缘一线外侧白光是凹槽下沿的受光边。 */
+  .glass-field {
+    background: oklch(100% 0 0 / 0.42);
+    backdrop-filter: blur(10px) saturate(150%);
+    -webkit-backdrop-filter: blur(10px) saturate(150%);
+    border: 1px solid oklch(0% 0 0 / 0.07);
+    border-radius: 0.625rem;
+    box-shadow:
+      inset 0 1px 2px oklch(0% 0 0 / 0.05),
+      0 1px 0 oklch(100% 0 0 / 0.55);
+    transition:
+      border-color var(--duration-fast) var(--ease-glass),
+      box-shadow var(--duration-fast) var(--ease-glass);
+  }
+
+  .dark .glass-field {
+    background: oklch(0% 0 0 / 0.24);
+    border-color: oklch(100% 0 0 / 0.09);
+    box-shadow: inset 0 1px 2px oklch(0% 0 0 / 0.3);
+  }
+
+  .glass-field:focus-within {
+    border-color: var(--color-accent-soft);
+    box-shadow:
+      inset 0 1px 2px oklch(0% 0 0 / 0.04),
+      0 0 0 3px oklch(from var(--color-accent) l c h / 0.16);
+  }
+
+  /* 主操作按钮：accent 渐变芯 + 完整的玻璃光学层 ——
+   * 顶部白线、0.5px 白描边、底部内泛光、深色轮廓、双层投影，
+   * 再叠一层 ::before 白色高光渐变。少任何一层都会退回「网页蓝按钮」。 */
+  .glass-button-primary {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+    background: linear-gradient(180deg, var(--color-accent-soft) 0%, var(--color-accent) 100%);
+    color: white;
+    border: 0;
+    border-radius: var(--radius-pill);
+    box-shadow:
+      inset 0 1px 0 oklch(100% 0 0 / 0.42),
+      inset 0 0 0 0.5px oklch(100% 0 0 / 0.22),
+      inset 0 -8px 14px -10px oklch(100% 0 0 / 0.5),
+      inset 0 0 0 1px oklch(from var(--color-accent-deep) l c h / 0.45),
+      0 4px 10px oklch(from var(--color-accent) l c h / 0.3),
+      0 12px 26px -8px oklch(from var(--color-accent) l c h / 0.42);
+    transition:
+      transform var(--duration-fast) var(--ease-glass),
+      box-shadow var(--duration-base) var(--ease-glass),
+      filter var(--duration-fast) var(--ease-glass);
+  }
+
+  .glass-button-primary::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    pointer-events: none;
+    background: linear-gradient(
+      180deg,
+      oklch(100% 0 0 / 0.5) 0%,
+      oklch(100% 0 0 / 0.12) 32%,
+      transparent 55%,
+      oklch(100% 0 0 / 0.08) 100%
+    );
+  }
+
+  .glass-button-primary:hover {
+    filter: brightness(1.05);
+    box-shadow:
+      inset 0 1px 0 oklch(100% 0 0 / 0.5),
+      inset 0 0 0 0.5px oklch(100% 0 0 / 0.28),
+      inset 0 -9px 15px -10px oklch(100% 0 0 / 0.6),
+      inset 0 0 0 1px oklch(from var(--color-accent-deep) l c h / 0.5),
+      0 8px 16px oklch(from var(--color-accent) l c h / 0.36),
+      0 17px 34px -8px oklch(from var(--color-accent) l c h / 0.5);
+  }
+
+  .glass-button-primary:active {
+    transform: scale(0.97);
+    filter: brightness(0.97);
+  }
+
+  /* 次要操作按钮：胶囊 ghost。
+   * macOS 的按钮语言里，行内次要操作是「透明底、悬停出现浅色胶囊」，
+   * 纯文字链接式按钮属于网页语汇，与玻璃面板放在一起会显得杂。 */
+  .glass-button-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius-pill);
+    background: transparent;
+    color: var(--color-ink-soft);
+    cursor: pointer;
+    transition:
+      background-color var(--duration-fast) var(--ease-glass),
+      border-color var(--duration-fast) var(--ease-glass),
+      color var(--duration-fast) var(--ease-glass),
+      transform var(--duration-fast) var(--ease-glass);
+  }
+
+  /* ghost 悬停不是「铺一层灰」而是「浮出一片薄玻璃」：
+   * 半透明白底 + 顶部白线 + 微投影，材质语言与面板一致。 */
+  .glass-button-ghost:hover {
+    background: oklch(100% 0 0 / 0.42);
+    color: var(--color-ink);
+    box-shadow:
+      inset 0 1px 0 oklch(100% 0 0 / 0.85),
+      inset 0 0 0 0.5px oklch(100% 0 0 / 0.5),
+      0 2px 6px oklch(0% 0 0 / 0.07);
+  }
+
+  .dark .glass-button-ghost:hover {
+    background: oklch(100% 0 0 / 0.09);
+    box-shadow:
+      inset 0 1px 0 oklch(100% 0 0 / 0.12),
+      0 2px 6px oklch(0% 0 0 / 0.3);
+  }
+
+  .glass-button-ghost:active {
+    transform: scale(0.96);
+  }
+
+  .glass-button-ghost:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  /* 危险变体：默认安静，悬停时才显露危险色 —— 删除不该在视觉上喊叫。 */
+  .glass-button-ghost-danger:hover,
+  .dark .glass-button-ghost-danger:hover {
+    background: oklch(from var(--color-danger) l c h / 0.12);
+    color: var(--color-danger);
+    box-shadow:
+      inset 0 1px 0 oklch(100% 0 0 / 0.4),
+      inset 0 0 0 1px oklch(from var(--color-danger) l c h / 0.25),
+      0 2px 6px oklch(from var(--color-danger) l c h / 0.15);
+  }
+
+  /* 导航/分段控件的选中态：一枚浮起的薄玻璃胶囊。
+   * 选中不靠色块而靠「材质浮起」表达 —— 这是 macOS 26+ 的
+   * 侧栏与分段控件语言，色彩只出现在文字上。 */
+  .glass-tab-active {
+    background: oklch(100% 0 0 / 0.65);
+    box-shadow:
+      inset 0 1px 0 oklch(100% 0 0 / 0.95),
+      inset 0 0 0 0.5px oklch(100% 0 0 / 0.55),
+      0 1px 1px oklch(0% 0 0 / 0.04),
+      0 3px 8px oklch(0% 0 0 / 0.08);
+  }
+
+  .dark .glass-tab-active {
+    background: oklch(100% 0 0 / 0.1);
+    box-shadow:
+      inset 0 1px 0 oklch(100% 0 0 / 0.14),
+      0 1px 3px oklch(0% 0 0 / 0.3);
+  }
+
+  /* ── 开关：iOS/macOS 的凹槽 + 浮起白珠 ──
+   * 未选中是「凹进面板的暗槽」（内阴影 + 底缘白光），选中态灌入
+   * 带光泽的色液（渐变 + 顶部白光 + 底部深色内影）。 */
+  .glass-switch {
+    border-radius: var(--radius-pill);
+    background: oklch(50% 0.01 260 / 0.16);
+    box-shadow:
+      inset 0 1px 3px oklch(0% 0 0 / 0.16),
+      inset 0 0 0 0.5px oklch(0% 0 0 / 0.06),
+      0 1px 0 oklch(100% 0 0 / 0.85);
+    transition:
+      background var(--duration-base) var(--ease-glass),
+      box-shadow var(--duration-base) var(--ease-glass);
+  }
+
+  .dark .glass-switch {
+    background: oklch(70% 0.01 260 / 0.22);
+    box-shadow:
+      inset 0 1px 3px oklch(0% 0 0 / 0.4),
+      inset 0 0 0 0.5px oklch(0% 0 0 / 0.2);
+  }
+
+  .glass-switch-on-success,
+  .dark .glass-switch-on-success {
+    background: linear-gradient(
+      180deg,
+      oklch(76% 0.19 150 / 0.96) 0%,
+      oklch(67% 0.19 150 / 0.96) 100%
+    );
+    box-shadow:
+      inset 0 1px 2px oklch(100% 0 0 / 0.5),
+      inset 0 -1px 3px oklch(40% 0.12 152 / 0.35),
+      inset 0 0 0 0.5px oklch(40% 0.12 152 / 0.3),
+      0 1px 3px oklch(60% 0.17 152 / 0.4);
+  }
+
+  .glass-switch-on-accent,
+  .dark .glass-switch-on-accent {
+    background: linear-gradient(
+      180deg,
+      oklch(68% 0.17 264 / 0.96) 0%,
+      oklch(58% 0.19 264 / 0.96) 100%
+    );
+    box-shadow:
+      inset 0 1px 2px oklch(100% 0 0 / 0.5),
+      inset 0 -1px 3px oklch(38% 0.14 264 / 0.35),
+      inset 0 0 0 0.5px oklch(38% 0.14 264 / 0.3),
+      0 1px 3px oklch(55% 0.17 264 / 0.4);
+  }
+
+  .glass-switch-thumb {
+    background: linear-gradient(180deg, oklch(100% 0 0) 0%, oklch(96% 0.002 260) 100%);
+    box-shadow:
+      0 0 0 0.5px oklch(0% 0 0 / 0.04),
+      inset 0 1px 0 oklch(100% 0 0),
+      0 1px 2px oklch(0% 0 0 / 0.12),
+      0 3px 8px oklch(0% 0 0 / 0.18);
+  }
+
+  /* 协议徽章：靠颜色区分四种协议。 */
+  .proto-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.15rem 0.6rem;
+    border-radius: var(--radius-pill);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0;
+    border: 1px solid currentColor;
+    background: oklch(from currentColor l c h / 0.12);
+  }
+}
+
+@layer utilities {
+  /* 尊重「减少动效」偏好。
+   * 这不是可选的礼貌：前庭功能障碍的用户会因为大范围动画产生生理不适。
+   * 但也不是全关 —— 保留极短的透明度过渡，否则界面会显得「断裂」。 */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+
+    .glass-interactive:hover {
+      transform: none;
+    }
+  }
+
+  @media (prefers-reduced-transparency: reduce) {
+    :root {
+      --glass-bg: oklch(99% 0.004 250 / 0.97);
+      --glass-bg-thick: oklch(99% 0.004 250 / 0.99);
+    }
+
+    .dark {
+      --glass-bg: oklch(22% 0.014 260 / 0.97);
+      --glass-bg-thick: oklch(19% 0.014 260 / 0.99);
+    }
+
+    .glass,
+    .glass-thick,
+    .glass-field {
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+  }
+
+  @media (prefers-contrast: more) {
+    /* 玻璃的描边由 inset shadow 承担，高对比度下换成实线轮廓。 */
+    .glass,
+    .glass-thick {
+      background: var(--color-canvas);
+      box-shadow: inset 0 0 0 1px currentColor;
+    }
+
+    .glass-field {
+      border-color: currentColor;
+    }
+
+    /* 高对比度下彩色背景只会降低文字与面板的对比，直接铺纯色。 */
+    .canvas-aurora,
+    .dark .canvas-aurora {
+      background: var(--color-canvas);
+    }
+  }
+
+  /* backdrop-filter 的降级：Firefox 早期版本与部分环境不支持。
+   * 不做降级的话玻璃会变成完全透明，文字直接叠在背景上没法读。 */
+  @supports not (backdrop-filter: blur(1px)) {
+    .glass,
+    .glass-thick,
+    .glass-field {
+      background: oklch(99% 0.005 250 / 0.92);
+    }
+
+    .dark .glass,
+    .dark .glass-thick,
+    .dark .glass-field {
+      background: oklch(24% 0.02 260 / 0.94);
+    }
+  }
+}

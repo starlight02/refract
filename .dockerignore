@@ -1,0 +1,14 @@
+.git
+.github
+.pnpm-store
+target
+node_modules
+web/node_modules
+web/dist
+web/test-results
+web/playwright-report
+*.db
+*.db-shm
+*.db-wal
+.env
+refract.toml

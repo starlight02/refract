@@ -1,0 +1,24 @@
+[package]
+name = "refract-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+refract-api = { workspace = true }
+refract-core = { workspace = true }
+refract-store = { workspace = true }
+refract-upstream = { workspace = true }
+anyhow = { workspace = true }
+figment = { workspace = true }
+mimalloc = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# warp 0.4 的 `default = []`，`warp::serve` / `warp::Server` 在 `server` feature 后面。
+warp = { workspace = true, features = ["server"] }
+
+[lints]
+workspace = true

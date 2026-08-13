@@ -1,0 +1,35 @@
+# Git 提交前门禁：隐私检查 + 自动格式化 + 代码质量检查，前后端全覆盖。
+# 安装：pnpm install 会经根 package.json 的 prepare 脚本自动 `lefthook install`。
+#
+# 串行而非并行：两个 fmt 任务都会改文件并把修复回填暂存区（stage_fixed），
+# 并行时 git index 会撞锁。顺序按耗时排 —— 隐私秒级、前端秒级、clippy 增量最慢。
+pre-commit:
+  parallel: false
+  jobs:
+    # 1) 隐私门禁：真实邮箱、API 密钥、本机绝对路径。规则见脚本头注释。
+    - name: privacy
+      run: sh scripts/privacy-check.sh
+
+    # 2) 前端格式化：vp fmt 就地修复暂存文件，并回填到本次提交。
+    - name: web fmt
+      root: "web/"
+      glob: "*.{ts,tsx,vue,css,json,md,html}"
+      run: pnpm exec vp fmt {staged_files}
+      stage_fixed: true
+
+    # 3) 前端质量门禁：oxlint + 类型检查（与 CI 的 web check 一致）。
+    - name: web check
+      root: "web/"
+      glob: "*.{ts,tsx,vue,css,json,html}"
+      run: pnpm exec vp check .
+
+    # 4) 后端格式化：cargo fmt 就地修复并回填。
+    - name: rust fmt
+      glob: "*.rs"
+      run: cargo fmt --all
+      stage_fixed: true
+
+    # 5) 后端质量门禁：clippy 全目标全特性，warning 即失败（等同 CI）。
+    - name: rust clippy
+      glob: "{*.rs,Cargo.toml,Cargo.lock}"
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings

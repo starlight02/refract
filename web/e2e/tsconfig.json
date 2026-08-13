@@ -1,0 +1,10 @@
+{
+  "extends": "@tsconfig/node24/tsconfig.json",
+  "include": ["./**/*"],
+  "compilerOptions": {
+    // 用例文件一半跑在 Node（http 假上游），一半通过 page.evaluate
+    // 跑在浏览器（fetch/localStorage）。两边的类型都要给齐。
+    "types": ["node"],
+    "lib": ["es2023", "dom", "dom.iterable"]
+  }
+}

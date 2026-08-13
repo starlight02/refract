@@ -1,0 +1,25 @@
+services:
+  refract:
+    build:
+      context: .
+    image: refract:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3939:3939"
+    environment:
+      REFRACT_LISTEN: 0.0.0.0:3939
+      REFRACT_DATABASE: /data/refract.db
+      REFRACT_REQUIRE_AUTH: "true"
+      REFRACT_ADMIN_TOKEN: ${REFRACT_ADMIN_TOKEN:?set REFRACT_ADMIN_TOKEN in .env}
+      REFRACT_LOG: ${REFRACT_LOG:-info}
+    volumes:
+      - refract-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  refract-data:

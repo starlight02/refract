@@ -1,0 +1,26 @@
+{
+  "name": "refract",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "dev": "concurrently --kill-others --names server,web --prefix-colors yellow,cyan \"pnpm run dev:server\" \"pnpm run dev:web\"",
+    "dev:server": "cargo watch --watch crates --watch Cargo.toml --exec 'run -p refract-server'",
+    "dev:web": "pnpm --dir web dev",
+    "prepare": "git rev-parse --is-inside-work-tree >/dev/null 2>&1 && lefthook install || true"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.4",
+    "lefthook": "^2.1.9"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.21.0",
+      "onFail": "download"
+    }
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.12.0"
+  }
+}

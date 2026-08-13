@@ -1,0 +1,38 @@
+allowBuilds:
+  vue-demi: true
+catalog:
+  vite: npm:@voidzero-dev/vite-plus-core@0.2.8
+  vite-plus: 0.2.8
+minimumReleaseAgeExclude:
+  - '@vue/compiler-core@3.6.0-rc.3'
+  - '@vue/compiler-dom@3.6.0-rc.3'
+  - '@vue/compiler-sfc@3.6.0-rc.3'
+  - '@vue/compiler-ssr@3.6.0-rc.3'
+  - '@vue/compiler-vapor@3.6.0-rc.3'
+  - '@vue/reactivity@3.6.0-rc.3'
+  - '@vue/runtime-core@3.6.0-rc.3'
+  - '@vue/runtime-dom@3.6.0-rc.3'
+  - '@vue/runtime-vapor@3.6.0-rc.3'
+  - '@vue/server-renderer@3.6.0-rc.3'
+  - '@vue/shared@3.6.0-rc.3'
+  - vue@3.6.0-rc.3
+overrides:
+  '@vue/compat': 3.6.0-rc.3
+  '@vue/compiler-core': 3.6.0-rc.3
+  '@vue/compiler-dom': 3.6.0-rc.3
+  '@vue/compiler-sfc': 3.6.0-rc.3
+  '@vue/compiler-ssr': 3.6.0-rc.3
+  '@vue/compiler-vapor': 3.6.0-rc.3
+  '@vue/reactivity': 3.6.0-rc.3
+  '@vue/runtime-core': 3.6.0-rc.3
+  '@vue/runtime-dom': 3.6.0-rc.3
+  '@vue/runtime-vapor': 3.6.0-rc.3
+  '@vue/server-renderer': 3.6.0-rc.3
+  '@vue/shared': 3.6.0-rc.3
+  vite: 'catalog:'
+  vue: 3.6.0-rc.3
+peerDependencyRules:
+  allowAny:
+    - vite
+  allowedVersions:
+    vite: '*'

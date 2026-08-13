@@ -1,0 +1,35 @@
+[package]
+name = "refract-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+refract-core = { workspace = true }
+refract-protocol = { workspace = true }
+refract-store = { workspace = true }
+refract-upstream = { workspace = true }
+arc-swap = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+pretty_assertions = { workspace = true }
+wiremock = { workspace = true }
+futures = { workspace = true }
+refract-upstream = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+
+[lints]
+workspace = true

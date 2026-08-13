@@ -1,0 +1,115 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/refract-core",
+    "crates/refract-protocol",
+    "crates/refract-store",
+    "crates/refract-upstream",
+    "crates/refract-router",
+    "crates/refract-api",
+    "crates/refract-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "AGPL-3.0-only"
+repository = "https://github.com/starshine/refract"
+authors = ["星光の殲滅者 <starshine@aili.moe>"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# `GatewayError` 携带渠道归属、HTTP 状态与 Retry-After 等排障上下文，
+# 刚好越过 clippy 的 128 字节阈值。错误路径是冷路径，为此把所有
+# `Result` 改成 `Box<GatewayError>` 只会污染每一处 `?`。
+result_large_err = "allow"
+
+[workspace.dependencies]
+# internal
+refract-core = { path = "crates/refract-core" }
+refract-protocol = { path = "crates/refract-protocol" }
+refract-store = { path = "crates/refract-store" }
+refract-upstream = { path = "crates/refract-upstream" }
+refract-router = { path = "crates/refract-router" }
+refract-api = { path = "crates/refract-api" }
+
+# async runtime & http
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+warp = { version = "0.4.3", default-features = false }
+hyper = "1.11"
+http = "1.5"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "webpki-roots", "system-proxy", "socks", "http2", "charset"] }
+bytes = "1.12"
+futures = "0.3"
+futures-util = "0.3"
+mime_guess = "2.0"
+
+# serde
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
+serde_with = "3.15"
+
+# storage
+# 不开 TLS feature：只连本地 SQLite 文件，不走网络。带上 tls-rustls-ring
+# 会把 ring 整套链进来，与 reqwest 的 aws-lc 形成两份重复的加密库。
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "json", "chrono", "uuid", "migrate"] }
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# errors
+thiserror = "2.0"
+anyhow = "1.0"
+
+# util
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
+dashmap = "6.2"
+arc-swap = "1.7"
+parking_lot = "0.12"
+rand = "0.10"
+base64 = "0.23"
+sha2 = "0.10"
+hex = "0.4"
+url = "2.5"
+figment = { version = "0.10", features = ["toml", "env"] }
+eventsource-stream = "0.2"
+rust-embed = { version = "8.9", features = ["mime-guess"] }
+mimalloc = "0.1"
+
+# dev
+tokio-test = "0.4"
+wiremock = "0.6"
+pretty_assertions = "1.4"
+rstest = "0.26"
+tempfile = "3.24"
+insta = { version = "1.44", features = ["json", "redactions"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# proc-macro 与构建脚本只在编译期运行，优化和 strip 它们对产物毫无意义；
+# 且 macOS 26+ 的 dyld 会以 "mis-aligned LINKEDIT string pool" 拒绝加载
+# 被 strip 过的 proc-macro dylib，导致 release 构建直接失败。
+[profile.release.build-override]
+opt-level = 0
+strip = false
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.test]
+opt-level = 1

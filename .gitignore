@@ -1,0 +1,46 @@
+# ---- Rust ----
+/target/
+**/*.rs.bk
+
+# ---- 运行时数据库（SQLite 及其 WAL/共享内存文件）----
+*.db
+*.db-shm
+*.db-wal
+
+# ---- Node / 前端 ----
+node_modules/
+dist/
+dist-ssr/
+coverage/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.pnpm-store/
+.eslintcache
+*.tsbuildinfo
+*.timestamp-*.mjs
+# Playwright
+test-results/
+playwright-report/
+
+# ---- 环境变量与本地密钥 ----
+.env
+.env.*
+!.env.example
+# 本地配置可能含 admin_token 明文，只允许提交 example
+refract.toml
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db

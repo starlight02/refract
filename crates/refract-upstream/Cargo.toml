@@ -1,0 +1,30 @@
+[package]
+name = "refract-upstream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+refract-core = { workspace = true }
+refract-protocol = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+eventsource-stream = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+pretty_assertions = { workspace = true }
+wiremock = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true
