@@ -39,6 +39,33 @@ export const useKeysStore = defineStore('keys', () => {
     }
   }
 
+  /** 编辑治理属性；密钥本体不变。失败抛出以便弹窗保持打开。 */
+  async function update(id: number, spec: NewApiKey): Promise<ApiKey> {
+    error.value = null
+    try {
+      const updated = await keys.update(id, spec)
+      const i = items.value.findIndex((k) => k.id === id)
+      if (i !== -1) items.value[i] = updated
+      return updated
+    } catch (e) {
+      error.value = toErrorMessage(e)
+      throw e
+    }
+  }
+
+  /** 已用配额清零。 */
+  async function resetUsage(id: number) {
+    error.value = null
+    try {
+      await keys.resetUsage(id)
+      const i = items.value.findIndex((k) => k.id === id)
+      if (i !== -1) items.value[i]!.used_quota = 0
+    } catch (e) {
+      error.value = toErrorMessage(e)
+      throw e
+    }
+  }
+
   async function remove(id: number) {
     error.value = null
     try {
@@ -66,5 +93,5 @@ export const useKeysStore = defineStore('keys', () => {
     }
   }
 
-  return { items, loading, error, fetch, create, remove, toggleEnabled }
+  return { items, loading, error, fetch, create, update, resetUsage, remove, toggleEnabled }
 })

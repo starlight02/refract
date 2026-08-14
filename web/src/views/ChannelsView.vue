@@ -12,7 +12,7 @@ import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { useChannelsStore } from '@/stores/channels'
-import { health as healthApi, settings } from '@/api/client'
+import { channels as channelsApi, health as healthApi, settings } from '@/api/client'
 import type {
   Channel,
   ChannelTestResult,
@@ -134,6 +134,34 @@ async function setNativeFirst(nativeFirst: boolean) {
   }
 }
 
+/** 查询上游余额（仅 OpenAI 兼容渠道有意义）。 */
+const balanceBusy = ref<Record<number, boolean>>({})
+
+function canProbeBalance(ch: Channel): boolean {
+  return ch.endpoints.some(
+    (ep) => ep.enabled && (ep.protocol === 'chat' || ep.protocol === 'responses'),
+  )
+}
+
+async function refreshBalance(ch: Channel) {
+  balanceBusy.value[ch.id] = true
+  try {
+    const result = await channelsApi.balance(ch.id)
+    const target = store.items.find((c) => c.id === ch.id)
+    if (target) {
+      target.balance = result.balance
+      target.balance_updated_at = new Date().toISOString()
+    }
+  } catch (e) {
+    testResults.value[ch.id] = {
+      success: false,
+      message: e instanceof Error ? `余额查询失败：${e.message}` : '余额查询失败',
+    }
+  } finally {
+    balanceBusy.value[ch.id] = false
+  }
+}
+
 async function runTest(ch: Channel) {
   testResults.value[ch.id] = 'pending'
   try {
@@ -143,6 +171,20 @@ async function runTest(ch: Channel) {
       success: false,
       message: e instanceof Error ? e.message : '测试失败',
     }
+  }
+}
+
+/** 一键全测：并发测所有启用中的渠道，各自的结果落在各自的卡片上。 */
+const testingAll = ref(false)
+
+async function runTestAll() {
+  const targets = store.items.filter((ch) => ch.enabled)
+  if (targets.length === 0 || testingAll.value) return
+  testingAll.value = true
+  try {
+    await Promise.allSettled(targets.map((ch) => runTest(ch)))
+  } finally {
+    testingAll.value = false
   }
 }
 
@@ -249,6 +291,17 @@ function addressLabel(ch: Channel): string {
       </div>
 
       <div class="flex items-center gap-2">
+        <button
+          v-if="store.items.length > 0"
+          type="button"
+          class="glass-button-ghost px-3.5 py-2 text-sm font-medium"
+          :disabled="testingAll"
+          title="并发测试全部启用中的渠道"
+          @click="runTestAll"
+        >
+          <AppIcon name="bolt" :size="15" />
+          {{ testingAll ? '测试中…' : '全部测试' }}
+        </button>
         <button
           v-if="store.items.length > 0"
           type="button"
@@ -390,6 +443,15 @@ function addressLabel(ch: Channel): string {
               >
                 转换
               </span>
+
+              <span
+                v-if="ch.auto_disabled"
+                class="proto-badge"
+                style="color: var(--color-danger)"
+                title="连续凭据错误被自动停用；按设置的间隔重测，通过后自动恢复。手动启用可立即清除。"
+              >
+                自动停用
+              </span>
             </div>
 
             <div class="mt-1.5 truncate font-mono text-xs text-ink-faint">
@@ -411,6 +473,15 @@ function addressLabel(ch: Channel): string {
               <span v-if="ch.endpoints.length > 1">
                 <span class="tabular font-medium text-ink-soft">{{ ch.endpoints.length }}</span>
                 个端点
+              </span>
+              <span v-if="ch.balance != null" :title="`刷新于 ${ch.balance_updated_at ?? ''}`">
+                余额
+                <span
+                  class="tabular font-medium"
+                  :class="ch.balance < 1 ? 'text-danger' : 'text-ink-soft'"
+                >
+                  ${{ ch.balance.toFixed(2) }}
+                </span>
               </span>
               <span v-for="t in ch.tags ?? []" :key="t" class="rounded bg-ink/8 px-1.5 py-0.5">{{
                 t
@@ -436,7 +507,10 @@ function addressLabel(ch: Channel): string {
                     :name="(testResults[ch.id] as ChannelTestResult).success ? 'check' : 'x'"
                     :size="13"
                   />
-                  {{ (testResults[ch.id] as ChannelTestResult).message }}
+                  {{ (testResults[ch.id] as ChannelTestResult).message
+                  }}<template v-if="(testResults[ch.id] as ChannelTestResult).latency_ms != null">
+                    · {{ (testResults[ch.id] as ChannelTestResult).latency_ms }}ms</template
+                  >
                 </span>
               </template>
             </div>
@@ -490,6 +564,18 @@ function addressLabel(ch: Channel): string {
             >
               <AppIcon name="bolt" :size="13" />
               测试
+            </button>
+
+            <button
+              v-if="canProbeBalance(ch)"
+              type="button"
+              class="glass-button-ghost px-2.5 py-1.5 text-xs"
+              :disabled="balanceBusy[ch.id]"
+              title="查询上游余额（OpenAI 兼容 billing 端点）"
+              @click="refreshBalance(ch)"
+            >
+              <AppIcon name="download" :size="13" />
+              {{ balanceBusy[ch.id] ? '查询中…' : '余额' }}
             </button>
 
             <button

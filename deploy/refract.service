@@ -1,0 +1,39 @@
+# Refract 的 systemd 单元示例。
+#
+# 安装：
+#   sudo cp refract-server /usr/local/bin/
+#   sudo useradd --system --home /var/lib/refract --create-home refract
+#   sudo cp deploy/refract.service /etc/systemd/system/
+#   sudo systemctl enable --now refract
+#
+# 配置走环境变量（也可换成 ExecStart=... --config /etc/refract/refract.toml）。
+[Unit]
+Description=Refract LLM gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=refract
+Group=refract
+Environment=REFRACT_LISTEN=127.0.0.1:3939
+Environment=REFRACT_DATABASE=/var/lib/refract/refract.db
+ExecStart=/usr/local/bin/refract-server
+Restart=on-failure
+RestartSec=2
+
+# 优雅关闭：给在途 SSE 长连接留出 drain 时间（与 shutdown_grace_secs 对齐）。
+TimeoutStopSec=35
+
+# 最小权限加固。网关只需要读写自己的数据目录与出网。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/refract
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

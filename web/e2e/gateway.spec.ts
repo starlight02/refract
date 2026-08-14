@@ -78,6 +78,24 @@ test.beforeAll(async () => {
         // 非 JSON 请求体保持空对象，断言会自然失败。
       }
       lastSeen = { path: req.url ?? '', headers: req.headers, body }
+      if (raw.includes('nonstandard-200-e2e')) {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end('upstream returned a maintenance page')
+        return
+      }
+      // 流式请求回 SSE —— 调试台等流式客户端要吃增量帧。
+      if (body.stream === true) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write(
+          'data: {"id":"chatcmpl-e2e","object":"chat.completion.chunk","model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"e2e-"},"finish_reason":null}]}\n\n',
+        )
+        res.write(
+          'data: {"id":"chatcmpl-e2e","object":"chat.completion.chunk","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+        )
+        res.write('data: [DONE]\n\n')
+        res.end()
+        return
+      }
       res.writeHead(200, { 'content-type': 'application/json' })
       const answer = req.url?.endsWith('/embeddings') ? UPSTREAM_EMBEDDINGS_ANSWER : UPSTREAM_ANSWER
       res.end(JSON.stringify(answer))
@@ -364,6 +382,42 @@ test('路由策略修改后持久化', async ({ page }) => {
   await expect(page.getByText('已保存')).toBeVisible()
 })
 
+test('200 空回复策略使用默认值、可持久化并热更新严格模式', async ({ page, baseURL }) => {
+  await page.goto('/settings')
+  const window = page.getByRole('spinbutton', { name: '判定窗口（秒）' })
+  const retries = page.getByRole('spinbutton', { name: '最大重试次数' }).last()
+  const strict200 = page.getByRole('switch', { name: '非标准 200 转为 500' })
+  await expect(window).toHaveValue('3')
+  await expect(retries).toHaveValue('5')
+  await expect(strict200).not.toBeChecked()
+
+  await window.fill('4')
+  await retries.fill('2')
+  await strict200.click()
+  await page.getByRole('button', { name: '保存设置' }).click()
+  await expect(page.getByText('已保存')).toBeVisible()
+
+  const invalid = await gatewayFetch(page, baseURL ?? '', '/v1/chat/completions', {
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: 'nonstandard-200-e2e' }],
+  })
+  expect(invalid.status).toBe(500)
+  expect(
+    String(invalid.body.error && (invalid.body.error as { message?: string }).message),
+  ).toContain('does not match the configured `chat` protocol')
+
+  await page.reload()
+  await expect(page.getByRole('spinbutton', { name: '判定窗口（秒）' })).toHaveValue('4')
+  await expect(page.getByRole('spinbutton', { name: '最大重试次数' }).last()).toHaveValue('2')
+  await expect(page.getByRole('switch', { name: '非标准 200 转为 500' })).toBeChecked()
+
+  await page.getByRole('spinbutton', { name: '判定窗口（秒）' }).fill('3')
+  await page.getByRole('spinbutton', { name: '最大重试次数' }).last().fill('5')
+  await page.getByRole('switch', { name: '非标准 200 转为 500' }).click()
+  await page.getByRole('button', { name: '保存设置' }).click()
+  await expect(page.getByText('已保存')).toBeVisible()
+})
+
 test('日志保留设置经过 API 持久化并守住输入范围', async ({ page }) => {
   await page.goto('/settings')
   const retention = page.getByRole('spinbutton', { name: '保留天数' })
@@ -546,7 +600,9 @@ test('仪表盘汇总了全部流量', async ({ page }) => {
   await page.goto('/')
   // 前面已经打了十几次请求：总数不可能是 0。
   await expect(page.locator('.tabular.text-3xl').first()).not.toHaveText(/^0$/)
-  await expect(page.locator('table')).toContainText('gpt-4o')
+  // 仪表盘现在有「按模型」与「按渠道」两张表，分别断言。
+  await expect(page.getByLabel('按模型统计表').locator('table')).toContainText('gpt-4o')
+  await expect(page.getByLabel('按渠道统计表').locator('table')).toContainText('E2E 主渠道')
 })
 
 test('设置页可导出备份，导回时同名渠道被跳过', async ({ page }) => {
@@ -636,4 +692,54 @@ test('替换导入需要二次确认，取消则不动数据', async ({ page }) 
     return ((await response.json()) as { data: Array<{ id: number }> }).data.length
   })
   expect(afterReplace).toBe(before)
+})
+
+test('调试台走完整网关管线并流式渲染回复', async ({ page }) => {
+  await page.goto('/playground')
+  await expect(page.getByRole('heading', { name: '调试台' })).toBeVisible()
+
+  // 模型下拉由 /api/models 派生；显式选中目标模型（列表里可能还有
+  // 其他测试留下的渠道）。
+  await page.getByLabel('调试模型').selectOption('gpt-4o')
+
+  await page.getByLabel('消息输入').fill('ping from playground')
+  await page.getByRole('button', { name: '发送' }).click()
+
+  // 假上游按 SSE 分两帧回 "e2e-" + "ok"，最终气泡应拼出完整文本。
+  await expect(page.getByLabel('会话记录')).toContainText('e2e-ok')
+  // 上游收到的请求确实是流式的（走了真实的网关流式管线）。
+  expect(lastSeen?.body.stream).toBe(true)
+})
+
+test('日志详情弹窗展示完整请求与响应正文', async ({ page }) => {
+  // serial 前序用例刚发过调试台流式请求：最新一条日志就是它。
+  await page.goto('/logs')
+  await page.locator('tbody tr').first().click()
+  await page.getByRole('button', { name: '查看完整请求' }).click()
+
+  const dialog = page.getByRole('dialog', { name: '完整请求' })
+  await expect(dialog).toBeVisible()
+  // 请求正文：调试台发出的用户消息。
+  await expect(dialog).toContainText('ping from playground')
+  // 响应正文：流式聚合出的文本。
+  await expect(dialog).toContainText('e2e-ok')
+  await dialog.getByRole('button', { name: '关闭' }).click()
+  await expect(dialog).toBeHidden()
+})
+
+test('价表在设置页维护，模型页汇总渠道与价格', async ({ page }) => {
+  await page.goto('/settings')
+  await page.getByRole('button', { name: '添加规则' }).click()
+  await page.getByLabel('价表第 1 行模式').fill('gpt-4o')
+  await page.getByLabel('价表第 1 行输入单价').fill('2.5')
+  await page.getByLabel('价表第 1 行输出单价').fill('10')
+  await page.getByRole('button', { name: '保存设置' }).click()
+  await expect(page.getByText('已保存')).toBeVisible()
+
+  await page.goto('/models')
+  const table = page.locator('table')
+  await expect(table).toContainText('gpt-4o')
+  await expect(table).toContainText('E2E 主渠道')
+  await expect(table).toContainText('2.5')
+  await expect(table).toContainText('10')
 })

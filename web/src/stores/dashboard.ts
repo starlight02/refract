@@ -1,7 +1,7 @@
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
 import { logs } from '@/api/client'
-import type { StatsSummary, ModelStat } from '@/api/types'
+import type { ChannelStat, ModelStat, StatsSummary, TimeBucket } from '@/api/types'
 import { toErrorMessage } from './shared'
 
 /**
@@ -13,6 +13,8 @@ export const useDashboardStore = defineStore('dashboard', () => {
   /** 汇总统计；null 表示尚未加载过（而不是「全是 0」）。 */
   const summary = ref<StatsSummary | null>(null)
   const byModel = ref<ModelStat[]>([])
+  const byChannel = ref<ChannelStat[]>([])
+  const timeseries = ref<TimeBucket[]>([])
   /** 在飞请求数。两个数据源并行拉取，任何一个在飞都算 loading。 */
   const inflight = ref(0)
   const loading = computed(() => inflight.value > 0)
@@ -23,6 +25,8 @@ export const useDashboardStore = defineStore('dashboard', () => {
   /** 各数据源的请求序号：快速切换时间窗口时，只让最新一次的结果落地。 */
   let summarySeq = 0
   let modelSeq = 0
+  let channelSeq = 0
+  let seriesSeq = 0
 
   /** 成功率 0..1；无请求时视为 1，避免仪表盘出现 NaN。 */
   const successRate = computed(() => {
@@ -64,14 +68,53 @@ export const useDashboardStore = defineStore('dashboard', () => {
     }
   }
 
-  /** 页面挂载时调用：两个维度并行刷新。 */
+  async function fetchByChannel(windowHours?: number) {
+    if (windowHours !== undefined) hours.value = windowHours
+    const seq = ++channelSeq
+    inflight.value += 1
+    error.value = null
+    try {
+      const data = await logs.byChannel(hours.value)
+      if (seq === channelSeq) byChannel.value = data
+    } catch (e) {
+      if (seq === channelSeq) error.value = toErrorMessage(e)
+    } finally {
+      inflight.value -= 1
+    }
+  }
+
+  async function fetchTimeseries(windowHours?: number) {
+    if (windowHours !== undefined) hours.value = windowHours
+    const seq = ++seriesSeq
+    inflight.value += 1
+    error.value = null
+    try {
+      // 窗口超过 48h 按天分桶，否则按小时 —— 桶数保持在可读范围。
+      const bucket = hours.value > 48 ? 'day' : 'hour'
+      const data = await logs.timeseries(hours.value, bucket)
+      if (seq === seriesSeq) timeseries.value = data
+    } catch (e) {
+      if (seq === seriesSeq) error.value = toErrorMessage(e)
+    } finally {
+      inflight.value -= 1
+    }
+  }
+
+  /** 页面挂载时调用：全部维度并行刷新。 */
   async function refresh(windowHours?: number) {
-    await Promise.all([fetchSummary(windowHours), fetchByModel(windowHours)])
+    await Promise.all([
+      fetchSummary(windowHours),
+      fetchByModel(windowHours),
+      fetchByChannel(windowHours),
+      fetchTimeseries(windowHours),
+    ])
   }
 
   return {
     summary,
     byModel,
+    byChannel,
+    timeseries,
     loading,
     error,
     hours,
@@ -79,6 +122,8 @@ export const useDashboardStore = defineStore('dashboard', () => {
     totalTokens,
     fetchSummary,
     fetchByModel,
+    fetchByChannel,
+    fetchTimeseries,
     refresh,
   }
 })

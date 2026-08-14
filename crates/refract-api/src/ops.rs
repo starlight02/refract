@@ -3,18 +3,17 @@
 use std::convert::Infallible;
 
 use serde_json::json;
+use warp::filters::BoxedFilter;
 use warp::{Filter, Reply};
 
-use crate::state::AppState;
+use crate::state::{AppState, with_state};
 
 /// 装配 `/health/live`、`/health/ready` 与 `/metrics`。
-pub fn routes(
-    state: AppState,
-) -> impl Filter<Extract = (warp::reply::Response,), Error = warp::Rejection> + Clone {
+pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let metrics = warp::path("metrics")
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .map(|state: AppState| {
             // 与健康探针同样不鉴权：指标不含密钥明文，模型/协议名的暴露面
             // 与部署内网可达性一致；需要隔离时在反代层挡即可。
@@ -26,13 +25,11 @@ pub fn routes(
             .into_response()
         });
     let probes = probe_routes(state);
-    metrics.or(probes).unify()
+    routes![metrics, probes]
 }
 
 /// 装配 `/health/live` 与 `/health/ready`。
-fn probe_routes(
-    state: AppState,
-) -> impl Filter<Extract = (warp::reply::Response,), Error = warp::Rejection> + Clone {
+fn probe_routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let live = warp::path!("health" / "live")
         .and(warp::path::end())
         .and(warp::get())
@@ -47,7 +44,7 @@ fn probe_routes(
     let ready = warp::path!("health" / "ready")
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state))
+        .and(with_state(state))
         .and_then(|state: AppState| async move {
             let (status, body) = match state.db().ping().await {
                 Ok(()) => (
@@ -67,11 +64,7 @@ fn probe_routes(
             )
         });
 
-    live.or(ready).unify()
-}
-
-fn with(state: AppState) -> impl Filter<Extract = (AppState,), Error = Infallible> + Clone {
-    warp::any().map(move || state.clone())
+    routes![live, ready]
 }
 
 #[cfg(test)]

@@ -1545,11 +1545,7 @@ impl ChatStreamEncoder {
     /// 与 [`StreamAggregator`] 同样的理由：Anthropic 在 message_start 给
     /// input、在 message_delta 给累积的 output，累加会重复计数。
     fn merge_usage(&mut self, u: &Usage) {
-        self.usage.input_tokens = self.usage.input_tokens.max(u.input_tokens);
-        self.usage.output_tokens = self.usage.output_tokens.max(u.output_tokens);
-        self.usage.cached_input_tokens = self.usage.cached_input_tokens.max(u.cached_input_tokens);
-        self.usage.cache_write_tokens = self.usage.cache_write_tokens.max(u.cache_write_tokens);
-        self.usage.reasoning_tokens = self.usage.reasoning_tokens.max(u.reasoning_tokens);
+        self.usage.merge_max(u);
     }
 
     /// 补齐收尾：finish_reason 帧、usage 帧、`[DONE]`。

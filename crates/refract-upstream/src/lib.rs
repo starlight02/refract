@@ -22,7 +22,7 @@ pub mod sse;
 
 pub use client::{
     UpstreamClient, UpstreamClientConfig, UpstreamRawResponse, UpstreamRawStream, UpstreamRequest,
-    UpstreamResponse,
+    UpstreamResponse, UpstreamSseStream,
 };
-pub use probe::{ModelProbe, probe_models};
+pub use probe::{ModelProbe, probe_balance, probe_models};
 pub use sse::{ByteStream, SseStream, sse_stream};

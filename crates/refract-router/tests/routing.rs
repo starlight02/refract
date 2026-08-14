@@ -6,12 +6,15 @@
 use std::time::Duration;
 
 use refract_core::{
-    Channel, ChannelEndpoint, ChannelKind, Credential, ErrorKind, ModelEntry, Protocol,
-    ProtocolSet, RoutingPolicy, TranscodePolicy, UpstreamAddress,
+    Channel, ChannelEndpoint, ChannelKind, Credential, EmptyResponseRetryOverride,
+    EmptyResponseRetryPolicy, ErrorKind, ModelEntry, Protocol, ProtocolSet, RoutingPolicy,
+    TranscodePolicy, UpstreamAddress,
 };
 use refract_protocol::codec::CodecSet;
 use refract_protocol::ir::{Message, Role, UnifiedRequest};
-use refract_router::{RouteExecutor, RoutePlanner, RoutedResponse, RoutedStream, RouterConfig};
+use refract_router::{
+    InboundPayload, RouteExecutor, RoutePlanner, RoutedResponse, RoutedStream, RouterConfig,
+};
 use refract_store::{BreakerPolicy, Database, HealthRepo};
 use serde_json::json;
 use wiremock::matchers::method;
@@ -70,6 +73,12 @@ fn channel(id: i64, name: &str, priority: i32, endpoints: Vec<ChannelEndpoint>) 
         proxy: None,
         param_override: None,
         note: None,
+        auto_disabled: false,
+        balance: None,
+        balance_updated_at: None,
+        extra_headers: Vec::new(),
+        test_model: None,
+        empty_response_retry: Default::default(),
     }
 }
 
@@ -103,6 +112,16 @@ fn chat_ok(text: &str) -> ResponseTemplate {
         "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     }))
+}
+
+fn strict_response_config() -> RouterConfig {
+    RouterConfig {
+        empty_response_retry: EmptyResponseRetryPolicy {
+            reject_nonstandard_200: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -156,6 +175,159 @@ async fn primary_success_never_touches_the_backup() {
     assert_eq!(outcome.channel_id, 1);
     assert_eq!(outcome.attempts, 1);
     assert!(!outcome.transcoded);
+}
+
+#[tokio::test]
+async fn fast_http_200_empty_response_retries_same_channel_up_to_its_override() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(chat_ok(""))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let mut selected = channel(
+        1,
+        "empty",
+        10,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &server.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    );
+    selected.empty_response_retry = EmptyResponseRetryOverride {
+        window_secs: Some(3),
+        max_retries: Some(2),
+    };
+    let channels = vec![selected];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        RouterConfig::default(),
+    );
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+
+    let outcome = exec.execute(&route, &ir_request()).await.unwrap();
+    assert_eq!(outcome.channel_id, 1);
+    assert_eq!(outcome.attempts, 3, "initial request plus two retries");
+    let RoutedResponse::Transcoded(response) = outcome.payload else {
+        panic!("normalized request should decode the response");
+    };
+    assert!(response.text().is_empty());
+}
+
+#[tokio::test]
+async fn literally_empty_http_200_body_retries_on_the_native_gateway_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(Vec::<u8>::new(), "application/json"))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let mut selected = channel(
+        1,
+        "empty-body",
+        10,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &server.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    );
+    selected.empty_response_retry = EmptyResponseRetryOverride {
+        window_secs: Some(3),
+        max_retries: Some(2),
+    };
+    let channels = vec![selected];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        RouterConfig::default(),
+    );
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let request = br#"{"model":"gpt-4o","messages":[]}"#;
+
+    let outcome = exec
+        .execute(
+            &route,
+            InboundPayload::raw(Protocol::Chat, request, "gpt-4o", false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.attempts, 3);
+    let RoutedResponse::Native { response, .. } = outcome.payload else {
+        panic!("native gateway request must preserve the raw response");
+    };
+    assert!(response.body.is_empty());
+}
+
+#[tokio::test]
+async fn fast_empty_stream_retries_before_any_frame_reaches_the_client() {
+    use futures::StreamExt as _;
+
+    let server = MockServer::start().await;
+    let empty_sse = concat!(
+        "data: {\"id\":\"chatcmpl-empty\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-empty\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(empty_sse),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let mut selected = channel(
+        1,
+        "empty-stream",
+        10,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &server.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    );
+    selected.empty_response_retry = EmptyResponseRetryOverride {
+        window_secs: Some(3),
+        max_retries: Some(1),
+    };
+    let channels = vec![selected];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        RouterConfig::default(),
+    );
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let mut request = ir_request();
+    request.stream = true;
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+
+    let outcome = exec.execute_stream(&route, &request).await.unwrap();
+    assert_eq!(outcome.attempts, 2);
+    let RoutedStream::Transcoded(stream) = outcome.payload else {
+        panic!("normalized request should use decoded stream path");
+    };
+    assert!(!stream.collect::<Vec<_>>().await.is_empty());
 }
 
 #[tokio::test]
@@ -216,6 +388,199 @@ async fn native_unary_passthrough_preserves_request_and_response_bytes() {
     }
     let received = server.received_requests().await.unwrap();
     assert_eq!(received[0].body.as_slice(), request_body);
+}
+
+#[tokio::test]
+async fn nonstandard_200_strict_mode_is_an_explicit_non_retryable_500() {
+    let invalid = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("upstream warming up", "text/plain"))
+        .expect(1)
+        .mount(&invalid)
+        .await;
+
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(chat_ok("must-not-be-used"))
+        .expect(0)
+        .mount(&backup)
+        .await;
+
+    let channels = vec![
+        channel(
+            1,
+            "invalid",
+            10,
+            vec![endpoint(
+                Protocol::Chat,
+                0,
+                &invalid.uri(),
+                ProtocolSet::EMPTY,
+            )],
+        ),
+        channel(
+            2,
+            "backup",
+            0,
+            vec![endpoint(
+                Protocol::Chat,
+                0,
+                &backup.uri(),
+                ProtocolSet::EMPTY,
+            )],
+        ),
+    ];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        strict_response_config(),
+    );
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let raw = br#"{"model":"gpt-4o","messages":[]}"#;
+
+    let error = exec
+        .execute(
+            &route,
+            InboundPayload::raw(Protocol::Chat, raw, "gpt-4o", false),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::InvalidUpstreamResponse);
+    assert_eq!(error.status(), 500);
+    assert!(!error.is_retryable());
+    assert_eq!(error.attempts, 1);
+    assert!(error.message.contains("HTTP 200"), "{}", error.message);
+    assert!(error.message.contains("text/plain"), "{}", error.message);
+    assert!(error.message.contains("chat"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn nonstandard_200_switch_off_preserves_existing_502_behavior() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw("<html>bad gateway</html>", "text/html"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let channels = vec![channel(
+        1,
+        "html",
+        0,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &server.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    )];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        RouterConfig::default(),
+    );
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let raw = br#"{"model":"gpt-4o","messages":[]}"#;
+
+    let error = exec
+        .execute(
+            &route,
+            InboundPayload::raw(Protocol::Chat, raw, "gpt-4o", false),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::UpstreamError);
+    assert_eq!(error.status(), 502);
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_unknown_json_but_keeps_standard_shape_extensions() {
+    let unknown = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "future_response": {"ok": true}
+        })))
+        .expect(1)
+        .mount(&unknown)
+        .await;
+    let channels = vec![channel(
+        1,
+        "unknown-json",
+        0,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &unknown.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    )];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        strict_response_config(),
+    );
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let raw = br#"{"model":"gpt-4o","messages":[]}"#;
+    let error = exec
+        .execute(
+            &route,
+            InboundPayload::raw(Protocol::Chat, raw, "gpt-4o", false),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::InvalidUpstreamResponse);
+
+    let standard = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-future",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "future_response": {"kept": true}
+        })))
+        .expect(1)
+        .mount(&standard)
+        .await;
+    let channels = vec![channel(
+        2,
+        "standard-with-extension",
+        0,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &standard.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    )];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        strict_response_config(),
+    );
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let outcome = exec
+        .execute(
+            &route,
+            InboundPayload::raw(Protocol::Chat, raw, "gpt-4o", false),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome.payload, RoutedResponse::Native { .. }));
 }
 
 #[tokio::test]
@@ -808,6 +1173,7 @@ async fn last_resort_can_be_disabled() {
         health,
         RouterConfig {
             allow_suspended_as_last_resort: false,
+            ..Default::default()
         },
     );
     let planner = RoutePlanner::default();
@@ -1100,6 +1466,65 @@ async fn malformed_first_stream_falls_over_before_returning_to_the_client() {
 
     let failed = health.get(1, Protocol::Chat).await.unwrap().unwrap();
     assert_eq!(failed.total_failures, 1);
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_non_sse_200_on_both_stream_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/plain")
+                .set_body_string("upstream is warming up"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let channels = vec![channel(
+        1,
+        "not-sse",
+        0,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &server.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    )];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        strict_response_config(),
+    );
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let mut ir = ir_request();
+    ir.stream = true;
+
+    let parsed_error = match exec.execute_stream(&route, &ir).await {
+        Err(error) => error,
+        Ok(_) => panic!("non-SSE HTTP 200 must fail in strict mode"),
+    };
+    assert_eq!(parsed_error.kind, ErrorKind::InvalidUpstreamResponse);
+    assert_eq!(parsed_error.status(), 500);
+    assert!(parsed_error.message.contains("text/plain"));
+
+    let raw = br#"{"model":"gpt-4o","stream":true,"messages":[]}"#;
+    let raw_error = match exec
+        .execute_stream(
+            &route,
+            InboundPayload::raw(Protocol::Chat, raw, "gpt-4o", true),
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("non-SSE HTTP 200 must fail on the native stream path"),
+    };
+    assert_eq!(raw_error.kind, ErrorKind::InvalidUpstreamResponse);
+    assert_eq!(raw_error.status(), 500);
 }
 
 #[tokio::test]

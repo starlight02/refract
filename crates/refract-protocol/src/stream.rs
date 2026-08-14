@@ -177,8 +177,8 @@ impl SseFrame {
     }
 
     /// 渲染成 SSE 线格式（含结尾空行）。
-    pub fn render(&self) -> String {
-        let mut out = String::with_capacity(self.data.len() + 24);
+    /// 零额外分配地将 SSE 线格式追加渲染到已有缓冲区中。
+    pub fn render_into(&self, out: &mut String) {
         if let Some(ev) = &self.event {
             out.push_str("event: ");
             out.push_str(ev);
@@ -191,6 +191,12 @@ impl SseFrame {
             out.push('\n');
         }
         out.push('\n');
+    }
+
+    /// 渲染成 SSE 线格式（含结尾空行）。
+    pub fn render(&self) -> String {
+        let mut out = String::with_capacity(self.data.len() + 24);
+        self.render_into(&mut out);
         out
     }
 }
@@ -374,6 +380,37 @@ impl StreamAggregator {
         Self::default()
     }
 
+    /// 把已聚合的内容渲染成人类可读的文本 —— 请求日志的「响应正文」快照。
+    ///
+    /// 不是无损重建（那是 codec 的职责），而是排障视角的忠实摘要：
+    /// 文本与拒答原样拼接，思考与工具调用带标注前缀。
+    pub fn text_preview(&self) -> String {
+        let mut out = String::new();
+        for (_, block) in &self.blocks {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            match block {
+                BlockAccum::Text(text) => out.push_str(text),
+                BlockAccum::Thinking { text, .. } => {
+                    out.push_str("[thinking]\n");
+                    out.push_str(text);
+                }
+                BlockAccum::Refusal(text) => {
+                    out.push_str("[refusal]\n");
+                    out.push_str(text);
+                }
+                BlockAccum::ToolUse { name, args, .. } => {
+                    out.push_str("[tool_call ");
+                    out.push_str(name);
+                    out.push_str("]\n");
+                    out.push_str(args);
+                }
+            }
+        }
+        out
+    }
+
     /// 吸收一个事件。
     pub fn absorb(&mut self, event: &StreamEvent) {
         match event {
@@ -461,11 +498,7 @@ impl StreamAggregator {
     /// 在 `message_delta` 给累积的 output；OpenAI 只在最后一帧给完整 usage。
     /// 取最大值对两种语义都正确，而累加会在 Anthropic 上重复计数。
     fn merge_usage(&mut self, u: Usage) {
-        self.usage.input_tokens = self.usage.input_tokens.max(u.input_tokens);
-        self.usage.output_tokens = self.usage.output_tokens.max(u.output_tokens);
-        self.usage.cached_input_tokens = self.usage.cached_input_tokens.max(u.cached_input_tokens);
-        self.usage.cache_write_tokens = self.usage.cache_write_tokens.max(u.cache_write_tokens);
-        self.usage.reasoning_tokens = self.usage.reasoning_tokens.max(u.reasoning_tokens);
+        self.usage.merge_max(&u);
     }
 
     /// 为空块构造一个指定种类的累加器。

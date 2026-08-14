@@ -9,7 +9,7 @@ import {
   DialogRoot,
   DialogTitle,
 } from 'reka-ui'
-import { AUTH_REQUIRED_EVENT, setAdminToken } from '@/api/client'
+import { AUTH_REQUIRED_EVENT, BACKEND_DOWN_EVENT, setAdminToken } from '@/api/client'
 import AppIcon from '@/components/AppIcon.vue'
 
 /** 深色模式偏好的存储键。 */
@@ -63,14 +63,57 @@ function saveTokenAndReload() {
 onMounted(() => window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired))
 onBeforeUnmount(() => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired))
 
-/** 主导航。移动端底栏也复用同一份顺序，避免两套入口发生漂移。 */
+/**
+ * 后端不可达横幅。
+ *
+ * dev 下 cargo watch 重编译（几秒到几分钟）、生产下服务重启，期间所有
+ * API 都会失败。客户端层已经对 GET 静默重试；这里补上体感 —— 显示一条
+ * 「后端启动中」横幅并轮询 `/health/live`，恢复后自动消失，用户不需要
+ * 猜「是我配置错了还是它还没起来」。
+ */
+const backendDown = ref(false)
+let healthTimer: ReturnType<typeof setInterval> | null = null
+
+function onBackendDown() {
+  if (backendDown.value) return
+  backendDown.value = true
+  healthTimer = setInterval(async () => {
+    try {
+      const response = await fetch('/health/live')
+      if (response.ok) {
+        backendDown.value = false
+        if (healthTimer) clearInterval(healthTimer)
+        healthTimer = null
+      }
+    } catch {
+      // 还没起来，下一轮再探。
+    }
+  }, 1_500)
+}
+
+onMounted(() => window.addEventListener(BACKEND_DOWN_EVENT, onBackendDown))
+onBeforeUnmount(() => {
+  window.removeEventListener(BACKEND_DOWN_EVENT, onBackendDown)
+  if (healthTimer) clearInterval(healthTimer)
+})
+
+/** 桌面侧栏主导航。 */
 const navItems = [
+  { name: 'dashboard', label: '仪表盘', icon: 'gauge' },
+  { name: 'channels', label: '渠道', icon: 'channels' },
+  { name: 'models', label: '模型', icon: 'boxes' },
+  { name: 'playground', label: '调试台', icon: 'chat' },
+  { name: 'logs', label: '请求日志', icon: 'logs' },
+  { name: 'keys', label: 'API 密钥', icon: 'key' },
+] as const
+/** 移动端底栏只放五个高频入口 —— 模型与调试台是桌面场景。 */
+const mobileNavItems = [
   { name: 'dashboard', label: '仪表盘', icon: 'gauge' },
   { name: 'channels', label: '渠道', icon: 'channels' },
   { name: 'logs', label: '请求日志', icon: 'logs' },
   { name: 'keys', label: 'API 密钥', icon: 'key' },
+  { name: 'settings', label: '设置', icon: 'settings' },
 ] as const
-const mobileNavItems = [...navItems, { name: 'settings', label: '设置', icon: 'settings' }] as const
 // 版本号写死在这里：vite.config.ts 没有注入 __APP_VERSION__ 之类的构建期全局，
 // 引用不存在的全局会在运行时直接 ReferenceError。
 const version = '0.1.0'
@@ -82,6 +125,26 @@ const version = '0.1.0'
   <div class="flex min-h-screen text-ink">
     <!-- 极光色斑背景：给所有玻璃层一个可折射的对象，见 main.css 的说明。 -->
     <div class="canvas-aurora" aria-hidden="true"></div>
+
+    <!-- 后端不可达横幅：编译/重启窗口的全局提示，恢复后自动消失。 -->
+    <Transition
+      enter-active-class="transition-opacity duration-300"
+      enter-from-class="opacity-0"
+      leave-active-class="transition-opacity duration-300"
+      leave-to-class="opacity-0"
+    >
+      <div
+        v-if="backendDown"
+        class="fixed top-3 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2.5 rounded-pill border border-warning/35 bg-warning/15 px-4 py-2.5 text-sm font-medium text-ink shadow-[0_8px_24px_-8px_oklch(0%_0_0/0.25)] backdrop-blur-xl"
+        role="status"
+      >
+        <span
+          class="size-2 shrink-0 animate-pulse rounded-full bg-warning"
+          aria-hidden="true"
+        ></span>
+        后端启动中（编译或重启）…就绪后自动恢复
+      </div>
+    </Transition>
     <header
       class="glass-thick fixed inset-x-3 top-3 z-30 flex h-14 items-center justify-between px-3 md:hidden"
     >

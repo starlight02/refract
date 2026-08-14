@@ -1673,12 +1673,7 @@ impl StreamEncoder for MessagesStreamEncoder {
             StreamEvent::Usage(u) => {
                 // 取最大值：Anthropic 的 message_delta 报的是累积量，
                 // 而 OpenAI 只在末帧报一次，两种语义下取 max 都对。
-                self.usage.input_tokens = self.usage.input_tokens.max(u.input_tokens);
-                self.usage.output_tokens = self.usage.output_tokens.max(u.output_tokens);
-                self.usage.cached_input_tokens =
-                    self.usage.cached_input_tokens.max(u.cached_input_tokens);
-                self.usage.cache_write_tokens =
-                    self.usage.cache_write_tokens.max(u.cache_write_tokens);
+                self.usage.merge_max(u);
             }
             StreamEvent::Stop {
                 reason,

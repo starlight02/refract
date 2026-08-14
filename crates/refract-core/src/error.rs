@@ -22,6 +22,8 @@ pub enum ErrorKind {
     RateLimited,
     /// 上游返回错误。502
     UpstreamError,
+    /// 上游返回 HTTP 200，但响应体不符合所配置的协议。500
+    InvalidUpstreamResponse,
     /// 无可用渠道。503
     NoAvailableChannel,
     /// 上游超时。504
@@ -46,7 +48,10 @@ impl ErrorKind {
             ErrorKind::NotFound => 404,
             ErrorKind::PayloadTooLarge => 413,
             ErrorKind::RateLimited => 429,
-            ErrorKind::Internal | ErrorKind::TranscodeFailed | ErrorKind::Configuration => 500,
+            ErrorKind::Internal
+            | ErrorKind::TranscodeFailed
+            | ErrorKind::Configuration
+            | ErrorKind::InvalidUpstreamResponse => 500,
             ErrorKind::UpstreamError => 502,
             ErrorKind::NoAvailableChannel => 503,
             ErrorKind::Timeout => 504,
@@ -65,9 +70,10 @@ impl ErrorKind {
             ErrorKind::RateLimited => "rate_limit_error",
             ErrorKind::UpstreamError | ErrorKind::NoAvailableChannel => "api_error",
             ErrorKind::Timeout => "timeout_error",
-            ErrorKind::TranscodeFailed | ErrorKind::Configuration | ErrorKind::Internal => {
-                "internal_server_error"
-            }
+            ErrorKind::TranscodeFailed
+            | ErrorKind::Configuration
+            | ErrorKind::Internal
+            | ErrorKind::InvalidUpstreamResponse => "internal_server_error",
         }
     }
 
@@ -82,9 +88,10 @@ impl ErrorKind {
             ErrorKind::RateLimited => "rate_limit_error",
             ErrorKind::UpstreamError | ErrorKind::NoAvailableChannel => "api_error",
             ErrorKind::Timeout => "timeout_error",
-            ErrorKind::TranscodeFailed | ErrorKind::Configuration | ErrorKind::Internal => {
-                "api_error"
-            }
+            ErrorKind::TranscodeFailed
+            | ErrorKind::Configuration
+            | ErrorKind::Internal
+            | ErrorKind::InvalidUpstreamResponse => "api_error",
         }
     }
 
@@ -100,9 +107,10 @@ impl ErrorKind {
             ErrorKind::UpstreamError => "INTERNAL",
             ErrorKind::NoAvailableChannel => "UNAVAILABLE",
             ErrorKind::Timeout => "DEADLINE_EXCEEDED",
-            ErrorKind::TranscodeFailed | ErrorKind::Configuration | ErrorKind::Internal => {
-                "INTERNAL"
-            }
+            ErrorKind::TranscodeFailed
+            | ErrorKind::Configuration
+            | ErrorKind::Internal
+            | ErrorKind::InvalidUpstreamResponse => "INTERNAL",
         }
     }
 
@@ -272,6 +280,7 @@ mod tests {
         assert_eq!(ErrorKind::Unauthenticated.status(), 401);
         assert_eq!(ErrorKind::RateLimited.status(), 429);
         assert_eq!(ErrorKind::UpstreamError.status(), 502);
+        assert_eq!(ErrorKind::InvalidUpstreamResponse.status(), 500);
         assert_eq!(ErrorKind::NoAvailableChannel.status(), 503);
         assert_eq!(ErrorKind::Timeout.status(), 504);
         // 需求 4 的拒绝是客户端配置/用法问题，不是服务端故障。
@@ -283,6 +292,7 @@ mod tests {
         assert!(!ErrorKind::InvalidRequest.is_retryable());
         assert!(!ErrorKind::NotFound.is_retryable());
         assert!(!ErrorKind::TranscodeNotPermitted.is_retryable());
+        assert!(!ErrorKind::InvalidUpstreamResponse.is_retryable());
         // 401/403 可能只是这一个渠道的 key 坏了，值得换一个。
         assert!(ErrorKind::Unauthenticated.is_retryable());
         assert!(ErrorKind::RateLimited.is_retryable());
@@ -308,6 +318,7 @@ mod tests {
             ErrorKind::PayloadTooLarge,
             ErrorKind::RateLimited,
             ErrorKind::UpstreamError,
+            ErrorKind::InvalidUpstreamResponse,
             ErrorKind::NoAvailableChannel,
             ErrorKind::Timeout,
             ErrorKind::TranscodeNotPermitted,

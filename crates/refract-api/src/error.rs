@@ -107,6 +107,7 @@ fn admin_code(kind: ErrorKind) -> &'static str {
         ErrorKind::PayloadTooLarge => "payload_too_large",
         ErrorKind::RateLimited => "rate_limited",
         ErrorKind::UpstreamError => "upstream_error",
+        ErrorKind::InvalidUpstreamResponse => "invalid_upstream_response",
         ErrorKind::NoAvailableChannel => "no_available_channel",
         ErrorKind::Timeout => "timeout",
         ErrorKind::TranscodeNotPermitted => "transcode_not_permitted",
@@ -152,6 +153,12 @@ pub async fn recover(rejection: Rejection) -> Result<impl Reply, Infallible> {
         {
             // 网关自有标识，与上游透传的 `x-request-id` 分属两条排障链路。
             response.headers_mut().insert("x-refract-request-id", value);
+        }
+        // 限流（本地或上游）时告诉客户端何时重试 —— 标准客户端会自动遵守。
+        if let Some(wait) = error.retry_after
+            && let Ok(value) = warp::http::HeaderValue::from_str(&wait.as_secs().max(1).to_string())
+        {
+            response.headers_mut().insert("retry-after", value);
         }
         return Ok(response);
     }

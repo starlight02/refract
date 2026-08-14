@@ -44,6 +44,85 @@ pub async fn probe_models(
     parse_model_list(protocol, &response.body)
 }
 
+/// 查询 OpenAI 兼容上游的剩余余额（美元或站点自定币种）。
+///
+/// 走 `/v1/dashboard/billing/subscription`（额度上限）与
+/// `/v1/dashboard/billing/usage`（本月已用，单位美分）——OpenAI 官方早已
+/// 废弃这对端点，但它们是中转站（one-api/new-api 系）的事实标准余额协议。
+/// 只对 OpenAI 形状协议有意义；其他协议返回配置错误。
+pub async fn probe_balance(
+    client: &UpstreamClient,
+    protocol: Protocol,
+    address: &UpstreamAddress,
+    credential: &Credential,
+    proxy: Option<&str>,
+) -> Result<f64, GatewayError> {
+    if !matches!(protocol, Protocol::Chat | Protocol::Responses) {
+        return Err(GatewayError::new(
+            ErrorKind::Configuration,
+            "balance probing is only defined for OpenAI-shaped upstreams",
+        ));
+    }
+
+    // 复用模型列表的地址解析拿到 `{base}{prefix}/models`，再替换端点段 ——
+    // 这样自定义 base/前缀（中转站带路径前缀是常态）自然生效。
+    let models_url = address
+        .resolve(protocol, refract_core::Action::ListModels, "")
+        .map_err(|e| GatewayError::new(ErrorKind::Configuration, e.to_string()))?;
+    let base = models_url
+        .as_str()
+        .trim_end_matches('/')
+        .trim_end_matches("/models")
+        .to_owned();
+
+    let subscription: Value = fetch_billing_json(
+        client,
+        &format!("{base}/dashboard/billing/subscription"),
+        credential,
+        proxy,
+    )
+    .await?;
+    let hard_limit = subscription
+        .get("hard_limit_usd")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            GatewayError::new(
+                ErrorKind::UpstreamError,
+                "upstream did not report hard_limit_usd — balance API unsupported",
+            )
+        })?;
+
+    // 本月用量窗口。end_date 用明天，避免时区导致今天的消耗被漏掉。
+    let now = chrono::Utc::now();
+    let start = now.format("%Y-%m-01").to_string();
+    let end = (now + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let usage: Value = fetch_billing_json(
+        client,
+        &format!("{base}/dashboard/billing/usage?start_date={start}&end_date={end}"),
+        credential,
+        proxy,
+    )
+    .await?;
+    let used_cents = usage
+        .get("total_usage")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+
+    Ok(hard_limit - used_cents / 100.0)
+}
+
+async fn fetch_billing_json(
+    client: &UpstreamClient,
+    url: &str,
+    credential: &Credential,
+    proxy: Option<&str>,
+) -> Result<Value, GatewayError> {
+    let response = client.get_json(url, credential, proxy).await?;
+    Ok(response)
+}
+
 /// 把各家的列表响应归一成模型数组。
 ///
 /// 公开出来是为了能脱离网络单测 —— 归一化逻辑的分支比 HTTP 部分多得多，

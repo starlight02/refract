@@ -158,6 +158,23 @@ pub struct HealthRepo {
 /// 用 EWMA 而不是「总时长 / 总次数」：真均值会被历史稀释，上游突然变慢时
 /// 反应太迟；EWMA 只需一行状态，且对近期更敏感。
 const LATENCY_ALPHA: f64 = 0.25;
+macro_rules! health_cols {
+    () => {
+        "channel_id, protocol, consecutive_fails, total_requests, total_failures, \
+         last_success_at, last_failure_at, last_error, suspended_until, avg_latency_ms"
+    };
+}
+
+const SELECT_HEALTH_BY_ENDPOINT: &str = concat!(
+    "SELECT ",
+    health_cols!(),
+    " FROM channel_health WHERE channel_id = ? AND protocol = ?"
+);
+const SELECT_ALL_HEALTH: &str = concat!(
+    "SELECT ",
+    health_cols!(),
+    " FROM channel_health ORDER BY channel_id, protocol"
+);
 
 impl HealthRepo {
     /// 用默认熔断策略构造。
@@ -252,7 +269,9 @@ impl HealthRepo {
         channel_id: ChannelId,
         protocol: Protocol,
         latency_ms: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
+        // 成功前处于挂起中 = 本次成功解除了熔断（值得通知一声）。
+        let was_suspended = self.suspended_until(channel_id, protocol).is_some();
         sqlx::query(
             "INSERT INTO channel_health \
              (channel_id, protocol, consecutive_fails, total_requests, total_failures, \
@@ -276,7 +295,7 @@ impl HealthRepo {
         .execute(self.db.pool())
         .await?;
         self.cache_suspension(channel_id, protocol, None);
-        Ok(())
+        Ok(was_suspended)
     }
 
     /// 记录一次失败，返回更新后的健康快照。
@@ -359,34 +378,25 @@ impl HealthRepo {
             .await?
             .ok_or_else(|| StoreError::not_found("channel health", channel_id))
     }
-
     /// 取一个端点的健康快照。
     pub async fn get(
         &self,
         channel_id: ChannelId,
         protocol: Protocol,
     ) -> Result<Option<EndpointHealth>, StoreError> {
-        let row = sqlx::query(
-            "SELECT channel_id, protocol, consecutive_fails, total_requests, total_failures, \
-             last_success_at, last_failure_at, last_error, suspended_until, avg_latency_ms \
-             FROM channel_health WHERE channel_id = ? AND protocol = ?",
-        )
-        .bind(channel_id)
-        .bind(protocol.as_str())
-        .fetch_optional(self.db.pool())
-        .await?;
+        let row = sqlx::query(SELECT_HEALTH_BY_ENDPOINT)
+            .bind(channel_id)
+            .bind(protocol.as_str())
+            .fetch_optional(self.db.pool())
+            .await?;
         row.as_ref().map(from_row).transpose()
     }
 
     /// 全量健康快照。路由层启动时一次性载入内存。
     pub async fn all(&self) -> Result<Vec<EndpointHealth>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT channel_id, protocol, consecutive_fails, total_requests, total_failures, \
-             last_success_at, last_failure_at, last_error, suspended_until, avg_latency_ms \
-             FROM channel_health ORDER BY channel_id, protocol",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = sqlx::query(SELECT_ALL_HEALTH)
+            .fetch_all(self.db.pool())
+            .await?;
         rows.iter().map(from_row).collect()
     }
 

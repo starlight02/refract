@@ -27,11 +27,16 @@ Aggregate channels can express things new-api cannot: *"My relay offers both Ope
 - **Per-endpoint configuration**: each protocol endpoint of an aggregate channel has its own address, credential, model set (with `alias=upstream_name` mapping), transcode policy, and priority order.
 - **Native-first routing**: a global switch. Off: routing semantics match new-api (pure priority). On: native protocol endpoints always outrank transcoded ones.
 - **Circuit breaking & health**: endpoints that fail consecutively are suspended with exponential backoff; upstream `Retry-After` headers are honored. State survives restarts and can be reset manually from the UI. Threshold and cooldown windows are configurable at runtime from Settings (threshold 0 disables the breaker).
-- **Request logs**: inbound/upstream protocol, transcoding, selected channel, retries, time-to-first-byte, and token usage are persisted, with per-model and per-key aggregation. Retention defaults to 30 days and is configurable from 1–3650 days. Every response carries an `x-refract-request-id` header that matches the log record.
+- **Request logs**: inbound/upstream protocol, transcoding, chosen channel, retries, TTFB and token usage all persisted, with per-model aggregation (including average TTFB / duration and generation speed) and per-key aggregation; request and response body snapshots are captured by default (64 KB cap, streaming stores the aggregated text, can be disabled in Settings) and the logs page can show the full request. Retention defaults to 30 days, adjustable 1–3650. Every response carries an `x-refract-request-id` header matching its log row.
 - **HTTP semantic passthrough**: native successes preserve the upstream status and end-to-end response headers while filtering hop-by-hop headers and stale streaming `Content-Length` values. A whitelist of client headers (`anthropic-beta`, `anthropic-version`, `openai-beta`, `x-title`, `http-referer`) is forwarded on native calls — never on transcoded ones.
-- **Soft token quotas per key**: each gateway API key can carry a token quota; exhausted keys are rejected at authentication time while in-flight requests finish normally.
+- **Soft quotas and rate limits per key**: each gateway API key can carry a total token quota (rejected at authentication once exhausted) plus RPM/TPM per-minute limits (429 with `Retry-After` when exceeded).
+- **Model pricing & spend tracking**: maintain a per-million-token price table in Settings (exact names or prefix wildcards); each request's cost is frozen into its log row using the table in effect at write time, and the dashboard, per-model and per-key stats all include spend.
+- **Playground**: the admin UI ships a built-in playground that streams through the full gateway pipeline (routing, transcoding, breakers, logging) — no gateway key needed.
+- **Unattended recovery**: terminal authentication failures can auto-disable a channel, periodic retests bring it back after recovery, and deduplicated webhook events report suspension, recovery, and auto-disable transitions.
+- **Abnormal-200 handling**: retry fast HTTP 200 responses that contain no model output (default: within 3 seconds, up to 5 retries), with per-channel overrides; optionally turn plain text, HTML, unknown JSON/SSE, and other protocol-invalid 200 responses into explicit HTTP 500 errors.
+- **Channel ledger**: refresh relay balances, compare request volume / latency / spend by channel, and inspect hourly or daily time series from the dashboard.
 - **Operational probes & metrics**: public `/health/live`, `/health/ready` and Prometheus text-format `/metrics`.
-- **Configuration backup**: export/import channels, gateway keys and settings as one JSON document; restored keys keep working across instances. Merge and replace import modes.
+- **Configuration and database backup**: export/import channels, gateway keys and settings as one JSON document; restored keys keep working across instances. Merge and replace import modes. Settings also exposes database size statistics and an online SQLite backup.
 - **Single-binary deployment**: the built frontend is embedded into the binary; deploying is copying one file.
 - **Designed for one user, not hard-wired to one user**: every business table carries `owner_id`, authentication is a trait — adding multi-user later doesn't touch business logic.
 
@@ -80,16 +85,27 @@ Compose binds the host port to loopback only, runs as a non-root user with a rea
 | Endpoint | Protocol |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/completions` | Legacy OpenAI Completions / FIM passthrough |
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1beta/models/{model}:generateContent` | Gemini (`...:streamGenerateContent` for streaming) |
-| `POST /v1/embeddings` | OpenAI Embeddings (passthrough to chat-protocol endpoints) |
-| `GET /v1/models` | Model list (derived from enabled channels) |
+| `POST /v1beta/models/{model}:embedContent` · `:batchEmbedContents` | Gemini native embeddings (passthrough) |
+| `POST /v1/embeddings` | OpenAI Embeddings (passthrough) |
+| `POST /v1/images/generations` · `/v1/images/edits` | OpenAI Images (passthrough; edits is multipart) |
+| `POST /v1/audio/speech` · `/v1/audio/transcriptions` · `/v1/audio/translations` | OpenAI Audio (passthrough; STT is multipart) |
+| `POST /v1/moderations` | OpenAI Moderations (passthrough) |
+| `POST /v1/rerank` | Cohere/Jina-shaped rerank (passthrough) |
+| `POST /v1/messages/count_tokens` | Anthropic token counting (passthrough to messages endpoints) |
+| `POST /v1beta/models/{model}:countTokens` | Gemini token counting (passthrough to gemini endpoints) |
+| `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` | OpenAI and Gemini model discovery (derived from enabled channels) |
+| `GET /v1/realtime?model=...` (WebSocket) | OpenAI Realtime native WebSocket bridge |
 | `GET /metrics` | Prometheus metrics (no auth, like the health probes) |
 
 Both streaming and non-streaming are supported. Gateway endpoints send permissive CORS headers so browser-based clients can call them directly. The admin UI lives under `/api/...`, uses a separate credential system from the gateway endpoints, and deliberately sends **no** CORS headers — the management surface is same-origin only.
 
-Embeddings have no cross-protocol translation (Anthropic has no such API and Gemini's shape differs), so they route only to chat-protocol endpoints: add the embedding model to a chat endpoint's model list and it becomes routable. Aliases, parameter overrides, retries and circuit breaking behave exactly like chat traffic.
+Passthrough endpoints (embeddings, images, audio, moderations, rerank, token counting) have no cross-protocol translation, so each routes only to native endpoints of its own protocol: add the model to that endpoint's model list and it becomes routable. Aliases (the `model` field inside multipart forms is rewritten too), retries and circuit breaking behave exactly like chat traffic; `model` is the routing key and is required on every passthrough request.
+
+Realtime is likewise native-only: it selects a healthy Chat endpoint, applies model aliases and gateway/key admission controls, then bridges text, binary, ping/pong and close frames without decoding events. Authenticate with `Authorization: Bearer <gateway-key>`; browser clients may use the OpenAI-compatible `realtime, openai-insecure-api-key.<gateway-key>` subprotocol pair (or `?key=`). A custom full Chat address must end in `/chat/completions` or `/realtime` so the WebSocket target can be derived without guessing.
 
 ## Configuration
 

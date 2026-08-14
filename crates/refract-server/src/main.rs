@@ -112,6 +112,8 @@ async fn main() -> Result<()> {
     enforce_exposure_policy(&config, &state).await?;
     warn_on_empty_config(&state);
     let maintenance = tokio::spawn(log_retention_loop(state.clone()));
+    // 自动禁用渠道的定时重测自愈（间隔从设置读取，0 = 关闭）。
+    let retest = tokio::spawn(refract_api::notify::auto_retest_loop(state.clone()));
 
     // 显式绑定而非 `Server::bind`：后者在端口被占用时直接 panic，
     // 而「3939 已被占用」是最常见的启动失败，值得一条人话错误。
@@ -148,6 +150,8 @@ async fn main() -> Result<()> {
 
     maintenance.abort();
     let _ = maintenance.await;
+    retest.abort();
+    let _ = retest.await;
     // 日志落库是 fire-and-forget 的后台任务，给它们一小段时间收尾再关池。
     tokio::time::sleep(Duration::from_millis(200)).await;
     db.close().await;

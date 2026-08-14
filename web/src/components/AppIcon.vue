@@ -12,6 +12,7 @@
  */
 import {
   ArrowLeftRight,
+  Boxes,
   Check,
   Copy,
   Download,
@@ -19,6 +20,7 @@ import {
   KeyRound,
   List,
   ListChecks,
+  MessagesSquare,
   Moon,
   Pencil,
   Plus,
@@ -68,6 +70,10 @@ const ICONS = {
   refresh: RefreshCw,
   /** 批量选择：带勾清单。 */
   checklist: ListChecks,
+  /** 模型总览：立体方块。 */
+  boxes: Boxes,
+  /** 调试台：对话气泡。 */
+  chat: MessagesSquare,
 } as const
 
 export type IconName = keyof typeof ICONS

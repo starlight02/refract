@@ -14,16 +14,20 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
-use refract_core::{Action, ChannelId, ErrorKind, GatewayError, Protocol};
+use refract_core::{
+    Action, ChannelId, EmptyResponseRetryPolicy, ErrorKind, GatewayError, Protocol,
+};
 use refract_protocol::codec::CodecSet;
-use refract_protocol::ir::{UnifiedRequest, UnifiedResponse, Usage};
+use refract_protocol::ir::{ContentPart, UnifiedRequest, UnifiedResponse, Usage};
 use refract_protocol::{SseFrame, SseParser, StreamEvent};
 use refract_store::HealthRepo;
 use refract_upstream::{
     ByteStream, SseStream, UpstreamClient, UpstreamRawResponse, UpstreamRawStream, UpstreamRequest,
+    UpstreamResponse, UpstreamSseStream,
 };
 use serde_json::Value;
 
+use crate::events::RouterEvent;
 use crate::plan::{Candidate, Route};
 
 /// 执行器配置。
@@ -31,12 +35,15 @@ use crate::plan::{Candidate, Route};
 pub struct RouterConfig {
     /// 熔断中的端点是否仍可作为最后手段。
     pub allow_suspended_as_last_resort: bool,
+    /// HTTP 200 空回复重试的全局默认值。
+    pub empty_response_retry: EmptyResponseRetryPolicy,
 }
 
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             allow_suspended_as_last_resort: true,
+            empty_response_retry: EmptyResponseRetryPolicy::default(),
         }
     }
 }
@@ -171,6 +178,8 @@ pub struct RouteExecutor {
     codecs: CodecSet,
     health: HealthRepo,
     config: RouterConfig,
+    /// 路由事件的旁路出口。`None` 时静默运行。
+    events: Option<crate::events::EventSender>,
 }
 
 impl std::fmt::Debug for RouteExecutor {
@@ -194,7 +203,14 @@ impl RouteExecutor {
             codecs,
             health,
             config,
+            events: None,
         }
+    }
+
+    /// 挂上路由事件出口。
+    pub fn with_events(mut self, sender: crate::events::EventSender) -> Self {
+        self.events = Some(sender);
+        self
     }
 
     /// 当前配置。
@@ -266,6 +282,29 @@ impl RouteExecutor {
         }
     }
 
+    /// 当前候选最终生效的空回复重试策略。
+    fn empty_response_retry_for(&self, candidate: &Candidate<'_>) -> EmptyResponseRetryPolicy {
+        candidate
+            .channel
+            .empty_response_retry
+            .resolve(self.config.empty_response_retry)
+    }
+
+    /// 统一失败处理：注解、记录熔断健康状态并判定可重试性。
+    async fn handle_failure(
+        &self,
+        candidate: &Candidate<'_>,
+        error: GatewayError,
+        attempts: u8,
+    ) -> Result<GatewayError, GatewayError> {
+        let annotated = annotate_candidate_error(error, candidate, attempts);
+        self.record_failure(candidate, &annotated).await;
+        if !annotated.is_retryable() {
+            Err(annotated)
+        } else {
+            Ok(annotated)
+        }
+    }
     /// 仅有归一化 IR 时的非流式执行。
     async fn execute_normalized(
         &self,
@@ -278,7 +317,6 @@ impl RouteExecutor {
 
         for idx in order {
             let candidate = &route.attempts[idx];
-            attempts = attempts.saturating_add(1);
             let body = match self.encode_for(candidate, ir) {
                 Ok(b) => b,
                 Err(e) => {
@@ -288,53 +326,99 @@ impl RouteExecutor {
                     continue;
                 }
             };
+            let channel_headers = merged_headers(&[], candidate);
+            let retry_policy = self.empty_response_retry_for(candidate);
+            let mut empty_retries = 0_u32;
+            loop {
+                attempts = attempts.saturating_add(1);
+                let started = std::time::Instant::now();
+                let mut req = UpstreamRequest::post(
+                    candidate.protocol(),
+                    candidate.address(),
+                    candidate.credential(),
+                    candidate.upstream_model(),
+                    Action::Generate,
+                    &body,
+                );
+                // 渠道自定义头是渠道配置（非客户端透传），转码调用也要带。
+                req.extra_headers = &channel_headers;
+                req.proxy = candidate.proxy();
+                req.timeout = self.timeout_for(candidate);
 
-            let started = std::time::Instant::now();
-            let mut req = UpstreamRequest::post(
-                candidate.protocol(),
-                candidate.address(),
-                candidate.credential(),
-                candidate.upstream_model(),
-                Action::Generate,
-                &body,
-            );
-            req.proxy = candidate.proxy();
-            req.timeout = self.timeout_for(candidate);
-
-            match self.client.send(req).await {
-                Ok(response) => {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    match self
-                        .codecs
-                        .for_protocol(candidate.protocol())
-                        .decode_response(&response.body)
-                    {
-                        Ok(payload) => {
-                            self.record_success(candidate, latency_ms).await;
-                            return Ok(self.outcome(
+                match self.client.send(req).await {
+                    Ok(response) => {
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        if response.body.is_null()
+                            && should_retry_empty(
+                                retry_policy,
+                                response.first_byte_to_end,
+                                empty_retries,
+                            )
+                        {
+                            empty_retries += 1;
+                            continue;
+                        }
+                        if response.status == 200
+                            && response.body.is_null()
+                            && retry_policy.reject_nonstandard_200
+                        {
+                            let error = annotate_candidate_error(
+                                invalid_parsed_200_response(candidate.protocol(), &response),
                                 candidate,
-                                route,
                                 attempts,
-                                latency_ms,
-                                RoutedResponse::Transcoded(payload),
-                            ));
+                            );
+                            self.record_failure(candidate, &error).await;
+                            return Err(error);
                         }
-                        Err(e) => {
-                            // 上游回了 200 但我们看不懂 —— 这是上游的问题
-                            // （或它根本不是这个协议），记失败并换渠道。
-                            let e = annotate_candidate_error(e, candidate, attempts);
-                            self.record_failure(candidate, &e).await;
-                            last_error = e;
+                        match self
+                            .codecs
+                            .for_protocol(candidate.protocol())
+                            .decode_response(&response.body)
+                        {
+                            Ok(payload) => {
+                                if unified_response_is_empty(&payload)
+                                    && should_retry_empty(
+                                        retry_policy,
+                                        response.first_byte_to_end,
+                                        empty_retries,
+                                    )
+                                {
+                                    empty_retries += 1;
+                                    continue;
+                                }
+                                self.record_success(candidate, latency_ms).await;
+                                return Ok(self.outcome(
+                                    candidate,
+                                    route,
+                                    attempts,
+                                    latency_ms,
+                                    RoutedResponse::Transcoded(payload),
+                                ));
+                            }
+                            Err(e) => {
+                                // 上游回了 200 但我们看不懂 —— 这是上游的问题
+                                // （或它根本不是这个协议），记失败并换渠道。
+                                let e = if response.status == 200
+                                    && retry_policy.reject_nonstandard_200
+                                {
+                                    invalid_parsed_200_response(candidate.protocol(), &response)
+                                } else {
+                                    e
+                                };
+                                last_error = self.handle_failure(candidate, e, attempts).await?;
+                                break;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    let e = annotate_candidate_error(e, candidate, attempts);
-                    self.record_failure(candidate, &e).await;
-                    if !e.is_retryable() {
-                        return Err(e);
+                    Err(e) => {
+                        let e = strict_200_parse_error(
+                            retry_policy.reject_nonstandard_200,
+                            candidate.protocol(),
+                            e,
+                        );
+                        last_error = self.handle_failure(candidate, e, attempts).await?;
+                        break;
                     }
-                    last_error = e;
                 }
             }
         }
@@ -370,7 +454,8 @@ impl RouteExecutor {
         for idx in order {
             let candidate = &route.attempts[idx];
             attempts = attempts.saturating_add(1);
-            let started = std::time::Instant::now();
+            let retry_policy = self.empty_response_retry_for(candidate);
+            let mut empty_retries = 0_u32;
 
             if candidate.needs_transcode(route.inbound) {
                 let ir = match decoded_ir.get_or_insert_with(|| {
@@ -391,112 +476,169 @@ impl RouteExecutor {
                         continue;
                     }
                 };
-                let mut request = UpstreamRequest::post(
-                    candidate.protocol(),
-                    candidate.address(),
-                    candidate.credential(),
-                    candidate.upstream_model(),
-                    Action::Generate,
-                    &body,
-                );
-                request.proxy = candidate.proxy();
-                request.timeout = self.timeout_for(candidate);
+                loop {
+                    let started = std::time::Instant::now();
+                    let mut request = UpstreamRequest::post(
+                        candidate.protocol(),
+                        candidate.address(),
+                        candidate.credential(),
+                        candidate.upstream_model(),
+                        Action::Generate,
+                        &body,
+                    );
+                    request.proxy = candidate.proxy();
+                    request.timeout = self.timeout_for(candidate);
 
-                match self.client.send(request).await {
-                    Ok(response) => {
-                        let latency_ms = started.elapsed().as_millis() as u64;
-                        match self
-                            .codecs
-                            .for_protocol(candidate.protocol())
-                            .decode_response(&response.body)
-                        {
-                            Ok(payload) => {
-                                self.record_success(candidate, latency_ms).await;
-                                return Ok(self.outcome(
+                    match self.client.send(request).await {
+                        Ok(response) => {
+                            let latency_ms = started.elapsed().as_millis() as u64;
+                            if response.body.is_null()
+                                && should_retry_empty(
+                                    retry_policy,
+                                    response.first_byte_to_end,
+                                    empty_retries,
+                                )
+                            {
+                                empty_retries += 1;
+                                attempts = attempts.saturating_add(1);
+                                continue;
+                            }
+                            if response.status == 200
+                                && response.body.is_null()
+                                && retry_policy.reject_nonstandard_200
+                            {
+                                let error = annotate_candidate_error(
+                                    invalid_parsed_200_response(candidate.protocol(), &response),
                                     candidate,
-                                    route,
                                     attempts,
-                                    latency_ms,
-                                    RoutedResponse::Transcoded(payload),
-                                ));
-                            }
-                            Err(error) => {
-                                let error = annotate_candidate_error(error, candidate, attempts);
+                                );
                                 self.record_failure(candidate, &error).await;
-                                last_error = error;
+                                return Err(error);
+                            }
+                            match self
+                                .codecs
+                                .for_protocol(candidate.protocol())
+                                .decode_response(&response.body)
+                            {
+                                Ok(payload) => {
+                                    if unified_response_is_empty(&payload)
+                                        && should_retry_empty(
+                                            retry_policy,
+                                            response.first_byte_to_end,
+                                            empty_retries,
+                                        )
+                                    {
+                                        empty_retries += 1;
+                                        attempts = attempts.saturating_add(1);
+                                        continue;
+                                    }
+                                    self.record_success(candidate, latency_ms).await;
+                                    return Ok(self.outcome(
+                                        candidate,
+                                        route,
+                                        attempts,
+                                        latency_ms,
+                                        RoutedResponse::Transcoded(payload),
+                                    ));
+                                }
+                                Err(error) => {
+                                    let error = if response.status == 200
+                                        && retry_policy.reject_nonstandard_200
+                                    {
+                                        invalid_parsed_200_response(candidate.protocol(), &response)
+                                    } else {
+                                        error
+                                    };
+                                    last_error =
+                                        self.handle_failure(candidate, error, attempts).await?;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    Err(error) => {
-                        let error = annotate_candidate_error(error, candidate, attempts);
-                        self.record_failure(candidate, &error).await;
-                        if !error.is_retryable() {
-                            return Err(error);
+                        Err(error) => {
+                            let error = strict_200_parse_error(
+                                retry_policy.reject_nonstandard_200,
+                                candidate.protocol(),
+                                error,
+                            );
+                            last_error = self.handle_failure(candidate, error, attempts).await?;
+                            break;
                         }
-                        last_error = error;
                     }
                 }
                 continue;
             }
 
             let prepared = prepare_native_body(candidate, route, raw_body)?;
-            let mut request = match &prepared {
-                PreparedBody::Raw(body) => UpstreamRequest::post_raw(
-                    candidate.protocol(),
-                    candidate.address(),
-                    candidate.credential(),
-                    candidate.upstream_model(),
-                    Action::Generate,
-                    body,
-                ),
-                PreparedBody::Json(body) => UpstreamRequest::post(
-                    candidate.protocol(),
-                    candidate.address(),
-                    candidate.credential(),
-                    candidate.upstream_model(),
-                    Action::Generate,
-                    body,
-                ),
-            };
-            request.extra_headers = headers;
-            request.proxy = candidate.proxy();
-            request.timeout = self.timeout_for(candidate);
+            let extra_headers = merged_headers(headers, candidate);
+            loop {
+                let started = std::time::Instant::now();
+                let mut request = prepared.to_request(candidate, Action::Generate);
+                request.extra_headers = &extra_headers;
+                request.proxy = candidate.proxy();
+                request.timeout = self.timeout_for(candidate);
 
-            match self.client.send_raw(request).await {
-                Ok(response) => {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    let usage = match inspect_native_response(
-                        self.codecs,
-                        candidate.protocol(),
-                        response.body.as_ref(),
-                    ) {
-                        Ok(usage) => usage,
-                        Err(error) => {
-                            let error = annotate_candidate_error(error, candidate, attempts);
-                            self.record_failure(candidate, &error).await;
-                            if !error.is_retryable() {
-                                return Err(error);
+                match self.client.send_raw(request).await {
+                    Ok(response) => {
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        let inspection = match inspect_native_response(
+                            self.codecs,
+                            candidate.protocol(),
+                            response.body.as_ref(),
+                            retry_policy.reject_nonstandard_200,
+                            response.status,
+                            response_content_type(&response.headers),
+                        ) {
+                            Ok(inspection) => inspection,
+                            Err(error) => {
+                                last_error =
+                                    self.handle_failure(candidate, error, attempts).await?;
+                                break;
                             }
-                            last_error = error;
+                        };
+                        if inspection.empty
+                            && should_retry_empty(
+                                retry_policy,
+                                response.first_byte_to_end,
+                                empty_retries,
+                            )
+                        {
+                            empty_retries += 1;
+                            attempts = attempts.saturating_add(1);
                             continue;
                         }
-                    };
-                    self.record_success(candidate, latency_ms).await;
-                    return Ok(self.outcome(
-                        candidate,
-                        route,
-                        attempts,
-                        latency_ms,
-                        RoutedResponse::Native { response, usage },
-                    ));
-                }
-                Err(error) => {
-                    let error = annotate_candidate_error(error, candidate, attempts);
-                    self.record_failure(candidate, &error).await;
-                    if !error.is_retryable() {
-                        return Err(error);
+                        if retry_policy.reject_nonstandard_200
+                            && response.status == 200
+                            && !inspection.protocol_standard
+                        {
+                            let error = annotate_candidate_error(
+                                invalid_200_response(
+                                    candidate.protocol(),
+                                    response_content_type(&response.headers),
+                                    response.body.as_ref(),
+                                ),
+                                candidate,
+                                attempts,
+                            );
+                            self.record_failure(candidate, &error).await;
+                            return Err(error);
+                        }
+                        self.record_success(candidate, latency_ms).await;
+                        return Ok(self.outcome(
+                            candidate,
+                            route,
+                            attempts,
+                            latency_ms,
+                            RoutedResponse::Native {
+                                response,
+                                usage: inspection.usage,
+                            },
+                        ));
                     }
-                    last_error = error;
+                    Err(error) => {
+                        last_error = self.handle_failure(candidate, error, attempts).await?;
+                        break;
+                    }
                 }
             }
         }
@@ -504,22 +646,28 @@ impl RouteExecutor {
         Err(last_error)
     }
 
-    /// 非对话端点（如 `/v1/embeddings`）的字节透传执行。
+    /// 非对话端点（如 `/v1/embeddings`、`/v1/images/generations`）的字节透传执行。
     ///
     /// 与 [`Self::execute`] 的差别：这类请求**没有跨协议转换语义**——不经过
-    /// IR/codec，请求与响应字节原样往返，只做模型别名与参数覆盖的顶层改写。
+    /// IR/codec，请求与响应字节原样往返，只做模型别名与参数覆盖的顶层最小改写。
     /// 候选必须与入口协议同构（调用方过滤，这里再防御一层）；熔断、健康记录、
     /// 重试语义与对话请求完全一致。
+    ///
+    /// `content_type` 为 `None` 时按 JSON 处理；multipart（音频转写、图像编辑）
+    /// 时原样携带 boundary，且只做 multipart 感知的模型字段改写（参数覆盖
+    /// 是 JSON 语义，对表单不适用）。
     pub async fn execute_passthrough(
         &self,
         route: &Route<'_>,
         action: Action,
         raw_body: &[u8],
         headers: &[(String, String)],
+        content_type: Option<&str>,
     ) -> Result<RouteOutcome<UpstreamRawResponse>, GatewayError> {
         let order = self.prioritize(route);
         let mut last_error = no_candidates(route);
         let mut attempts = 0_u8;
+        let is_multipart = content_type.is_some_and(|ct| ct.starts_with("multipart/"));
 
         for idx in order {
             let candidate = &route.attempts[idx];
@@ -529,26 +677,15 @@ impl RouteExecutor {
             attempts = attempts.saturating_add(1);
             let started = std::time::Instant::now();
 
-            let prepared = prepare_native_body(candidate, route, raw_body)?;
-            let mut request = match &prepared {
-                PreparedBody::Raw(body) => UpstreamRequest::post_raw(
-                    candidate.protocol(),
-                    candidate.address(),
-                    candidate.credential(),
-                    candidate.upstream_model(),
-                    action,
-                    body,
-                ),
-                PreparedBody::Json(body) => UpstreamRequest::post(
-                    candidate.protocol(),
-                    candidate.address(),
-                    candidate.credential(),
-                    candidate.upstream_model(),
-                    action,
-                    body,
-                ),
+            let prepared = if is_multipart {
+                prepare_multipart_body(candidate, route, raw_body)
+            } else {
+                prepare_native_body(candidate, route, raw_body)?
             };
-            request.extra_headers = headers;
+            let mut request = prepared.to_request(candidate, action);
+            request.raw_content_type = content_type;
+            let extra_headers = merged_headers(headers, candidate);
+            request.extra_headers = &extra_headers;
             request.proxy = candidate.proxy();
             request.timeout = self.timeout_for(candidate);
 
@@ -559,12 +696,7 @@ impl RouteExecutor {
                     return Ok(self.outcome(candidate, route, attempts, latency_ms, response));
                 }
                 Err(error) => {
-                    let error = annotate_candidate_error(error, candidate, attempts);
-                    self.record_failure(candidate, &error).await;
-                    if !error.is_retryable() {
-                        return Err(error);
-                    }
-                    last_error = error;
+                    last_error = self.handle_failure(candidate, error, attempts).await?;
                 }
             }
         }
@@ -587,7 +719,6 @@ impl RouteExecutor {
 
         for idx in order {
             let candidate = &route.attempts[idx];
-            attempts = attempts.saturating_add(1);
             let body = match self.encode_for(candidate, ir) {
                 Ok(b) => b,
                 Err(e) => {
@@ -595,66 +726,79 @@ impl RouteExecutor {
                     continue;
                 }
             };
-
-            let started = std::time::Instant::now();
-            let mut req = UpstreamRequest::post(
-                candidate.protocol(),
-                candidate.address(),
-                candidate.credential(),
-                candidate.upstream_model(),
-                Action::Stream,
-                &body,
-            );
-            req.proxy = candidate.proxy();
-            // 流式请求不设整体超时：上游客户端只按 stream_idle_timeout 保护，
-            // 整体 deadline 会误杀持续产出 token 的长回答。
-
-            match self.client.stream(req).await {
-                Ok(stream) => match preflight_sse_stream(
-                    stream,
-                    self.codecs,
+            let channel_headers = merged_headers(&[], candidate);
+            let retry_policy = self.empty_response_retry_for(candidate);
+            let mut empty_retries = 0_u32;
+            loop {
+                attempts = attempts.saturating_add(1);
+                let started = std::time::Instant::now();
+                let mut req = UpstreamRequest::post(
                     candidate.protocol(),
-                    self.client.config().stream_idle_timeout,
-                )
-                .await
-                {
-                    Ok((prefix, rest)) => {
-                        let latency_ms = started.elapsed().as_millis() as u64;
-                        let mut prefix = prefix.into_iter();
-                        let first = prefix.next().expect("preflight returns a non-empty prefix");
-                        let rest = Box::pin(futures_util::stream::iter(prefix.map(Ok)).chain(rest));
-                        let tracked = track_stream(
-                            first,
-                            rest,
-                            self.health.clone(),
-                            candidate.channel_id(),
-                            candidate.protocol(),
-                            latency_ms,
-                        );
-                        return Ok(self.outcome(
-                            candidate,
-                            route,
-                            attempts,
-                            latency_ms,
-                            RoutedStream::Transcoded(tracked),
-                        ));
-                    }
-                    Err(error) => {
-                        let error = annotate_candidate_error(error, candidate, attempts);
-                        self.record_failure(candidate, &error).await;
-                        if !error.is_retryable() {
-                            return Err(error);
+                    candidate.address(),
+                    candidate.credential(),
+                    candidate.upstream_model(),
+                    Action::Stream,
+                    &body,
+                );
+                req.extra_headers = &channel_headers;
+                req.proxy = candidate.proxy();
+                // 流式请求不设整体超时：上游客户端只按 stream_idle_timeout 保护，
+                // 整体 deadline 会误杀持续产出 token 的长回答。
+
+                match self.client.stream(req).await {
+                    Ok(UpstreamSseStream {
+                        status,
+                        headers,
+                        stream,
+                    }) => match preflight_sse_stream(
+                        stream,
+                        self.codecs,
+                        candidate.protocol(),
+                        self.client.config().stream_idle_timeout,
+                        retry_policy,
+                        retry_policy.reject_nonstandard_200 && status == 200,
+                        response_content_type(&headers),
+                    )
+                    .await
+                    {
+                        Ok((prefix, rest, empty_duration)) => {
+                            if empty_duration.is_some_and(|duration| {
+                                should_retry_empty(retry_policy, duration, empty_retries)
+                            }) {
+                                empty_retries += 1;
+                                continue;
+                            }
+                            let latency_ms = started.elapsed().as_millis() as u64;
+                            let mut prefix = prefix.into_iter();
+                            let first =
+                                prefix.next().expect("preflight returns a non-empty prefix");
+                            let rest =
+                                Box::pin(futures_util::stream::iter(prefix.map(Ok)).chain(rest));
+                            let tracked = track_stream(
+                                first,
+                                rest,
+                                self.health.clone(),
+                                candidate.channel_id(),
+                                candidate.protocol(),
+                                latency_ms,
+                            );
+                            return Ok(self.outcome(
+                                candidate,
+                                route,
+                                attempts,
+                                latency_ms,
+                                RoutedStream::Transcoded(tracked),
+                            ));
                         }
-                        last_error = error;
+                        Err(error) => {
+                            last_error = self.handle_failure(candidate, error, attempts).await?;
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        last_error = self.handle_failure(candidate, e, attempts).await?;
+                        break;
                     }
-                },
-                Err(e) => {
-                    let e = annotate_candidate_error(e, candidate, attempts);
-                    self.record_failure(candidate, &e).await;
-                    if !e.is_retryable() {
-                        return Err(e);
-                    }
-                    last_error = e;
                 }
             }
         }
@@ -690,7 +834,8 @@ impl RouteExecutor {
         for idx in order {
             let candidate = &route.attempts[idx];
             attempts = attempts.saturating_add(1);
-            let started = std::time::Instant::now();
+            let retry_policy = self.empty_response_retry_for(candidate);
+            let mut empty_retries = 0_u32;
 
             if candidate.needs_transcode(route.inbound) {
                 let ir = match decoded_ir.get_or_insert_with(|| {
@@ -710,119 +855,126 @@ impl RouteExecutor {
                         continue;
                     }
                 };
-                let mut request = UpstreamRequest::post(
-                    candidate.protocol(),
-                    candidate.address(),
-                    candidate.credential(),
-                    candidate.upstream_model(),
-                    Action::Stream,
-                    &body,
-                );
-                request.proxy = candidate.proxy();
-
-                match self.client.stream(request).await {
-                    Ok(stream) => match preflight_sse_stream(
-                        stream,
-                        self.codecs,
+                loop {
+                    let started = std::time::Instant::now();
+                    let mut request = UpstreamRequest::post(
                         candidate.protocol(),
-                        self.client.config().stream_idle_timeout,
-                    )
-                    .await
-                    {
-                        Ok((prefix, rest)) => {
-                            let latency_ms = started.elapsed().as_millis() as u64;
-                            let stream = prepend_stream(prefix, rest);
-                            return Ok(self.outcome(
-                                candidate,
-                                route,
-                                attempts,
-                                latency_ms,
-                                RoutedStream::Transcoded(stream),
-                            ));
-                        }
-                        Err(error) => {
-                            let error = annotate_candidate_error(error, candidate, attempts);
-                            self.record_failure(candidate, &error).await;
-                            if !error.is_retryable() {
-                                return Err(error);
+                        candidate.address(),
+                        candidate.credential(),
+                        candidate.upstream_model(),
+                        Action::Stream,
+                        &body,
+                    );
+                    request.proxy = candidate.proxy();
+
+                    match self.client.stream(request).await {
+                        Ok(UpstreamSseStream {
+                            status,
+                            headers,
+                            stream,
+                        }) => match preflight_sse_stream(
+                            stream,
+                            self.codecs,
+                            candidate.protocol(),
+                            self.client.config().stream_idle_timeout,
+                            retry_policy,
+                            retry_policy.reject_nonstandard_200 && status == 200,
+                            response_content_type(&headers),
+                        )
+                        .await
+                        {
+                            Ok((prefix, rest, empty_duration)) => {
+                                if empty_duration.is_some_and(|duration| {
+                                    should_retry_empty(retry_policy, duration, empty_retries)
+                                }) {
+                                    empty_retries += 1;
+                                    attempts = attempts.saturating_add(1);
+                                    continue;
+                                }
+                                let latency_ms = started.elapsed().as_millis() as u64;
+                                let stream = prepend_stream(prefix, rest);
+                                return Ok(self.outcome(
+                                    candidate,
+                                    route,
+                                    attempts,
+                                    latency_ms,
+                                    RoutedStream::Transcoded(stream),
+                                ));
                             }
-                            last_error = error;
+                            Err(error) => {
+                                last_error =
+                                    self.handle_failure(candidate, error, attempts).await?;
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            last_error = self.handle_failure(candidate, error, attempts).await?;
+                            break;
                         }
-                    },
-                    Err(error) => {
-                        let error = annotate_candidate_error(error, candidate, attempts);
-                        self.record_failure(candidate, &error).await;
-                        if !error.is_retryable() {
-                            return Err(error);
-                        }
-                        last_error = error;
                     }
                 }
                 continue;
             }
 
             let prepared = prepare_native_body(candidate, route, raw_body)?;
-            let mut request = match &prepared {
-                PreparedBody::Raw(body) => UpstreamRequest::post_raw(
-                    candidate.protocol(),
-                    candidate.address(),
-                    candidate.credential(),
-                    candidate.upstream_model(),
-                    Action::Stream,
-                    body,
-                ),
-                PreparedBody::Json(body) => UpstreamRequest::post(
-                    candidate.protocol(),
-                    candidate.address(),
-                    candidate.credential(),
-                    candidate.upstream_model(),
-                    Action::Stream,
-                    body,
-                ),
-            };
-            request.extra_headers = headers;
-            request.proxy = candidate.proxy();
+            let extra_headers = merged_headers(headers, candidate);
+            loop {
+                let started = std::time::Instant::now();
+                let mut request = prepared.to_request(candidate, Action::Stream);
+                request.extra_headers = &extra_headers;
+                request.proxy = candidate.proxy();
 
-            match self.client.stream_raw(request).await {
-                Ok(response) => match preflight_raw_stream(
-                    response.stream,
-                    self.codecs,
-                    candidate.protocol(),
-                    self.client.config().stream_idle_timeout,
-                )
-                .await
-                {
-                    Ok((prefix, rest)) => {
-                        let latency_ms = started.elapsed().as_millis() as u64;
-                        let stream = prepend_stream(prefix, rest);
-                        return Ok(self.outcome(
-                            candidate,
-                            route,
-                            attempts,
-                            latency_ms,
-                            RoutedStream::Native(UpstreamRawStream {
-                                status: response.status,
-                                headers: response.headers,
-                                stream,
-                            }),
-                        ));
+                match self.client.stream_raw(request).await {
+                    Ok(response) => {
+                        let UpstreamRawStream {
+                            status,
+                            headers,
+                            stream,
+                        } = response;
+                        match preflight_raw_stream(
+                            stream,
+                            self.codecs,
+                            candidate.protocol(),
+                            self.client.config().stream_idle_timeout,
+                            retry_policy,
+                            retry_policy.reject_nonstandard_200 && status == 200,
+                            response_content_type(&headers),
+                        )
+                        .await
+                        {
+                            Ok((prefix, rest, empty_duration)) => {
+                                if empty_duration.is_some_and(|duration| {
+                                    should_retry_empty(retry_policy, duration, empty_retries)
+                                }) {
+                                    empty_retries += 1;
+                                    attempts = attempts.saturating_add(1);
+                                    continue;
+                                }
+                                let latency_ms = started.elapsed().as_millis() as u64;
+                                let stream = prepend_stream(prefix, rest);
+                                return Ok(self.outcome(
+                                    candidate,
+                                    route,
+                                    attempts,
+                                    latency_ms,
+                                    RoutedStream::Native(UpstreamRawStream {
+                                        status,
+                                        headers,
+                                        stream,
+                                    }),
+                                ));
+                            }
+                            Err(error) => {
+                                last_error =
+                                    self.handle_failure(candidate, error, attempts).await?;
+                                break;
+                            }
+                        }
                     }
                     Err(error) => {
-                        let error = annotate_candidate_error(error, candidate, attempts);
-                        self.record_failure(candidate, &error).await;
-                        if !error.is_retryable() {
-                            return Err(error);
-                        }
-                        last_error = error;
+                        last_error = self.handle_failure(candidate, error, attempts).await?;
+                        break;
                     }
-                },
-                Err(error) => {
-                    let error = annotate_candidate_error(error, candidate, attempts);
-                    self.record_failure(candidate, &error).await;
-                    if !error.is_retryable() {
-                        return Err(error);
-                    }
-                    last_error = error;
                 }
             }
         }
@@ -851,13 +1003,19 @@ impl RouteExecutor {
     }
 
     async fn record_success(&self, candidate: &Candidate<'_>, latency_ms: u64) {
-        if let Err(e) = self
+        match self
             .health
             .record_success(candidate.channel_id(), candidate.protocol(), latency_ms)
             .await
         {
+            Ok(recovered) => self.emit(RouterEvent::Success {
+                channel_id: candidate.channel_id(),
+                channel_name: candidate.channel.name.clone(),
+                protocol: candidate.protocol(),
+                recovered,
+            }),
             // 健康度写失败不能影响请求结果 —— 它是可观测性，不是正确性。
-            tracing::warn!(error = %e, "failed to record upstream success");
+            Err(e) => tracing::warn!(error = %e, "failed to record upstream success"),
         }
     }
 
@@ -865,7 +1023,7 @@ impl RouteExecutor {
         if !affects_endpoint_health(error.kind) {
             return;
         }
-        if let Err(e) = self
+        match self
             .health
             .record_failure(
                 candidate.channel_id(),
@@ -875,14 +1033,128 @@ impl RouteExecutor {
             )
             .await
         {
-            tracing::warn!(error = %e, "failed to record upstream failure");
+            Ok(health) => self.emit(RouterEvent::Failure {
+                channel_id: candidate.channel_id(),
+                channel_name: candidate.channel.name.clone(),
+                protocol: candidate.protocol(),
+                kind: error.kind,
+                message: error.message.clone(),
+                suspended: health.suspended_until.is_some(),
+                consecutive_fails: health.consecutive_fails,
+            }),
+            Err(e) => tracing::warn!(error = %e, "failed to record upstream failure"),
+        }
+    }
+
+    /// 发出一条路由事件。没有订阅者或队列已关闭时静默丢弃 ——
+    /// 事件是尽力而为的旁路信息，绝不反压请求路径。
+    fn emit(&self, event: RouterEvent) {
+        if let Some(sender) = &self.events {
+            let _ = sender.send(event);
         }
     }
 }
 
 enum PreparedBody<'a> {
     Raw(&'a [u8]),
+    /// multipart 改写模型名后产生的新字节。
+    OwnedRaw(Vec<u8>),
     Json(Value),
+}
+
+impl<'a> PreparedBody<'a> {
+    pub fn to_request(
+        &'a self,
+        candidate: &'a Candidate<'a>,
+        action: Action,
+    ) -> UpstreamRequest<'a> {
+        match self {
+            PreparedBody::Raw(body) => UpstreamRequest::post_raw(
+                candidate.protocol(),
+                candidate.address(),
+                candidate.credential(),
+                candidate.upstream_model(),
+                action,
+                body,
+            ),
+            PreparedBody::OwnedRaw(body) => UpstreamRequest::post_raw(
+                candidate.protocol(),
+                candidate.address(),
+                candidate.credential(),
+                candidate.upstream_model(),
+                action,
+                body.as_slice(),
+            ),
+            PreparedBody::Json(body) => UpstreamRequest::post(
+                candidate.protocol(),
+                candidate.address(),
+                candidate.credential(),
+                candidate.upstream_model(),
+                action,
+                body,
+            ),
+        }
+    }
+}
+
+/// 合并入站白名单头与渠道自定义头。渠道头在后 —— 同名时渠道配置获胜
+/// （用户显式配置的意图强于客户端透传）。
+fn merged_headers(
+    forwarded: &[(String, String)],
+    candidate: &Candidate<'_>,
+) -> Vec<(String, String)> {
+    forwarded
+        .iter()
+        .cloned()
+        .chain(candidate.channel.extra_headers.iter().cloned())
+        .collect()
+}
+
+/// multipart 表单的准备：只在需要模型别名时做 multipart 感知的字段值替换。
+///
+/// 表单不是 JSON，参数覆盖（JSON 合并语义）对它不适用；改写失败（表单里
+/// 没有 model 字段）时原样透传 —— 上游会按表单里的原值处理，这比拒绝请求
+/// 更接近「透明代理」的语义。
+fn prepare_multipart_body<'a>(
+    candidate: &Candidate<'_>,
+    route: &Route<'_>,
+    raw_body: &'a [u8],
+) -> PreparedBody<'a> {
+    if candidate.upstream_model() == route.model {
+        return PreparedBody::Raw(raw_body);
+    }
+    match rewrite_multipart_model(raw_body, candidate.upstream_model()) {
+        Some(rewritten) => PreparedBody::OwnedRaw(rewritten),
+        None => PreparedBody::Raw(raw_body),
+    }
+}
+
+/// 在 multipart 字节里把 `name="model"` 字段的值换成上游模型名。
+///
+/// 不引入完整的 multipart 解析器：字段值区间由「双 CRLF 之后到下一个 CRLF」
+/// 界定（model 是文本字段，值必然单行），这个结构由 RFC 7578 保证。
+/// 找不到字段返回 `None`。
+fn rewrite_multipart_model(raw: &[u8], upstream_model: &str) -> Option<Vec<u8>> {
+    const MARKER: &[u8] = b"name=\"model\"";
+    let marker_at = raw
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)?;
+    // 字段头（Content-Disposition 行等）以空行结束，之后才是值。
+    let after_marker = &raw[marker_at..];
+    let value_start_rel = after_marker
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?
+        + 4;
+    let value_start = marker_at + value_start_rel;
+    let value_len = raw[value_start..]
+        .windows(2)
+        .position(|window| window == b"\r\n")?;
+
+    let mut rewritten = Vec::with_capacity(raw.len() + upstream_model.len());
+    rewritten.extend_from_slice(&raw[..value_start]);
+    rewritten.extend_from_slice(upstream_model.as_bytes());
+    rewritten.extend_from_slice(&raw[value_start + value_len..]);
+    Some(rewritten)
 }
 
 /// 原生协议通常直接使用原始字节；模型别名或渠道覆盖只做顶层最小改写。
@@ -921,6 +1193,8 @@ fn apply_param_override(body: &mut Value, param_override: &Option<Value>, protoc
     let (Some(Value::Object(overrides)), Value::Object(map)) = (param_override, body) else {
         return;
     };
+    // `null` 是删除语义：merge 只能加和改，而「剥掉某上游不认的字段」
+    // （logprobs、reasoning_effort…）是参数覆盖剩下 20% 的高频诉求。
     for (key, value) in overrides {
         match protocol_group(key, value) {
             Some(group_protocol) => {
@@ -928,12 +1202,20 @@ fn apply_param_override(body: &mut Value, param_override: &Option<Value>, protoc
                     && let Value::Object(group) = value
                 {
                     for (k, v) in group {
-                        map.insert(k.clone(), v.clone());
+                        if v.is_null() {
+                            map.remove(k);
+                        } else {
+                            map.insert(k.clone(), v.clone());
+                        }
                     }
                 }
             }
             None => {
-                map.insert(key.clone(), value.clone());
+                if value.is_null() {
+                    map.remove(key);
+                } else {
+                    map.insert(key.clone(), value.clone());
+                }
             }
         }
     }
@@ -982,22 +1264,50 @@ fn decode_raw_request(
     Ok(ir)
 }
 
+struct NativeResponseInspection {
+    usage: Usage,
+    empty: bool,
+    protocol_standard: bool,
+}
+
 fn inspect_native_response(
     codecs: CodecSet,
     protocol: Protocol,
     body: &[u8],
-) -> Result<Usage, GatewayError> {
+    reject_nonstandard_200: bool,
+    status: u16,
+    content_type: &str,
+) -> Result<NativeResponseInspection, GatewayError> {
+    if body.is_empty() {
+        return Ok(NativeResponseInspection {
+            usage: Usage::default(),
+            empty: true,
+            protocol_standard: false,
+        });
+    }
     let value: Value = serde_json::from_slice(body).map_err(|error| {
-        GatewayError::new(
-            ErrorKind::UpstreamError,
-            format!("upstream returned malformed JSON: {error}"),
-        )
+        if reject_nonstandard_200 && status == 200 {
+            invalid_200_response(protocol, content_type, body)
+        } else {
+            GatewayError::new(
+                ErrorKind::UpstreamError,
+                format!("upstream returned malformed JSON: {error}"),
+            )
+        }
     })?;
 
     let explicit_error = value.get("error").is_some_and(|error| !error.is_null())
         || value.get("type").and_then(Value::as_str) == Some("error")
         || value.get("type").and_then(Value::as_str) == Some("response.failed")
         || value.pointer("/response/status").and_then(Value::as_str) == Some("failed");
+    let recognizable_generation = match protocol {
+        Protocol::Chat => value.get("choices").is_some(),
+        Protocol::Responses => {
+            value.get("output").is_some() || value.pointer("/response/output").is_some()
+        }
+        Protocol::Messages => value.get("content").is_some(),
+        Protocol::Gemini => value.get("candidates").is_some(),
+    };
     let decoded = codecs.for_protocol(protocol).decode_response(&value);
     if explicit_error {
         return Err(decoded.err().unwrap_or_else(|| {
@@ -1009,7 +1319,126 @@ fn inspect_native_response(
     }
 
     // 未知的新成功形状不得阻断原生直通；能识别时提取 usage，不能识别时为 0。
-    Ok(decoded.map(|response| response.usage).unwrap_or_default())
+    Ok(match decoded {
+        Ok(response) => NativeResponseInspection {
+            usage: response.usage,
+            empty: recognizable_generation && unified_response_is_empty(&response),
+            protocol_standard: recognizable_generation,
+        },
+        // 未知的新成功形状不能被误判为空回复。
+        Err(_) => NativeResponseInspection {
+            usage: Usage::default(),
+            empty: false,
+            protocol_standard: false,
+        },
+    })
+}
+
+const RESPONSE_PREVIEW_LIMIT: usize = 160;
+
+fn response_content_type(headers: &http::HeaderMap) -> &str {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+}
+
+fn response_preview(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "<empty>".to_owned();
+    }
+    let end = body.len().min(RESPONSE_PREVIEW_LIMIT);
+    let mut preview: String = String::from_utf8_lossy(&body[..end])
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if body.len() > RESPONSE_PREVIEW_LIMIT {
+        preview.push('…');
+    }
+    preview
+}
+
+fn sse_response_preview(events: &[refract_upstream::sse::SseEvent]) -> Vec<u8> {
+    let mut preview = Vec::with_capacity(RESPONSE_PREVIEW_LIMIT);
+    for event in events {
+        for part in [event.event.as_bytes(), b": ", event.data.as_bytes(), b"\n"] {
+            let remaining = RESPONSE_PREVIEW_LIMIT.saturating_sub(preview.len());
+            preview.extend_from_slice(&part[..part.len().min(remaining)]);
+            if preview.len() == RESPONSE_PREVIEW_LIMIT {
+                return preview;
+            }
+        }
+    }
+    preview
+}
+
+fn byte_stream_preview(chunks: &[Bytes]) -> Vec<u8> {
+    let mut preview = Vec::with_capacity(RESPONSE_PREVIEW_LIMIT);
+    for chunk in chunks {
+        let remaining = RESPONSE_PREVIEW_LIMIT.saturating_sub(preview.len());
+        preview.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if preview.len() == RESPONSE_PREVIEW_LIMIT {
+            break;
+        }
+    }
+    preview
+}
+
+fn invalid_200_response(protocol: Protocol, content_type: &str, body: &[u8]) -> GatewayError {
+    let preview = response_preview(body);
+    GatewayError::new(
+        ErrorKind::InvalidUpstreamResponse,
+        format!(
+            "upstream returned HTTP 200 with a response that does not match the configured `{protocol}` protocol (content-type: {content_type}; body preview: {preview:?})"
+        ),
+    )
+    .with_protocol(protocol)
+    .with_upstream(200, preview)
+}
+
+fn invalid_parsed_200_response(protocol: Protocol, response: &UpstreamResponse) -> GatewayError {
+    let body = response.body.to_string();
+    invalid_200_response(
+        protocol,
+        response_content_type(&response.headers),
+        body.as_bytes(),
+    )
+}
+
+fn strict_200_parse_error(enabled: bool, protocol: Protocol, error: GatewayError) -> GatewayError {
+    if enabled && error.upstream_status == Some(200) {
+        let body = error.upstream_body.as_deref().unwrap_or_default();
+        invalid_200_response(protocol, "unknown", body.as_bytes())
+    } else {
+        error
+    }
+}
+
+/// “空回复”只看模型输出；纯 usage、停止原因与协议仪式字段都不算内容。
+fn unified_response_is_empty(response: &UnifiedResponse) -> bool {
+    response.content.iter().all(|part| match part {
+        ContentPart::Text { text }
+        | ContentPart::Thinking { text, .. }
+        | ContentPart::Refusal { text } => text.trim().is_empty(),
+        ContentPart::RedactedThinking { data } => data.trim().is_empty(),
+        _ => false,
+    })
+}
+
+fn should_retry_empty(
+    policy: EmptyResponseRetryPolicy,
+    first_byte_to_end: Duration,
+    retries: u32,
+) -> bool {
+    policy.enabled()
+        && retries < policy.max_retries
+        && first_byte_to_end <= Duration::from_secs(u64::from(policy.window_secs))
 }
 
 const STREAM_PREFLIGHT_LIMIT: usize = 1024 * 1024;
@@ -1019,46 +1448,95 @@ async fn preflight_sse_stream(
     mut stream: SseStream,
     codecs: CodecSet,
     protocol: Protocol,
-    timeout: Duration,
-) -> Result<(Vec<refract_upstream::sse::SseEvent>, SseStream), GatewayError> {
-    tokio::time::timeout(timeout, async move {
-        let mut decoder = codecs.for_protocol(protocol).stream_decoder();
-        let mut prefix = Vec::new();
-        let mut bytes = 0_usize;
+    idle_timeout: Duration,
+    empty_policy: EmptyResponseRetryPolicy,
+    reject_nonstandard_200: bool,
+    content_type: &str,
+) -> Result<
+    (
+        Vec<refract_upstream::sse::SseEvent>,
+        SseStream,
+        Option<Duration>,
+    ),
+    GatewayError,
+> {
+    let mut decoder = codecs.for_protocol(protocol).stream_decoder();
+    let mut prefix = Vec::new();
+    let mut bytes = 0_usize;
+    let mut first_byte_at: Option<std::time::Instant> = None;
+    let mut saw_valid_event = false;
 
-        while let Some(item) = stream.next().await {
-            let event = item?;
-            bytes = bytes.saturating_add(event.event.len() + event.data.len());
-            if bytes > STREAM_PREFLIGHT_LIMIT {
-                return Err(GatewayError::new(
-                    ErrorKind::UpstreamError,
-                    "upstream produced over 1 MiB before its first valid stream event",
-                ));
-            }
-            let frame = SseFrame {
-                event: (!event.event.is_empty()).then(|| event.event.clone()),
-                data: event.data.clone(),
-            };
-            let events = decoder.decode(&frame)?;
-            let meaningful = validate_stream_events(&events)?;
-            prefix.push(event);
-            if meaningful {
-                return Ok((prefix, stream));
-            }
+    loop {
+        if saw_valid_event
+            && let Some(first) = first_byte_at
+            && empty_policy.enabled()
+            && first.elapsed() >= Duration::from_secs(u64::from(empty_policy.window_secs))
+        {
+            return Ok((prefix, stream, None));
         }
 
-        Err(GatewayError::new(
-            ErrorKind::UpstreamError,
-            "upstream stream ended before its first valid event",
-        ))
-    })
-    .await
-    .map_err(|_| {
-        GatewayError::new(
-            ErrorKind::Timeout,
-            "upstream did not produce a valid first stream event before the idle deadline",
-        )
-    })?
+        let next = if saw_valid_event && empty_policy.enabled() {
+            let deadline = first_byte_at.expect("valid event follows first byte")
+                + Duration::from_secs(u64::from(empty_policy.window_secs));
+            tokio::select! {
+                item = tokio::time::timeout(idle_timeout, stream.next()) => item,
+                () = tokio::time::sleep_until(deadline.into()) => {
+                    return Ok((prefix, stream, None));
+                }
+            }
+        } else {
+            tokio::time::timeout(idle_timeout, stream.next()).await
+        }
+        .map_err(|_| {
+            GatewayError::new(
+                ErrorKind::Timeout,
+                "upstream did not produce a valid first stream event before the idle deadline",
+            )
+        })?;
+
+        let Some(item) = next else {
+            if !saw_valid_event {
+                return Err(if reject_nonstandard_200 {
+                    invalid_200_response(protocol, content_type, &sse_response_preview(&prefix))
+                } else {
+                    GatewayError::new(
+                        ErrorKind::UpstreamError,
+                        "upstream stream ended before its first valid event",
+                    )
+                });
+            }
+            let elapsed = first_byte_at.map_or(Duration::ZERO, |first| first.elapsed());
+            return Ok((prefix, stream, Some(elapsed)));
+        };
+
+        let event = item?;
+        first_byte_at.get_or_insert_with(std::time::Instant::now);
+        bytes = bytes.saturating_add(event.event.len() + event.data.len());
+        if bytes > STREAM_PREFLIGHT_LIMIT {
+            return Err(GatewayError::new(
+                ErrorKind::UpstreamError,
+                "upstream produced over 1 MiB before its first model output",
+            ));
+        }
+        let frame = SseFrame {
+            event: (!event.event.is_empty()).then(|| event.event.clone()),
+            data: event.data.clone(),
+        };
+        let events = decoder.decode(&frame).map_err(|error| {
+            if reject_nonstandard_200 {
+                invalid_200_response(protocol, content_type, event.data.as_bytes())
+            } else {
+                error
+            }
+        })?;
+        let meaningful = validate_stream_events(&events)?;
+        let has_output = stream_events_have_output(&events);
+        saw_valid_event |= meaningful;
+        prefix.push(event);
+        if has_output || (meaningful && !empty_policy.enabled()) {
+            return Ok((prefix, stream, None));
+        }
+    }
 }
 
 /// 原生字节流预检完整 SSE 帧，同时保留已读取 chunk 供原样回放。
@@ -1066,49 +1544,120 @@ async fn preflight_raw_stream(
     mut stream: ByteStream,
     codecs: CodecSet,
     protocol: Protocol,
-    timeout: Duration,
-) -> Result<(Vec<Bytes>, ByteStream), GatewayError> {
-    tokio::time::timeout(timeout, async move {
-        let mut parser = SseParser::new();
-        let mut decoder = codecs.for_protocol(protocol).stream_decoder();
-        let mut prefix = Vec::new();
-        let mut bytes = 0_usize;
+    idle_timeout: Duration,
+    empty_policy: EmptyResponseRetryPolicy,
+    reject_nonstandard_200: bool,
+    content_type: &str,
+) -> Result<(Vec<Bytes>, ByteStream, Option<Duration>), GatewayError> {
+    let mut parser = SseParser::new();
+    let mut decoder = codecs.for_protocol(protocol).stream_decoder();
+    let mut prefix = Vec::new();
+    let mut bytes = 0_usize;
+    let mut first_byte_at: Option<std::time::Instant> = None;
+    let mut saw_valid_event = false;
 
-        while let Some(item) = stream.next().await {
-            let chunk = item?;
-            bytes = bytes.saturating_add(chunk.len());
-            if bytes > STREAM_PREFLIGHT_LIMIT {
-                return Err(GatewayError::new(
-                    ErrorKind::UpstreamError,
-                    "upstream produced over 1 MiB before its first valid stream event",
-                ));
-            }
-            let frames = parser.feed_bytes(&chunk)?;
-            prefix.push(chunk);
-            for frame in frames {
-                if validate_stream_events(&decoder.decode(&frame)?)? {
-                    return Ok((prefix, stream));
+    loop {
+        if saw_valid_event
+            && let Some(first) = first_byte_at
+            && empty_policy.enabled()
+            && first.elapsed() >= Duration::from_secs(u64::from(empty_policy.window_secs))
+        {
+            return Ok((prefix, stream, None));
+        }
+
+        let next = if saw_valid_event && empty_policy.enabled() {
+            let deadline = first_byte_at.expect("valid event follows first byte")
+                + Duration::from_secs(u64::from(empty_policy.window_secs));
+            tokio::select! {
+                item = tokio::time::timeout(idle_timeout, stream.next()) => item,
+                () = tokio::time::sleep_until(deadline.into()) => {
+                    return Ok((prefix, stream, None));
                 }
             }
+        } else {
+            tokio::time::timeout(idle_timeout, stream.next()).await
         }
+        .map_err(|_| {
+            GatewayError::new(
+                ErrorKind::Timeout,
+                "upstream did not produce a valid first stream event before the idle deadline",
+            )
+        })?;
 
-        if let Some(frame) = parser.finish_bytes()?
-            && validate_stream_events(&decoder.decode(&frame)?)?
-        {
-            return Ok((prefix, stream));
+        let Some(item) = next else {
+            let preview = byte_stream_preview(&prefix);
+            let final_frame = parser.finish_bytes().map_err(|error| {
+                if reject_nonstandard_200 {
+                    invalid_200_response(protocol, content_type, &preview)
+                } else {
+                    error
+                }
+            })?;
+            if let Some(frame) = final_frame {
+                let events = decoder.decode(&frame).map_err(|error| {
+                    if reject_nonstandard_200 {
+                        invalid_200_response(protocol, content_type, &preview)
+                    } else {
+                        error
+                    }
+                })?;
+                saw_valid_event |= validate_stream_events(&events)?;
+                if stream_events_have_output(&events) {
+                    return Ok((prefix, stream, None));
+                }
+            }
+            if !saw_valid_event {
+                return Err(if reject_nonstandard_200 {
+                    invalid_200_response(protocol, content_type, &preview)
+                } else {
+                    GatewayError::new(
+                        ErrorKind::UpstreamError,
+                        "upstream stream ended before its first valid event",
+                    )
+                });
+            }
+            let elapsed = first_byte_at.map_or(Duration::ZERO, |first| first.elapsed());
+            return Ok((prefix, stream, Some(elapsed)));
+        };
+
+        let chunk = item?;
+        if !chunk.is_empty() {
+            first_byte_at.get_or_insert_with(std::time::Instant::now);
         }
-        Err(GatewayError::new(
-            ErrorKind::UpstreamError,
-            "upstream stream ended before its first valid event",
-        ))
-    })
-    .await
-    .map_err(|_| {
-        GatewayError::new(
-            ErrorKind::Timeout,
-            "upstream did not produce a valid first stream event before the idle deadline",
-        )
-    })?
+        bytes = bytes.saturating_add(chunk.len());
+        if bytes > STREAM_PREFLIGHT_LIMIT {
+            return Err(GatewayError::new(
+                ErrorKind::UpstreamError,
+                "upstream produced over 1 MiB before its first model output",
+            ));
+        }
+        prefix.push(chunk);
+        let preview = byte_stream_preview(&prefix);
+        let frames = parser
+            .feed_bytes(prefix.last().expect("chunk was just pushed"))
+            .map_err(|error| {
+                if reject_nonstandard_200 {
+                    invalid_200_response(protocol, content_type, &preview)
+                } else {
+                    error
+                }
+            })?;
+        for frame in frames {
+            let events = decoder.decode(&frame).map_err(|error| {
+                if reject_nonstandard_200 {
+                    invalid_200_response(protocol, content_type, &preview)
+                } else {
+                    error
+                }
+            })?;
+            let meaningful = validate_stream_events(&events)?;
+            let has_output = stream_events_have_output(&events);
+            saw_valid_event |= meaningful;
+            if has_output || (meaningful && !empty_policy.enabled()) {
+                return Ok((prefix, stream, None));
+            }
+        }
+    }
 }
 
 fn validate_stream_events(events: &[StreamEvent]) -> Result<bool, GatewayError> {
@@ -1134,6 +1683,34 @@ fn validate_stream_events(events: &[StreamEvent]) -> Result<bool, GatewayError> 
     Ok(events
         .iter()
         .any(|event| !matches!(event, StreamEvent::Ping)))
+}
+
+fn stream_events_have_output(events: &[StreamEvent]) -> bool {
+    events.iter().any(|event| match event {
+        StreamEvent::TextDelta { text, .. }
+        | StreamEvent::ThinkingDelta { text, .. }
+        | StreamEvent::RefusalDelta { text, .. } => !text.trim().is_empty(),
+        StreamEvent::ToolCallStart { .. } => true,
+        StreamEvent::ToolCallArgsDelta { fragment, .. } => !fragment.trim().is_empty(),
+        _ => false,
+    })
+}
+
+#[cfg(test)]
+mod empty_response_tests {
+    use super::*;
+
+    #[test]
+    fn retry_requires_empty_completion_inside_window_and_remaining_budget() {
+        let policy = EmptyResponseRetryPolicy {
+            window_secs: 3,
+            max_retries: 5,
+            reject_nonstandard_200: false,
+        };
+        assert!(should_retry_empty(policy, Duration::from_secs(3), 0));
+        assert!(!should_retry_empty(policy, Duration::from_millis(3001), 0));
+        assert!(!should_retry_empty(policy, Duration::from_secs(1), 5));
+    }
 }
 
 fn prepend_stream<T>(
@@ -1176,6 +1753,7 @@ fn affects_endpoint_health(kind: ErrorKind) -> bool {
             | ErrorKind::PermissionDenied
             | ErrorKind::RateLimited
             | ErrorKind::UpstreamError
+            | ErrorKind::InvalidUpstreamResponse
             | ErrorKind::Timeout
             | ErrorKind::Configuration
             // 上游 404 说明渠道的地址或模型名配错了 —— 客户端拼错模型在
@@ -1263,5 +1841,26 @@ fn rewrite_model(body: &mut Value, protocol: Protocol, upstream_model: &str) {
     }
     if let Value::Object(map) = body {
         map.insert("model".into(), Value::String(upstream_model.to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod multipart_tests {
+    use super::rewrite_multipart_model;
+
+    #[test]
+    fn rewrites_only_the_model_field_value() {
+        let form = b"--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nalias\r\n--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\r\nDATA\r\n--B--\r\n";
+        let out = rewrite_multipart_model(form, "real-model").unwrap();
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains("\r\nreal-model\r\n"));
+        assert!(!text.contains("\r\nalias\r\n"));
+        assert!(text.contains("DATA"), "other parts must be untouched");
+    }
+
+    #[test]
+    fn missing_model_field_returns_none() {
+        let form = b"--B\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nDATA\r\n--B--\r\n";
+        assert!(rewrite_multipart_model(form, "x").is_none());
     }
 }

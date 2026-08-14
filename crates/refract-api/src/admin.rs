@@ -16,11 +16,11 @@ use refract_core::{Action, Channel, ChannelId, Credential, GatewayError, Protoco
 use refract_store::{LogFilter, NewApiKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use warp::{Filter, Rejection, Reply};
+use warp::{Filter, Rejection, Reply, filters::BoxedFilter};
 
 use crate::auth::admin_auth;
 use crate::error::{ApiError, store_to_gateway};
-use crate::state::AppState;
+use crate::state::{AppState, with_state};
 
 /// 统一成功包裹。
 ///
@@ -141,19 +141,41 @@ fn restore_unchanged_credentials(existing: &Channel, incoming: &mut Channel) {
 }
 
 /// 装配管理路由。
-pub fn routes(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let auth = admin_auth(state.clone());
 
-    warp::path("api").and(auth).and(
-        channels(state.clone())
-            .or(keys(state.clone()))
-            .or(logs(state.clone()))
-            .or(stats(state.clone()))
-            .or(settings(state.clone()))
-            .or(health(state.clone()))
-            .or(backup(state.clone()))
-            .or(models(state)),
-    )
+    warp::path("api")
+        .and(auth)
+        .and(routes![
+            channels(state.clone()),
+            keys(state.clone()),
+            logs(state.clone()),
+            stats(state.clone()),
+            settings(state.clone()),
+            health(state.clone()),
+            backup(state.clone()),
+            playground(state.clone()),
+            data(state.clone()),
+            models(state),
+        ])
+        .boxed()
+}
+
+/// `POST /api/playground/chat` —— 管理面的模型调试台。
+///
+/// 请求体是 OpenAI Chat 形状，直接进入网关的完整分发管线（路由、转码、
+/// 熔断、日志一个不少）；流式响应原样转发 SSE。
+fn playground(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
+    warp::path("playground")
+        .and(warp::path("chat"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::bytes())
+        .and(with_state(state))
+        .and_then(|raw: bytes::Bytes, state: AppState| async move {
+            crate::gateway::playground_chat(state, raw).await
+        })
+        .boxed()
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +183,7 @@ pub fn routes(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = R
 // ---------------------------------------------------------------------------
 
 /// 渠道 CRUD。
-fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let base = warp::path("channels");
     let st = state.clone();
     let probe_state = state.clone();
@@ -171,7 +193,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
     let list = base
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(st.clone()))
+        .and(with_state(st.clone()))
         .and_then(|state: AppState| async move {
             let items = state
                 .channel_repo()
@@ -181,12 +203,59 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
             ok(items.into_iter().map(redact_channel).collect::<Vec<_>>())
         });
 
+    // POST /api/channels/{id}/balance —— 查询上游余额并缓存。
+    let balance_state = state.clone();
+    let balance = base
+        .and(warp::path::param::<i64>())
+        .and(warp::path("balance"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_state(balance_state))
+        .and_then(|id: i64, state: AppState| async move {
+            let channel = state
+                .channel_repo()
+                .get(refract_core::DEFAULT_OWNER_ID, id)
+                .await
+                .map_err(reject)?;
+            // 找一个 OpenAI 形状端点：余额协议只在这类上游有定义。
+            let endpoint = channel
+                .endpoints
+                .iter()
+                .find(|ep| {
+                    ep.enabled
+                        && matches!(
+                            ep.protocol,
+                            refract_core::Protocol::Chat | refract_core::Protocol::Responses
+                        )
+                })
+                .ok_or_else(|| {
+                    reject(refract_store::StoreError::Invalid(
+                        "balance probing needs an enabled chat/responses endpoint".into(),
+                    ))
+                })?;
+            let amount = refract_upstream::probe_balance(
+                state.upstream(),
+                endpoint.protocol,
+                channel.effective_address(endpoint),
+                channel.effective_credential(endpoint),
+                channel.proxy.as_deref(),
+            )
+            .await
+            .map_err(|e| warp::reject::custom(ApiError(e)))?;
+            state
+                .channel_repo()
+                .set_balance(refract_core::DEFAULT_OWNER_ID, id, amount)
+                .await
+                .map_err(reject)?;
+            ok(serde_json::json!({ "id": id, "balance": amount }))
+        });
+
     // POST /api/channels
     let create = base
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|mut channel: Channel, state: AppState| async move {
             // 客户端传什么 owner_id 都无所谓 —— 服务端定。
             channel.owner_id = refract_core::DEFAULT_OWNER_ID;
@@ -207,7 +276,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::param::<ChannelId>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|id: ChannelId, state: AppState| async move {
             let channel = state
                 .channel_repo()
@@ -223,7 +292,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::put())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(
             |id: ChannelId, mut channel: Channel, state: AppState| async move {
                 // 路径里的 id 是权威的，body 里的被忽略 —— 否则一个 PUT /1 带 body.id=2
@@ -253,7 +322,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::param::<ChannelId>())
         .and(warp::path::end())
         .and(warp::delete())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|id: ChannelId, state: AppState| async move {
             state
                 .channel_repo()
@@ -271,7 +340,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(
             |id: ChannelId, body: EnabledBody, state: AppState| async move {
                 state
@@ -291,7 +360,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(probe_state))
+        .and(with_state(probe_state))
         .and_then(
             |id: ChannelId, body: EndpointRef, state: AppState| async move {
                 let channel = state
@@ -320,7 +389,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(test_state))
+        .and(with_state(test_state))
         .and_then(
             |id: ChannelId, body: TestRequest, state: AppState| async move {
                 let channel = state
@@ -340,7 +409,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path("duplicate"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|id: ChannelId, state: AppState| async move {
             let mut copy = state
                 .channel_repo()
@@ -363,7 +432,7 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|body: BulkRequest, state: AppState| async move {
             let repo = state.channel_repo();
             let owner = refract_core::DEFAULT_OWNER_ID;
@@ -379,24 +448,9 @@ fn channels(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
 
     // 顺序：具体路径在前，参数路径在后。`/channels/bulk` 与 `/channels/:id/enabled`
     // 必须先匹配，否则 `:id` 会尝试把 "bulk"/"enabled" 解析成数字然后失败。
-    list.or(create)
-        .unify()
-        .or(bulk)
-        .unify()
-        .or(toggle)
-        .unify()
-        .or(probe)
-        .unify()
-        .or(test)
-        .unify()
-        .or(duplicate)
-        .unify()
-        .or(get)
-        .unify()
-        .or(update)
-        .unify()
-        .or(delete)
-        .unify()
+    routes![
+        list, create, bulk, toggle, probe, test, duplicate, balance, get, update, delete,
+    ]
 }
 
 /// 批量操作请求体。
@@ -427,7 +481,7 @@ struct EndpointRef {
 /// 连通性测试的请求体。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct TestRequest {
+pub(crate) struct TestRequest {
     /// 指定端点；省略则用首选端点。
     protocol: Option<Protocol>,
     /// 指定模型；省略则用该端点的第一个模型。
@@ -469,7 +523,7 @@ fn pick_endpoint(
 ///
 /// 不做协议转换：测试的目标是「这个端点的原生协议能不能正常工作」，
 /// 转换能力由路由层保证，不在这里重复验证。
-async fn run_channel_test(
+pub(crate) async fn run_channel_test(
     state: &AppState,
     channel: &Channel,
     req: TestRequest,
@@ -484,7 +538,11 @@ async fn run_channel_test(
         }
     };
 
-    let model = test_upstream_model(endpoint, req.model.as_deref());
+    // 优先级：本次请求指定 > 渠道配置的测试模型 > 端点第一个模型。
+    let model = test_upstream_model(
+        endpoint,
+        req.model.as_deref().or(channel.test_model.as_deref()),
+    );
 
     let ir = refract_protocol::UnifiedRequest::new(
         &model,
@@ -523,24 +581,39 @@ async fn run_channel_test(
         refract_core::Action::Generate,
         &body,
     );
+    let channel_headers = channel.extra_headers.clone();
+    req.extra_headers = &channel_headers;
     req.proxy = channel.proxy.as_deref();
 
+    let started = std::time::Instant::now();
     match state.upstream().send(req).await {
         Ok(resp) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
             let status = resp.status;
+            let success = (200..300).contains(&status);
+            if success {
+                // 测试通过等于一次真实成功 —— 顺手解除该端点的熔断，
+                // 不必等下一个用户请求去当探针。
+                let _ = state
+                    .health_repo()
+                    .record_success(channel.id, endpoint.protocol, latency_ms)
+                    .await;
+            }
             serde_json::json!({
-                "success": (200..300).contains(&status),
-                "message": if (200..300).contains(&status) {
+                "success": success,
+                "message": if success {
                     "upstream responded successfully"
                 } else {
                     "upstream returned non-2xx"
                 },
                 "upstream_status": status,
+                "latency_ms": latency_ms,
             })
         }
         Err(e) => serde_json::json!({
             "success": false,
             "message": e.to_string(),
+            "latency_ms": started.elapsed().as_millis() as u64,
         }),
     }
 }
@@ -603,13 +676,13 @@ fn validate(channel: &Channel) -> Result<(), Rejection> {
 // ---------------------------------------------------------------------------
 
 /// 网关密钥管理。
-fn keys(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+fn keys(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let base = warp::path("keys");
 
     let list = base
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|state: AppState| async move {
             let items = state
                 .key_repo()
@@ -623,7 +696,7 @@ fn keys(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejecti
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|spec: NewApiKey, state: AppState| async move {
             let (key, plaintext) = state
                 .key_repo()
@@ -640,7 +713,7 @@ fn keys(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejecti
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|id: i64, body: EnabledBody, state: AppState| async move {
             state
                 .key_repo()
@@ -650,11 +723,45 @@ fn keys(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejecti
             ok(serde_json::json!({ "id": id, "enabled": body.enabled }))
         });
 
+    // PUT /api/keys/{id} —— 改治理属性，密钥本体不变。
+    let update = base
+        .and(warp::path::param::<i64>())
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(
+            |id: i64, spec: refract_store::NewApiKey, state: AppState| async move {
+                let key = state
+                    .key_repo()
+                    .update(refract_core::DEFAULT_OWNER_ID, id, &spec)
+                    .await
+                    .map_err(reject)?;
+                ok(key)
+            },
+        );
+
+    // POST /api/keys/{id}/reset-usage —— 已用配额清零（周期预算的手动形态）。
+    let reset_usage = base
+        .and(warp::path::param::<i64>())
+        .and(warp::path("reset-usage"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_state(state.clone()))
+        .and_then(|id: i64, state: AppState| async move {
+            state
+                .key_repo()
+                .reset_usage(refract_core::DEFAULT_OWNER_ID, id)
+                .await
+                .map_err(reject)?;
+            ok(serde_json::json!({ "id": id, "used_quota": 0 }))
+        });
+
     let delete = base
         .and(warp::path::param::<i64>())
         .and(warp::path::end())
         .and(warp::delete())
-        .and(with(state))
+        .and(with_state(state))
         .and_then(|id: i64, state: AppState| async move {
             state
                 .key_repo()
@@ -664,12 +771,80 @@ fn keys(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejecti
             ok(serde_json::json!({ "deleted": id }))
         });
 
-    list.or(create)
-        .unify()
-        .or(toggle)
-        .unify()
-        .or(delete)
-        .unify()
+    routes![list, create, toggle, update, reset_usage, delete]
+}
+
+// ---------------------------------------------------------------------------
+// 数据管理
+// ---------------------------------------------------------------------------
+
+/// 数据库观测与在线备份。
+fn data(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
+    let base = warp::path("data");
+
+    // GET /api/data/stats —— 库体积、日志行数、最旧日志。
+    // 正文快照 + 长保留天数组合下库会悄悄长大，用户第一次发现不该是磁盘满。
+    let stats = base
+        .and(warp::path("stats"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let (db_bytes, log_rows, oldest) = state.db().stats().await.map_err(reject)?;
+            ok(serde_json::json!({
+                "db_bytes": db_bytes,
+                "log_rows": log_rows,
+                "oldest_log_at": oldest,
+            }))
+        });
+
+    // GET /api/data/backup —— `VACUUM INTO` 在线热备（WAL 下安全、产物已紧凑），
+    // 直接作为附件下发。个人库通常几十 MB，读进内存可接受；超限提示走停机备份。
+    let backup = base
+        .and(warp::path("backup"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state))
+        .and_then(|state: AppState| async move {
+            const MAX_INLINE_BACKUP: u64 = 512 * 1024 * 1024;
+            let target = std::env::temp_dir().join(format!(
+                "refract-backup-{}.db",
+                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            ));
+            if let Err(e) = state.db().vacuum_into(&target).await {
+                let _ = tokio::fs::remove_file(&target).await;
+                return Err(reject(e));
+            }
+            let metadata = tokio::fs::metadata(&target).await.ok();
+            if metadata.is_none_or(|m| m.len() > MAX_INLINE_BACKUP) {
+                let _ = tokio::fs::remove_file(&target).await;
+                return Err(reject(refract_store::StoreError::Invalid(
+                    "database exceeds 512 MB — back it up offline (see OPERATIONS.md)".into(),
+                )));
+            }
+            let bytes = tokio::fs::read(&target).await.map_err(|e| {
+                warp::reject::custom(ApiError(refract_core::GatewayError::internal(
+                    e.to_string(),
+                )))
+            })?;
+            let _ = tokio::fs::remove_file(&target).await;
+            let mut response = warp::reply::Response::new(bytes.into());
+            response.headers_mut().insert(
+                "content-type",
+                warp::http::HeaderValue::from_static("application/vnd.sqlite3"),
+            );
+            if let Ok(disposition) = warp::http::HeaderValue::from_str(&format!(
+                "attachment; filename=\"refract-{}.db\"",
+                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            )) {
+                response
+                    .headers_mut()
+                    .insert("content-disposition", disposition);
+            }
+            Ok::<_, Rejection>(response)
+        });
+
+    routes![stats, backup]
 }
 
 // ---------------------------------------------------------------------------
@@ -677,14 +852,14 @@ fn keys(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejecti
 // ---------------------------------------------------------------------------
 
 /// 请求日志查询。
-fn logs(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+fn logs(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let base = warp::path("logs");
 
     let query = base
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<LogFilter>())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|filter: LogFilter, state: AppState| async move {
             let items = state
                 .log_repo()
@@ -699,13 +874,68 @@ fn logs(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejecti
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(state))
+        .and(with_state(state.clone()))
         .and_then(|body: PruneBody, state: AppState| async move {
             let removed = state.log_repo().prune(body.days).await.map_err(reject)?;
             ok(serde_json::json!({ "removed": removed }))
         });
 
-    prune.or(query).unify()
+    // GET /api/logs/export —— 按当前筛选导出 NDJSON（上限 5 万行，防失控）。
+    // 与列表接口共用同一个 filter：所见即所导。
+    let export = base
+        .and(warp::path("export"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<LogFilter>())
+        .and(with_state(state.clone()))
+        .and_then(|mut filter: LogFilter, state: AppState| async move {
+            filter.limit = Some(filter.limit.unwrap_or(50_000).min(50_000));
+            filter.offset = None;
+            let items = state
+                .log_repo()
+                .query(refract_core::DEFAULT_OWNER_ID, &filter)
+                .await
+                .map_err(reject)?;
+            let mut body = String::with_capacity(items.len() * 256);
+            for item in &items {
+                if let Ok(line) = serde_json::to_string(item) {
+                    body.push_str(&line);
+                    body.push('\n');
+                }
+            }
+            let response = warp::http::Response::builder()
+                .header("content-type", "application/x-ndjson; charset=utf-8")
+                .header(
+                    "content-disposition",
+                    "attachment; filename=\"refract-logs.ndjson\"",
+                )
+                .body(body)
+                .map_err(|e| {
+                    warp::reject::custom(crate::error::ApiError(
+                        refract_core::GatewayError::internal(e.to_string()),
+                    ))
+                })?;
+            Ok::<_, Rejection>(response.into_response())
+        });
+
+    // GET /api/logs/{id} —— 单条完整记录，含请求/响应正文快照。
+    // 正文可能几十 KB，列表接口永远不带；只有用户点开详情才取。
+    let detail = base
+        .and(warp::path::param::<i64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state))
+        .and_then(|id: i64, state: AppState| async move {
+            let log = state
+                .log_repo()
+                .get(refract_core::DEFAULT_OWNER_ID, id)
+                .await
+                .map_err(reject)?;
+            ok(log)
+        });
+
+    // ok() 包 JSON 信封，export 是裸响应 —— 两组 Reply 类型不同，boxed 统一。
+    routes![prune, detail, query, export]
 }
 
 /// 日志清理请求体。
@@ -726,15 +956,29 @@ fn default_hours() -> u32 {
     24
 }
 
+/// 时序统计的查询参数。
+#[derive(Debug, Deserialize)]
+struct TimeseriesQuery {
+    #[serde(default = "default_hours")]
+    hours: u32,
+    /// `hour`（默认）或 `day`。
+    #[serde(default = "default_bucket")]
+    bucket: String,
+}
+
+fn default_bucket() -> String {
+    "hour".into()
+}
+
 /// 仪表盘统计。
-fn stats(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+fn stats(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let base = warp::path("stats");
 
     let summary = base
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<StatsQuery>())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|q: StatsQuery, state: AppState| async move {
             let value = state
                 .log_repo()
@@ -749,7 +993,7 @@ fn stats(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Reject
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<StatsQuery>())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|q: StatsQuery, state: AppState| async move {
             let items = state
                 .log_repo()
@@ -759,12 +1003,42 @@ fn stats(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Reject
             ok(items)
         });
 
+    let by_channel = base
+        .and(warp::path("channels"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<StatsQuery>())
+        .and(with_state(state.clone()))
+        .and_then(|q: StatsQuery, state: AppState| async move {
+            let value = state
+                .log_repo()
+                .by_channel(refract_core::DEFAULT_OWNER_ID, q.hours)
+                .await
+                .map_err(reject)?;
+            ok(value)
+        });
+
+    let timeseries = base
+        .and(warp::path("timeseries"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<TimeseriesQuery>())
+        .and(with_state(state.clone()))
+        .and_then(|q: TimeseriesQuery, state: AppState| async move {
+            let value = state
+                .log_repo()
+                .timeseries(refract_core::DEFAULT_OWNER_ID, q.hours, q.bucket == "day")
+                .await
+                .map_err(reject)?;
+            ok(value)
+        });
+
     let by_key = base
         .and(warp::path("keys"))
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<StatsQuery>())
-        .and(with(state))
+        .and(with_state(state))
         .and_then(|q: StatsQuery, state: AppState| async move {
             let items = state
                 .log_repo()
@@ -774,7 +1048,7 @@ fn stats(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Reject
             ok(items)
         });
 
-    by_model.or(by_key).unify().or(summary).unify()
+    routes![by_model, by_key, by_channel, timeseries, summary]
 }
 
 // ---------------------------------------------------------------------------
@@ -782,14 +1056,14 @@ fn stats(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Reject
 // ---------------------------------------------------------------------------
 
 /// 路由策略与管理令牌。
-fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let base = warp::path("settings");
 
     let get_policy = base
         .and(warp::path("routing"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|state: AppState| async move { ok(state.policy()) });
 
     let set_policy = base
@@ -797,7 +1071,7 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::put())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|policy: RoutingPolicy, state: AppState| async move {
             state
                 .settings_repo()
@@ -813,7 +1087,7 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path("log-retention"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|state: AppState| async move {
             ok(serde_json::json!({
                 "days": state.settings_repo().log_retention_days().await,
@@ -825,7 +1099,7 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::put())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|body: LogRetentionBody, state: AppState| async move {
             state
                 .settings_repo()
@@ -839,7 +1113,7 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path("breaker"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|state: AppState| async move {
             let policy = state
                 .settings_repo()
@@ -854,7 +1128,7 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::put())
         .and(json_body())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(
             |policy: refract_store::BreakerPolicy, state: AppState| async move {
                 state
@@ -868,6 +1142,181 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
             },
         );
 
+    let get_limits = base
+        .and(warp::path("limits"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let limits = state
+                .settings_repo()
+                .global_limits()
+                .await
+                .map_err(reject)?;
+            ok(limits)
+        });
+
+    let set_limits = base
+        .and(warp::path("limits"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(
+            |limits: refract_store::GlobalLimits, state: AppState| async move {
+                state
+                    .settings_repo()
+                    .set_global_limits(&limits)
+                    .await
+                    .map_err(reject)?;
+                state.reload_global_limits().await.map_err(reject)?;
+                ok(limits)
+            },
+        );
+
+    let get_empty_response_retry = base
+        .and(warp::path("empty-response-retry"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move { ok(state.empty_response_retry()) });
+
+    let set_empty_response_retry = base
+        .and(warp::path("empty-response-retry"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(
+            |policy: refract_core::EmptyResponseRetryPolicy, state: AppState| async move {
+                state
+                    .settings_repo()
+                    .set_empty_response_retry(policy)
+                    .await
+                    .map_err(reject)?;
+                state.reload_empty_response_retry().await.map_err(reject)?;
+                ok(policy)
+            },
+        );
+
+    let get_notify = base
+        .and(warp::path("notify"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let webhook_url = state.settings_repo().webhook_url().await.map_err(reject)?;
+            let retest_minutes = state.settings_repo().retest_minutes().await;
+            ok(serde_json::json!({
+                "webhook_url": webhook_url,
+                "retest_minutes": retest_minutes,
+            }))
+        });
+
+    let set_notify = base
+        .and(warp::path("notify"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(|body: NotifyBody, state: AppState| async move {
+            state
+                .settings_repo()
+                .set_webhook_url(body.webhook_url.as_deref())
+                .await
+                .map_err(reject)?;
+            state
+                .settings_repo()
+                .set_retest_minutes(body.retest_minutes)
+                .await
+                .map_err(reject)?;
+            state.reload_webhook().await.map_err(reject)?;
+            ok(body)
+        });
+
+    // POST /api/settings/notify/test —— 立即发一条测试事件，验证 webhook 通不通。
+    let test_notify = base
+        .and(warp::path("notify"))
+        .and(warp::path("test"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let Some(url) = state.webhook_url() else {
+                return Err(reject(refract_store::StoreError::Invalid(
+                    "webhook url is not configured — save it first".into(),
+                )));
+            };
+            crate::notify::send_webhook(
+                &url,
+                "notify.test",
+                "refract",
+                None,
+                "这是一条测试通知；收到即表示 webhook 配置正确",
+            )
+            .await;
+            ok(serde_json::json!({ "sent": true }))
+        });
+
+    let get_log_bodies = base
+        .and(warp::path("log-bodies"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let enabled = state
+                .settings_repo()
+                .capture_bodies()
+                .await
+                .map_err(reject)?;
+            ok(serde_json::json!({ "enabled": enabled }))
+        });
+
+    let set_log_bodies = base
+        .and(warp::path("log-bodies"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(|body: LogBodiesBody, state: AppState| async move {
+            state
+                .settings_repo()
+                .set_capture_bodies(body.enabled)
+                .await
+                .map_err(reject)?;
+            state.reload_capture_bodies().await.map_err(reject)?;
+            ok(serde_json::json!({ "enabled": body.enabled }))
+        });
+
+    let get_pricing = base
+        .and(warp::path("pricing"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let prices = state.settings_repo().pricing().await.map_err(reject)?;
+            ok(prices)
+        });
+
+    let set_pricing = base
+        .and(warp::path("pricing"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(
+            |prices: Vec<refract_store::ModelPrice>, state: AppState| async move {
+                state
+                    .settings_repo()
+                    .set_pricing(&prices)
+                    .await
+                    .map_err(reject)?;
+                // 热替换价表快照，立即对后续请求的成本计算生效。
+                state.reload_pricing().await.map_err(reject)?;
+                ok(prices)
+            },
+        );
+
     // 管理令牌只能写、不能读 —— 读接口等于把令牌泄漏给任何已经进来的人，
     // 而设置它的前提恰恰是「还没有令牌」。
     let set_token = base
@@ -875,7 +1324,7 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
         .and(warp::path::end())
         .and(warp::put())
         .and(json_body())
-        .and(with(state))
+        .and(with_state(state))
         .and_then(|body: AdminTokenBody, state: AppState| async move {
             let repo = state.settings_repo();
             match body.token.filter(|t| !t.trim().is_empty()) {
@@ -896,19 +1345,26 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
             }
         });
 
-    get_policy
-        .or(set_policy)
-        .unify()
-        .or(get_retention)
-        .unify()
-        .or(set_retention)
-        .unify()
-        .or(get_breaker)
-        .unify()
-        .or(set_breaker)
-        .unify()
-        .or(set_token)
-        .unify()
+    routes![
+        get_policy,
+        set_policy,
+        get_retention,
+        set_retention,
+        get_breaker,
+        set_breaker,
+        get_pricing,
+        set_pricing,
+        get_log_bodies,
+        set_log_bodies,
+        get_limits,
+        set_limits,
+        get_empty_response_retry,
+        set_empty_response_retry,
+        get_notify,
+        set_notify,
+        test_notify,
+        set_token,
+    ]
 }
 
 /// 设置管理令牌的请求体。
@@ -916,6 +1372,27 @@ fn settings(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rej
 struct AdminTokenBody {
     /// 新令牌；`null` 或空串表示清除。
     token: Option<String>,
+}
+
+/// 正文快照开关的请求体。
+#[derive(Debug, Deserialize)]
+struct LogBodiesBody {
+    enabled: bool,
+}
+
+/// 通知与自愈设置的请求体。
+#[derive(Debug, Serialize, Deserialize)]
+struct NotifyBody {
+    /// 告警 webhook 地址；空或 null 表示关闭通知。
+    #[serde(default)]
+    webhook_url: Option<String>,
+    /// 自动禁用渠道的重测间隔（分钟）；0 关闭自愈。
+    #[serde(default = "default_retest_minutes")]
+    retest_minutes: u32,
+}
+
+fn default_retest_minutes() -> u32 {
+    refract_store::settings_repo::DEFAULT_RETEST_MINUTES
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -954,6 +1431,12 @@ struct ExportedSettings {
     /// 旧版本备份没有这个字段，缺省回落默认值。
     #[serde(default)]
     breaker_policy: refract_store::BreakerPolicy,
+    /// 模型价表。旧版本备份缺省为空。
+    #[serde(default)]
+    pricing: Vec<refract_store::ModelPrice>,
+    /// HTTP 200 空回复重试策略。
+    #[serde(default)]
+    empty_response_retry: refract_core::EmptyResponseRetryPolicy,
 }
 
 /// 导入请求。
@@ -975,11 +1458,11 @@ enum ImportMode {
 }
 
 /// 配置导出 / 导入。
-fn backup(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+fn backup(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let export = warp::path("export")
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|state: AppState| async move {
             let owner = refract_core::DEFAULT_OWNER_ID;
             let channels = state.channel_repo().list(owner).await.map_err(reject)?;
@@ -997,6 +1480,8 @@ fn backup(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejec
                         .breaker_policy()
                         .await
                         .map_err(reject)?,
+                    pricing: state.settings_repo().pricing().await.map_err(reject)?,
+                    empty_response_retry: state.empty_response_retry(),
                 },
             };
             ok(document)
@@ -1006,12 +1491,12 @@ fn backup(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejec
         .and(warp::path::end())
         .and(warp::post())
         .and(json_body())
-        .and(with(state))
+        .and(with_state(state))
         .and_then(|req: ImportRequest, state: AppState| async move {
             import_document(req, &state).await
         });
 
-    export.or(import).unify()
+    routes![export, import]
 }
 
 /// 执行导入。
@@ -1118,10 +1603,20 @@ async fn import_document(
         .set_breaker_policy(&req.data.settings.breaker_policy)
         .await
         .map_err(reject)?;
+    settings
+        .set_pricing(&req.data.settings.pricing)
+        .await
+        .map_err(reject)?;
+    settings
+        .set_empty_response_retry(req.data.settings.empty_response_retry)
+        .await
+        .map_err(reject)?;
 
     commit_channels(state).await?;
     state.reload_policy().await.map_err(reject)?;
     state.reload_breaker().await.map_err(reject)?;
+    state.reload_pricing().await.map_err(reject)?;
+    state.reload_empty_response_retry().await.map_err(reject)?;
 
     ok(serde_json::json!({
         "channels_imported": channels_imported,
@@ -1138,14 +1633,14 @@ async fn import_document(
 // ---------------------------------------------------------------------------
 
 /// 端点健康状态。
-fn health(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+fn health(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let base = warp::path("health");
 
     let all = base
         .and(warp::path("channels"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state.clone()))
+        .and(with_state(state.clone()))
         .and_then(|state: AppState| async move {
             let items = state.health_repo().all().await.map_err(reject)?;
             ok(items)
@@ -1158,7 +1653,7 @@ fn health(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejec
         .and(warp::path("reset"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(with(state))
+        .and(with_state(state))
         .and_then(
             |id: ChannelId, protocol: Protocol, state: AppState| async move {
                 state
@@ -1170,18 +1665,18 @@ fn health(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejec
             },
         );
 
-    reset.or(all).unify()
+    routes![reset, all]
 }
 
 /// 可用模型清单 —— 由当前渠道快照推导，不是另一张表。
 ///
 /// 「模型列表」不该是用户手工维护的第二份真相：它就是「所有启用渠道的所有
 /// 启用端点声明的模型」的并集。让它成为派生值，配置改完列表自动对。
-fn models(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+fn models(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     warp::path("models")
         .and(warp::path::end())
         .and(warp::get())
-        .and(with(state))
+        .and(with_state(state))
         .and_then(|state: AppState| async move {
             let channels = state.channels();
             let mut names: Vec<&str> = channels
@@ -1196,16 +1691,10 @@ fn models(state: AppState) -> impl Filter<Extract = (impl Reply,), Error = Rejec
             names.dedup();
             ok(names)
         })
+        .boxed()
 }
 
 // ---------------------------------------------------------------------------
-
-/// 把状态注入过滤器链。
-fn with(
-    state: AppState,
-) -> impl Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || state.clone())
-}
 
 #[cfg(test)]
 mod tests {
@@ -1239,6 +1728,12 @@ mod tests {
             proxy: None,
             param_override: None,
             note: None,
+            auto_disabled: false,
+            balance: None,
+            balance_updated_at: None,
+            extra_headers: Vec::new(),
+            test_model: None,
+            empty_response_retry: Default::default(),
         }
     }
 
@@ -1803,6 +2298,175 @@ mod tests {
             !text.contains(&plaintext),
             "plaintext key leaked through the list endpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn balance_probe_uses_the_billing_endpoints_and_caches_the_result() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v1/dashboard/billing/subscription",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "hard_limit_usd": 120.0 })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/dashboard/billing/usage"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    // total_usage 单位是美分。
+                    .set_body_json(serde_json::json!({ "total_usage": 2550.0 })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = test_state().await;
+        let mut channel = sample();
+        channel.address = UpstreamAddress {
+            unofficial: true,
+            full_address: false,
+            base_url: Some(server.uri()),
+            version_prefix: None,
+            path: None,
+        };
+        state.channel_repo().create(&channel).await.unwrap();
+        state.reload_channels().await.unwrap();
+        let id = state.channels()[0].id;
+
+        let response = warp::test::request()
+            .method("POST")
+            .path(&format!("/api/channels/{id}/balance"))
+            .reply(&routes(state.clone()))
+            .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        // 120 − 25.50 = 94.50
+        assert!((body["data"]["balance"].as_f64().unwrap() - 94.5).abs() < 1e-9);
+
+        // 结果缓存进渠道行。
+        let channel = state
+            .channel_repo()
+            .get(refract_core::DEFAULT_OWNER_ID, id)
+            .await
+            .unwrap();
+        assert!((channel.balance.unwrap() - 94.5).abs() < 1e-9);
+        assert!(channel.balance_updated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn key_update_and_usage_reset_keep_the_key_itself() {
+        let state = test_state().await;
+        let (created, plaintext) = state
+            .key_repo()
+            .create(
+                refract_core::DEFAULT_OWNER_ID,
+                refract_store::NewApiKey {
+                    name: "before".into(),
+                    quota: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .key_repo()
+            .record_usage(created.id, 60, 0.0)
+            .await
+            .unwrap();
+
+        // 编辑治理属性：名字、限速、备注全改，密钥本体不动。
+        let response = warp::test::request()
+            .method("PUT")
+            .path(&format!("/api/keys/{}", created.id))
+            .json(&serde_json::json!({
+                "name": "after",
+                "quota": 500,
+                "rpm_limit": 30,
+                "tpm_limit": 100000,
+                "note": "给 Cursor 用的"
+            }))
+            .reply(&routes(state.clone()))
+            .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["data"]["name"], "after");
+        assert_eq!(body["data"]["rpm_limit"], 30);
+        assert_eq!(body["data"]["note"], "给 Cursor 用的");
+        // 已用配额不因编辑而变。
+        assert_eq!(body["data"]["used_quota"], 60);
+
+        // 原明文照常可用（key_hash 未变）。
+        let found = state
+            .key_repo()
+            .find_by_plaintext(&plaintext)
+            .await
+            .unwrap()
+            .expect("plaintext still resolves");
+        assert_eq!(found.name, "after");
+
+        // 重置用量。
+        let response = warp::test::request()
+            .method("POST")
+            .path(&format!("/api/keys/{}/reset-usage", created.id))
+            .reply(&routes(state.clone()))
+            .await;
+        assert_eq!(response.status(), 200);
+        let after = state
+            .key_repo()
+            .get(refract_core::DEFAULT_OWNER_ID, created.id)
+            .await
+            .unwrap();
+        assert_eq!(after.used_quota, 0);
+    }
+
+    #[tokio::test]
+    async fn playground_chat_goes_through_the_full_gateway_pipeline() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-pg",
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "pong" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = test_state().await;
+        let mut channel = sample();
+        channel.address = UpstreamAddress {
+            unofficial: true,
+            full_address: false,
+            base_url: Some(server.uri()),
+            version_prefix: None,
+            path: None,
+        };
+        state.channel_repo().create(&channel).await.unwrap();
+        state.reload_channels().await.unwrap();
+
+        let response = warp::test::request()
+            .method("POST")
+            .path("/api/playground/chat")
+            .json(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "ping" }]
+            }))
+            .reply(&routes(state))
+            .await;
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "pong");
     }
 
     #[tokio::test]

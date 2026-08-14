@@ -14,12 +14,21 @@ import GlassSwitch from '@/components/GlassSwitch.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import {
   backup,
+  data as dataApi,
   getAdminToken,
   setAdminToken as storeLocalToken,
   settings,
   type ImportResult,
 } from '@/api/client'
-import type { BreakerPolicy, RoutingPolicy, SelectionMode } from '@/api/types'
+import type {
+  BreakerPolicy,
+  EmptyResponseRetryPolicy,
+  GlobalLimits,
+  ModelPrice,
+  NotifySettings,
+  RoutingPolicy,
+  SelectionMode,
+} from '@/api/types'
 
 const loading = ref(true)
 const saving = ref(false)
@@ -39,16 +48,80 @@ const breaker = ref<BreakerPolicy>({
   base_cooldown_secs: 30,
   max_cooldown_secs: 900,
 })
+const pricing = ref<ModelPrice[]>([])
+const logBodies = ref(true)
+const notify = ref<NotifySettings>({ webhook_url: '', retest_minutes: 30 })
+const limits = ref<GlobalLimits>({ rpm: 0, max_concurrency: 0 })
+const emptyResponseRetry = ref<EmptyResponseRetryPolicy>({
+  window_secs: 3,
+  max_retries: 5,
+  reject_nonstandard_200: false,
+})
+const dbStats = ref<{ db_bytes: number; log_rows: number; oldest_log_at: string | null } | null>(
+  null,
+)
+
+function fmtBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
 
 /** 上一次从后端拉到的快照，用于判断有没有改过。 */
 let policySnapshot = ''
 let retentionSnapshot = 30
 let breakerSnapshot = ''
+let pricingSnapshot = '[]'
+let logBodiesSnapshot = true
+let notifySnapshot = ''
+let limitsSnapshot = ''
+let emptyResponseRetrySnapshot = ''
 
 const policyDirty = computed(() => policySnapshot !== JSON.stringify(policy.value))
 const retentionDirty = computed(() => retentionSnapshot !== retentionDays.value)
 const breakerDirty = computed(() => breakerSnapshot !== JSON.stringify(breaker.value))
-const isDirty = computed(() => policyDirty.value || retentionDirty.value || breakerDirty.value)
+const pricingDirty = computed(() => pricingSnapshot !== JSON.stringify(pricing.value))
+const logBodiesDirty = computed(() => logBodiesSnapshot !== logBodies.value)
+const notifyDirty = computed(() => notifySnapshot !== JSON.stringify(notify.value))
+const limitsDirty = computed(() => limitsSnapshot !== JSON.stringify(limits.value))
+const emptyResponseRetryDirty = computed(
+  () => emptyResponseRetrySnapshot !== JSON.stringify(emptyResponseRetry.value),
+)
+const limitsValid = computed(
+  () =>
+    Number.isInteger(limits.value.rpm) &&
+    limits.value.rpm >= 0 &&
+    limits.value.rpm <= 1_000_000 &&
+    Number.isInteger(limits.value.max_concurrency) &&
+    limits.value.max_concurrency >= 0 &&
+    limits.value.max_concurrency <= 100_000,
+)
+const notifyValid = computed(() => {
+  const url = notify.value.webhook_url?.trim() ?? ''
+  const urlOk = url === '' || url.startsWith('http://') || url.startsWith('https://')
+  const minutes = notify.value.retest_minutes
+  return urlOk && Number.isInteger(minutes) && minutes >= 0 && minutes <= 1440
+})
+const emptyResponseRetryValid = computed(
+  () =>
+    Number.isInteger(emptyResponseRetry.value.window_secs) &&
+    emptyResponseRetry.value.window_secs >= 0 &&
+    emptyResponseRetry.value.window_secs <= 3600 &&
+    Number.isInteger(emptyResponseRetry.value.max_retries) &&
+    emptyResponseRetry.value.max_retries >= 0 &&
+    emptyResponseRetry.value.max_retries <= 100,
+)
+const isDirty = computed(
+  () =>
+    policyDirty.value ||
+    retentionDirty.value ||
+    breakerDirty.value ||
+    pricingDirty.value ||
+    logBodiesDirty.value ||
+    notifyDirty.value ||
+    limitsDirty.value ||
+    emptyResponseRetryDirty.value,
+)
 const retentionValid = computed(
   () =>
     Number.isInteger(retentionDays.value) &&
@@ -70,20 +143,77 @@ const breakerValid = computed(() => {
     b.max_cooldown_secs <= 86_400
   )
 })
+/** 与后端 ModelPrice::validate 一致：pattern 非空，价格为非负有限数。 */
+const pricingValid = computed(() =>
+  pricing.value.every(
+    (row) =>
+      row.pattern.trim() !== '' &&
+      Number.isFinite(row.input_per_m) &&
+      row.input_per_m >= 0 &&
+      Number.isFinite(row.output_per_m) &&
+      row.output_per_m >= 0 &&
+      (row.cached_input_per_m == null ||
+        (Number.isFinite(row.cached_input_per_m) && row.cached_input_per_m >= 0)) &&
+      (row.cache_write_per_m == null ||
+        (Number.isFinite(row.cache_write_per_m) && row.cache_write_per_m >= 0)),
+  ),
+)
+
+function addPriceRow() {
+  pricing.value.push({
+    pattern: '',
+    input_per_m: 0,
+    output_per_m: 0,
+    cached_input_per_m: null,
+    cache_write_per_m: null,
+  })
+}
+
+/** number input 清空时 v-model.number 给空串；归一成 null（后端语义：回落输入价）。 */
+function normalizePrice(row: ModelPrice, key: 'cached_input_per_m' | 'cache_write_per_m') {
+  const value = row[key]
+  if (value === undefined || (typeof value === 'string' && value === '') || Number.isNaN(value)) {
+    row[key] = null
+  }
+}
+
+function removePriceRow(index: number) {
+  pricing.value.splice(index, 1)
+}
 
 onMounted(async () => {
   try {
-    const [p, retention, b] = await Promise.all([
-      settings.routingPolicy(),
-      settings.logRetention(),
-      settings.breakerPolicy(),
-    ])
+    const [p, retention, b, prices, bodies, notifySettings, globalLimits, emptyRetry] =
+      await Promise.all([
+        settings.routingPolicy(),
+        settings.logRetention(),
+        settings.breakerPolicy(),
+        settings.pricing(),
+        settings.logBodies(),
+        settings.notify(),
+        settings.globalLimits(),
+        settings.emptyResponseRetry(),
+      ])
     policy.value = p
     policySnapshot = JSON.stringify(p)
     retentionDays.value = retention.days
     retentionSnapshot = retention.days
     breaker.value = b
     breakerSnapshot = JSON.stringify(b)
+    pricing.value = prices
+    pricingSnapshot = JSON.stringify(prices)
+    logBodies.value = bodies.enabled
+    logBodiesSnapshot = bodies.enabled
+    notify.value = { ...notifySettings, webhook_url: notifySettings.webhook_url ?? '' }
+    notifySnapshot = JSON.stringify(notify.value)
+    limits.value = globalLimits
+    limitsSnapshot = JSON.stringify(globalLimits)
+    emptyResponseRetry.value = emptyRetry
+    emptyResponseRetrySnapshot = JSON.stringify(emptyRetry)
+    dataApi
+      .stats()
+      .then((stats) => (dbStats.value = stats))
+      .catch(() => {})
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : '加载失败'
   } finally {
@@ -98,6 +228,22 @@ async function save() {
   }
   if (!breakerValid.value) {
     saveError.value = '熔断参数不合法：阈值 0–1000，冷却 1–86400 秒且上限不小于起始值'
+    return
+  }
+  if (!pricingValid.value) {
+    saveError.value = '价表不合法：模式不能为空，价格必须是非负数字'
+    return
+  }
+  if (!notifyValid.value) {
+    saveError.value = '通知设置不合法：webhook 需以 http(s):// 开头，重测间隔 0–1440 分钟'
+    return
+  }
+  if (!limitsValid.value) {
+    saveError.value = '全局限制不合法：RPM ≤ 1,000,000，并发 ≤ 100,000'
+    return
+  }
+  if (!emptyResponseRetryValid.value) {
+    saveError.value = '空回复重试不合法：判定窗口需为 0–3600 秒，最大重试需为 0–100 次'
     return
   }
   saving.value = true
@@ -119,11 +265,55 @@ async function save() {
       breaker.value = b
       breakerSnapshot = JSON.stringify(b)
     }
+    if (pricingDirty.value) {
+      const prices = await settings.setPricing(pricing.value)
+      pricing.value = prices
+      pricingSnapshot = JSON.stringify(prices)
+    }
+    if (logBodiesDirty.value) {
+      const bodies = await settings.setLogBodies(logBodies.value)
+      logBodies.value = bodies.enabled
+      logBodiesSnapshot = bodies.enabled
+    }
+    if (limitsDirty.value) {
+      const saved_ = await settings.setGlobalLimits(limits.value)
+      limits.value = saved_
+      limitsSnapshot = JSON.stringify(saved_)
+    }
+    if (emptyResponseRetryDirty.value) {
+      const saved_ = await settings.setEmptyResponseRetry(emptyResponseRetry.value)
+      emptyResponseRetry.value = saved_
+      emptyResponseRetrySnapshot = JSON.stringify(saved_)
+    }
+    if (notifyDirty.value) {
+      const saved_ = await settings.setNotify({
+        webhook_url: notify.value.webhook_url?.trim() || null,
+        retest_minutes: notify.value.retest_minutes,
+      })
+      notify.value = { ...saved_, webhook_url: saved_.webhook_url ?? '' }
+      notifySnapshot = JSON.stringify(notify.value)
+    }
     saved.value = true
   } catch (e) {
     saveError.value = e instanceof Error ? e.message : '保存失败'
   } finally {
     saving.value = false
+  }
+}
+
+const notifyTesting = ref(false)
+const notifyTestResult = ref<string | null>(null)
+
+async function sendTestNotification() {
+  notifyTesting.value = true
+  notifyTestResult.value = null
+  try {
+    await settings.testNotify()
+    notifyTestResult.value = '已发送 —— 去通知渠道确认收到'
+  } catch (e) {
+    notifyTestResult.value = e instanceof Error ? e.message : '发送失败'
+  } finally {
+    notifyTesting.value = false
   }
 }
 
@@ -394,6 +584,58 @@ async function runImport(payload: unknown) {
             >
           </span>
         </label>
+
+        <!-- HTTP 200 空回复重试 -->
+        <div class="border-t border-ink/8 pt-4">
+          <span class="text-sm font-medium text-ink-soft">上游 200 空回复重试</span>
+          <p class="mt-1 text-xs text-ink-faint">
+            上游返回 HTTP 200 但没有文本、推理、拒答或工具调用，且“完成时刻 −
+            首字节时刻”不超过判定窗口时，在同一渠道重试。任一值为 0 即关闭。
+          </p>
+          <div class="mt-3 grid max-w-md grid-cols-1 gap-4 sm:grid-cols-2">
+            <label class="flex flex-col gap-1.5">
+              <span class="text-xs font-medium text-ink-soft">判定窗口（秒）</span>
+              <input
+                v-model.number="emptyResponseRetry.window_secs"
+                type="number"
+                min="0"
+                max="3600"
+                step="1"
+                inputmode="numeric"
+                class="glass-field tabular px-3 py-2 text-sm outline-none"
+              />
+            </label>
+            <label class="flex flex-col gap-1.5">
+              <span class="text-xs font-medium text-ink-soft">最大重试次数</span>
+              <input
+                v-model.number="emptyResponseRetry.max_retries"
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                inputmode="numeric"
+                class="glass-field tabular px-3 py-2 text-sm outline-none"
+              />
+            </label>
+          </div>
+          <p v-if="!emptyResponseRetryValid" class="mt-2 text-xs text-danger" role="alert">
+            判定窗口需为 0–3600 秒，最大重试需为 0–100 次。
+          </p>
+
+          <label class="mt-4 flex cursor-pointer items-center gap-3 border-t border-ink/8 pt-4">
+            <GlassSwitch
+              v-model="emptyResponseRetry.reject_nonstandard_200"
+              label="非标准 200 转为 500"
+            />
+            <div>
+              <span class="text-sm font-medium">非标准 200 转为 500</span>
+              <p class="mt-0.5 text-xs text-ink-faint">
+                开启后，纯文本、HTML 或无法识别的 JSON/SSE 等不符合渠道协议的 HTTP 200
+                响应会转换为不可重试的 500，并返回明确错误提示。
+              </p>
+            </div>
+          </label>
+        </div>
       </section>
 
       <!-- 熔断 -->
@@ -458,6 +700,237 @@ async function runImport(payload: unknown) {
         </p>
       </section>
 
+      <!-- 数据 -->
+      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
+        <div>
+          <h2 class="text-sm font-semibold text-ink-soft uppercase">数据</h2>
+          <p class="mt-1 text-xs text-ink-faint">
+            SQLite 在线热备（VACUUM INTO，产物紧凑、可直接恢复使用）。
+            配置备份只含渠道与密钥，这里是含全部请求日志的完整数据库。
+          </p>
+        </div>
+
+        <div v-if="dbStats" class="flex flex-wrap gap-x-6 gap-y-1 text-sm text-ink-soft">
+          <span>
+            体积 <span class="tabular font-medium">{{ fmtBytes(dbStats.db_bytes) }}</span>
+          </span>
+          <span>
+            日志 <span class="tabular font-medium">{{ dbStats.log_rows.toLocaleString() }}</span> 行
+          </span>
+          <span v-if="dbStats.oldest_log_at">
+            最旧 <span class="tabular font-medium">{{ dbStats.oldest_log_at }}</span>
+          </span>
+        </div>
+
+        <div>
+          <a
+            :href="dataApi.backupUrl()"
+            download
+            class="glass-button-ghost inline-flex items-center gap-1.5 px-3 py-2 text-sm"
+          >
+            <AppIcon name="download" :size="14" />
+            下载数据库备份
+          </a>
+        </div>
+      </section>
+
+      <!-- 全局限制 -->
+      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
+        <div>
+          <h2 class="text-sm font-semibold text-ink-soft uppercase">全局限制</h2>
+          <p class="mt-1 text-xs text-ink-faint">
+            网关级保险丝，对所有请求生效（包括免鉴权模式）。跑飞的本地 agent
+            循环不该原样打穿上游账单。0 表示不限。
+          </p>
+        </div>
+
+        <div class="grid max-w-xl grid-cols-1 gap-4 sm:grid-cols-2">
+          <label class="flex flex-col gap-1.5">
+            <span class="text-sm font-medium text-ink-soft">全局 RPM</span>
+            <input
+              v-model.number="limits.rpm"
+              type="number"
+              min="0"
+              max="1000000"
+              step="1"
+              inputmode="numeric"
+              aria-label="全局每分钟请求数上限"
+              class="glass-field tabular px-3 py-2 text-sm outline-none"
+            />
+            <span class="text-xs text-ink-faint">每分钟请求数上限</span>
+          </label>
+
+          <label class="flex flex-col gap-1.5">
+            <span class="text-sm font-medium text-ink-soft">并发上限</span>
+            <input
+              v-model.number="limits.max_concurrency"
+              type="number"
+              min="0"
+              max="100000"
+              step="1"
+              inputmode="numeric"
+              aria-label="全局并发上限"
+              class="glass-field tabular px-3 py-2 text-sm outline-none"
+            />
+            <span class="text-xs text-ink-faint">同时在途请求数（流式占用直到结束）</span>
+          </label>
+        </div>
+
+        <p v-if="!limitsValid" class="text-xs text-danger" role="alert">
+          RPM ≤ 1,000,000；并发 ≤ 100,000。
+        </p>
+      </section>
+
+      <!-- 通知与自愈 -->
+      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
+        <div>
+          <h2 class="text-sm font-semibold text-ink-soft uppercase">通知与自愈</h2>
+          <p class="mt-1 text-xs text-ink-faint">
+            熔断、恢复、自动禁用事件推送到 webhook（通用 JSON，可对接 Server酱 / 飞书 / Telegram
+            网桥）。连续 3 次凭据错误的渠道会被自动停用， 并按设定间隔重测，通过即自动恢复。
+          </p>
+        </div>
+
+        <label class="flex flex-col gap-1.5">
+          <span class="text-sm font-medium text-ink-soft">Webhook 地址</span>
+          <div class="flex items-center gap-2">
+            <input
+              v-model="notify.webhook_url"
+              type="url"
+              placeholder="https://example.com/hook（留空关闭通知）"
+              aria-label="告警 webhook 地址"
+              class="glass-field w-full max-w-xl px-3 py-2 font-mono text-sm outline-none"
+            />
+            <button
+              type="button"
+              class="glass-button-ghost shrink-0 px-3 py-2 text-sm"
+              :disabled="notifyTesting || notifyDirty || !notify.webhook_url"
+              :title="notifyDirty ? '先保存设置再测试' : '发送一条测试通知'"
+              @click="sendTestNotification"
+            >
+              {{ notifyTesting ? '发送中…' : '发送测试' }}
+            </button>
+          </div>
+          <span v-if="notifyTestResult" class="text-xs text-ink-soft">
+            {{ notifyTestResult }}
+          </span>
+        </label>
+
+        <label class="flex max-w-sm flex-col gap-1.5">
+          <span class="text-sm font-medium text-ink-soft">自动禁用渠道的重测间隔</span>
+          <div class="flex items-center gap-2">
+            <input
+              v-model.number="notify.retest_minutes"
+              type="number"
+              min="0"
+              max="1440"
+              step="1"
+              inputmode="numeric"
+              aria-label="重测间隔分钟数"
+              class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
+            />
+            <span class="text-sm text-ink-faint">分钟，0 关闭自愈</span>
+          </div>
+        </label>
+
+        <p v-if="!notifyValid" class="text-xs text-danger" role="alert">
+          webhook 需以 http(s):// 开头；重测间隔 0–1440 分钟。
+        </p>
+      </section>
+
+      <!-- 模型价表 -->
+      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
+        <div>
+          <h2 class="text-sm font-semibold text-ink-soft uppercase">模型价表</h2>
+          <p class="mt-1 text-xs text-ink-faint">
+            按「每百万 token」计价，币种自定。模式支持精确模型名或以 * 结尾的前缀
+            （精确名优先，其后取最长前缀）。缓存读/写价留空按输入价计（不打折）。
+            请求日志按落库当时的价表固化成本。
+          </p>
+        </div>
+
+        <div v-if="pricing.length > 0" class="flex flex-col gap-2">
+          <div
+            class="grid grid-cols-[1fr_6rem_6rem_6rem_6rem_2.5rem] items-center gap-2 text-xs text-ink-faint"
+          >
+            <span>模式</span>
+            <span class="text-right">输入 / M</span>
+            <span class="text-right">输出 / M</span>
+            <span class="text-right">缓存读 / M</span>
+            <span class="text-right">缓存写 / M</span>
+            <span></span>
+          </div>
+          <div
+            v-for="(row, i) in pricing"
+            :key="i"
+            class="grid grid-cols-[1fr_6rem_6rem_6rem_6rem_2.5rem] items-center gap-2"
+          >
+            <input
+              v-model="row.pattern"
+              type="text"
+              placeholder="gpt-4o 或 gpt-4o*"
+              :aria-label="`价表第 ${i + 1} 行模式`"
+              class="glass-field px-3 py-2 font-mono text-xs outline-none"
+            />
+            <input
+              v-model.number="row.input_per_m"
+              type="number"
+              min="0"
+              step="0.01"
+              :aria-label="`价表第 ${i + 1} 行输入单价`"
+              class="glass-field tabular px-3 py-2 text-right text-xs outline-none"
+            />
+            <input
+              v-model.number="row.output_per_m"
+              type="number"
+              min="0"
+              step="0.01"
+              :aria-label="`价表第 ${i + 1} 行输出单价`"
+              class="glass-field tabular px-3 py-2 text-right text-xs outline-none"
+            />
+            <input
+              v-model.number="row.cached_input_per_m"
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="=输入"
+              :aria-label="`价表第 ${i + 1} 行缓存读单价`"
+              class="glass-field tabular px-3 py-2 text-right text-xs outline-none"
+              @change="normalizePrice(row, 'cached_input_per_m')"
+            />
+            <input
+              v-model.number="row.cache_write_per_m"
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="=输入"
+              :aria-label="`价表第 ${i + 1} 行缓存写单价`"
+              class="glass-field tabular px-3 py-2 text-right text-xs outline-none"
+              @change="normalizePrice(row, 'cache_write_per_m')"
+            />
+            <button
+              type="button"
+              class="glass-button-ghost glass-button-ghost-danger justify-center px-2 py-2"
+              :aria-label="`删除价表第 ${i + 1} 行`"
+              @click="removePriceRow(i)"
+            >
+              <AppIcon name="x" :size="13" />
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <button type="button" class="glass-button-ghost px-3 py-2 text-sm" @click="addPriceRow">
+            <AppIcon name="plus" :size="14" />
+            添加规则
+          </button>
+        </div>
+
+        <p v-if="!pricingValid" class="text-xs text-danger" role="alert">
+          模式不能为空，价格必须是非负数字。
+        </p>
+      </section>
+
       <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
         <div>
           <h2 class="text-sm font-semibold text-ink-soft uppercase">日志保留</h2>
@@ -465,6 +938,16 @@ async function runImport(payload: unknown) {
             服务启动时清理一次，之后每 24 小时按当前设置删除过期请求日志。
           </p>
         </div>
+
+        <label class="flex cursor-pointer items-center gap-3">
+          <GlassSwitch v-model="logBodies" label="记录请求与响应正文" />
+          <span>
+            <span class="text-sm font-medium">记录请求与响应正文</span>
+            <span class="ml-2 text-xs text-ink-faint">
+              排障时可在日志里查看完整请求；正文超过 64KB 截断，流式存聚合文本。
+            </span>
+          </span>
+        </label>
 
         <label class="flex max-w-sm flex-col gap-1.5">
           <span class="text-sm font-medium text-ink-soft">保留天数</span>
@@ -492,7 +975,15 @@ async function runImport(payload: unknown) {
         <button
           type="button"
           class="glass-button-primary px-5 py-2.5 text-sm font-medium disabled:opacity-50"
-          :disabled="saving || !isDirty || !retentionValid || !breakerValid"
+          :disabled="
+            saving ||
+            !isDirty ||
+            !retentionValid ||
+            !breakerValid ||
+            !pricingValid ||
+            !notifyValid ||
+            !emptyResponseRetryValid
+          "
           @click="save"
         >
           {{ saving ? '保存中…' : '保存设置' }}

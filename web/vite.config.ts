@@ -176,11 +176,46 @@ export default defineConfig({
   server: {
     proxy: {
       // 开发时把 API 打到本地后端，避免 CORS 配置污染生产代码。
-      '/api': { target: 'http://127.0.0.1:3939', changeOrigin: true },
-      '/v1': { target: 'http://127.0.0.1:3939', changeOrigin: true },
-      '/v1beta': { target: 'http://127.0.0.1:3939', changeOrigin: true },
-      '/health': { target: 'http://127.0.0.1:3939', changeOrigin: true },
-      '/metrics': { target: 'http://127.0.0.1:3939', changeOrigin: true },
+      '/api': backendProxy(),
+      '/v1': backendProxy(),
+      '/v1beta': backendProxy(),
+      '/health': backendProxy(),
+      '/metrics': backendProxy(),
     },
   },
 })
+
+/**
+ * 指向本地后端的代理条目。
+ *
+ * `pnpm dev` 里 cargo watch 编译期间（首次启动或每次改 Rust 代码）后端
+ * 必然不可达，http-proxy 默认回一个裸 502 —— 页面看起来像坏了。这里把
+ * 代理错误换成结构化的 503：前端客户端据此识别「后端编译中」，对 GET
+ * 自动重试，App 壳显示恢复横幅。生产形态（单二进制内嵌前端）没有这层
+ * 代理，不受影响。
+ */
+function backendProxy() {
+  return {
+    target: 'http://127.0.0.1:3939',
+    changeOrigin: true,
+    configure(proxy: { on(event: 'error', cb: (...args: unknown[]) => void): void }) {
+      proxy.on('error', (...args) => {
+        const res = args[2] as {
+          headersSent?: boolean
+          writeHead?: (status: number, headers: Record<string, string>) => void
+          end?: (chunk: string) => void
+        }
+        // SSE/WebSocket 升级失败时第三个参数可能是裸 socket，防御式判断。
+        if (typeof res?.writeHead === 'function' && !res.headersSent) {
+          res.writeHead(503, { 'content-type': 'application/json' })
+        }
+        res?.end?.(
+          JSON.stringify({
+            code: 'backend_unavailable',
+            message: '后端不可达 —— 正在编译或尚未启动，就绪后会自动恢复',
+          }),
+        )
+      })
+    },
+  }
+}

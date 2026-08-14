@@ -10,7 +10,7 @@
 //! 抛出语法错误，用户看到的是「Unexpected token <」而不是 404。
 use warp::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG};
 use warp::http::{HeaderValue, StatusCode};
-use warp::{Filter, Reply};
+use warp::{Filter, Reply, filters::BoxedFilter};
 
 /// 编译期内嵌的前端产物。
 ///
@@ -27,13 +27,14 @@ struct Assets;
 const API_PREFIXES: [&str; 4] = ["api/", "health/", "v1/", "v1beta/"];
 
 /// 静态资源路由。
-pub fn routes() -> impl Filter<Extract = (impl Reply,), Error = warp::Rejection> + Clone {
+pub fn routes() -> BoxedFilter<(warp::reply::Response,)> {
     warp::get()
         .and(warp::path::tail())
         .and(warp::header::optional::<String>("if-none-match"))
         .and_then(|tail: warp::path::Tail, inm: Option<String>| async move {
             serve(tail.as_str(), inm.as_deref()).ok_or_else(warp::reject::not_found)
         })
+        .boxed()
 }
 
 /// 解析一个路径并渲染响应。

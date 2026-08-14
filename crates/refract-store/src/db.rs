@@ -74,6 +74,9 @@ impl Database {
     /// 打开（并在需要时创建）一个 SQLite 数据库文件，然后跑迁移。
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
+        if path.as_os_str() == ":memory:" {
+            return Self::open_in_memory().await;
+        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -126,6 +129,32 @@ impl Database {
     /// 执行一次轻量查询，确认连接池与 SQLite 都能响应。
     pub async fn ping(&self) -> Result<(), StoreError> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// 数据库观测：文件字节数、日志行数、最旧日志时间。
+    pub async fn stats(&self) -> Result<(i64, i64, Option<String>), StoreError> {
+        let size: i64 = sqlx::query_scalar(
+            "SELECT page_count * page_size FROM pragma_page_count, pragma_page_size",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        let log_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+            .fetch_one(self.pool())
+            .await?;
+        let oldest: Option<String> = sqlx::query_scalar("SELECT MIN(created_at) FROM request_logs")
+            .fetch_one(self.pool())
+            .await?;
+        Ok((size, log_rows, oldest))
+    }
+
+    /// `VACUUM INTO` 在线热备：WAL 模式下安全，产物已紧凑无空页。
+    /// 路径由调用方在受控目录里生成，单引号转义只是纵深防御。
+    pub async fn vacuum_into(&self, target: &std::path::Path) -> Result<(), StoreError> {
+        let path = target.to_string_lossy().replace('\'', "''");
+        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{path}'")))
+            .execute(self.pool())
+            .await?;
         Ok(())
     }
 

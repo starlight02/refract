@@ -26,6 +26,16 @@ const router = createRouter({
       component: () => import('../views/ChannelEditorView.vue'),
     },
     {
+      path: '/models',
+      name: 'models',
+      component: () => import('../views/ModelsView.vue'),
+    },
+    {
+      path: '/playground',
+      name: 'playground',
+      component: () => import('../views/PlaygroundView.vue'),
+    },
+    {
       path: '/logs',
       name: 'logs',
       component: () => import('../views/LogsView.vue'),
@@ -56,6 +66,8 @@ router.afterEach((to) => {
     channels: '渠道',
     'channel-new': '新建渠道',
     'channel-edit': '编辑渠道',
+    models: '模型',
+    playground: '调试台',
     logs: '请求日志',
     keys: 'API 密钥',
     settings: '设置',

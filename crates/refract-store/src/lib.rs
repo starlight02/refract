@@ -19,4 +19,18 @@ pub use key_repo::{ApiKey, ApiKeyRepo, ExportedApiKey, NewApiKey};
 pub use log_repo::{
     KeyUsageStat, LogFilter, LogRepo, ModelStat, NewRequestLog, RequestLog, StatsSummary,
 };
-pub use settings_repo::SettingsRepo;
+pub use settings_repo::{GlobalLimits, ModelPrice, SettingsRepo, price_for};
+
+/// 确保影响行数大于 0，否则返回 EntityNotFound 错误。
+#[inline]
+pub(crate) fn ensure_affected(
+    affected: u64,
+    entity: &'static str,
+    id: impl std::fmt::Display,
+) -> Result<(), StoreError> {
+    if affected == 0 {
+        Err(StoreError::not_found(entity, id))
+    } else {
+        Ok(())
+    }
+}

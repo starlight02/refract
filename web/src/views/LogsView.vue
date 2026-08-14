@@ -13,6 +13,15 @@ import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { useLogsStore } from '@/stores/logs'
 import { useChannelsStore } from '@/stores/channels'
+import { logs as logsApi } from '@/api/client'
+import {
+  DialogContent,
+  DialogDescription,
+  DialogOverlay,
+  DialogPortal,
+  DialogRoot,
+  DialogTitle,
+} from 'reka-ui'
 import type { Protocol, RequestLog } from '@/api/types'
 
 const store = useLogsStore()
@@ -42,6 +51,17 @@ onUnmounted(() => {
 const draftModel = ref('')
 const draftChannel = ref<number | ''>('')
 const draftFailuresOnly = ref(false)
+const draftRequestId = ref('')
+const draftSince = ref('')
+const draftUntil = ref('')
+
+/** datetime-local（本地时区）转后端要的 UTC 秒级时间串。 */
+function toUtcStamp(local: string): string | undefined {
+  if (!local) return undefined
+  const date = new Date(local)
+  if (Number.isNaN(date.getTime())) return undefined
+  return date.toISOString().replace('T', ' ').slice(0, 19)
+}
 
 /** 展开的行 id 集合。 */
 const expanded = ref<Set<number>>(new Set())
@@ -67,6 +87,9 @@ function applyFilter() {
   store.fetch({
     model: draftModel.value.trim() || undefined,
     channel_id: draftChannel.value === '' ? undefined : draftChannel.value,
+    request_id: draftRequestId.value.trim() || undefined,
+    since: toUtcStamp(draftSince.value),
+    until: toUtcStamp(draftUntil.value),
     failures_only: draftFailuresOnly.value || undefined,
   })
 }
@@ -75,7 +98,56 @@ function resetFilter() {
   draftModel.value = ''
   draftChannel.value = ''
   draftFailuresOnly.value = false
+  draftRequestId.value = ''
+  draftSince.value = ''
+  draftUntil.value = ''
   store.fetch({})
+}
+
+/** 按当前筛选下载全量 NDJSON（上限 5 万行，服务端拼装）。 */
+function exportAll() {
+  const a = document.createElement('a')
+  a.href = logsApi.exportUrl(store.filter)
+  a.download = ''
+  a.click()
+}
+
+// ── 完整请求详情 ──
+// 正文可能几十 KB，列表接口从不带它；点开时按 id 单独取。
+const detail = ref<RequestLog | null>(null)
+const detailLoading = ref(false)
+const detailError = ref<string | null>(null)
+const detailOpen = computed(
+  () => detailLoading.value || detail.value !== null || detailError.value !== null,
+)
+
+async function openDetail(id: number) {
+  detailLoading.value = true
+  detailError.value = null
+  detail.value = null
+  try {
+    detail.value = await logsApi.get(id)
+  } catch (e) {
+    detailError.value = e instanceof Error ? e.message : '加载失败'
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+function closeDetail() {
+  detail.value = null
+  detailError.value = null
+  detailLoading.value = false
+}
+
+/** 尽力美化 JSON；不是 JSON（流式聚合文本）就原样展示。 */
+function pretty(raw?: string | null): string {
+  if (!raw) return ''
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
 }
 
 function toggleRow(id: number) {
@@ -176,6 +248,16 @@ function fullTime(iso: string): string {
           导出本页
         </button>
 
+        <button
+          type="button"
+          class="glass-button-ghost flex items-center gap-1.5 px-3 py-2 text-sm"
+          title="按当前筛选导出 NDJSON（上限 5 万行）"
+          @click="exportAll"
+        >
+          <AppIcon name="upload" :size="14" />
+          导出全量
+        </button>
+
         <label class="flex items-center gap-1.5 text-xs text-ink-soft">
           清理
           <input
@@ -217,6 +299,37 @@ function fullTime(iso: string): string {
           <option value="">全部</option>
           <option v-for="o in channelsStore.options" :key="o.id" :value="o.id">{{ o.name }}</option>
         </select>
+      </label>
+
+      <label class="flex flex-col gap-1.5">
+        <span class="text-xs font-medium text-ink-soft">request id</span>
+        <input
+          v-model="draftRequestId"
+          type="text"
+          placeholder="x-refract-request-id"
+          class="glass-field w-52 px-3 py-1.5 font-mono text-xs outline-none"
+          @keydown.enter="applyFilter"
+        />
+      </label>
+
+      <label class="flex flex-col gap-1.5">
+        <span class="text-xs font-medium text-ink-soft">从</span>
+        <input
+          v-model="draftSince"
+          type="datetime-local"
+          aria-label="起始时间"
+          class="glass-field px-3 py-1.5 text-sm outline-none"
+        />
+      </label>
+
+      <label class="flex flex-col gap-1.5">
+        <span class="text-xs font-medium text-ink-soft">到</span>
+        <input
+          v-model="draftUntil"
+          type="datetime-local"
+          aria-label="截止时间"
+          class="glass-field px-3 py-1.5 text-sm outline-none"
+        />
       </label>
 
       <label class="flex cursor-pointer items-center gap-2 pb-2 text-sm">
@@ -361,12 +474,26 @@ function fullTime(iso: string): string {
                     <dd>{{ log.transcoded ? '是' : '原生' }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">缓存 tokens</dt>
+                    <dt class="text-ink-faint">缓存读 tokens</dt>
                     <dd class="tabular">{{ log.cached_tokens }}</dd>
+                  </div>
+                  <div>
+                    <dt class="text-ink-faint">缓存写 tokens</dt>
+                    <dd class="tabular">{{ log.cache_write_tokens }}</dd>
                   </div>
                   <div>
                     <dt class="text-ink-faint">推理 tokens</dt>
                     <dd class="tabular">{{ log.reasoning_tokens }}</dd>
+                  </div>
+                  <div>
+                    <dt class="text-ink-faint">首字延迟</dt>
+                    <dd class="tabular">{{ log.ttfb_ms != null ? `${log.ttfb_ms}ms` : '—' }}</dd>
+                  </div>
+                  <div>
+                    <dt class="text-ink-faint">生成耗时</dt>
+                    <dd class="tabular">
+                      {{ log.ttfb_ms != null ? `${log.duration_ms - log.ttfb_ms}ms` : '—' }}
+                    </dd>
                   </div>
                   <div>
                     <dt class="text-ink-faint">重试</dt>
@@ -389,6 +516,16 @@ function fullTime(iso: string): string {
                   >
                     {{ log.error_message }}
                   </p>
+                </div>
+
+                <div class="mt-3">
+                  <button
+                    type="button"
+                    class="glass-button-ghost px-3 py-1.5 text-xs"
+                    @click.stop="openDetail(log.id)"
+                  >
+                    查看完整请求
+                  </button>
                 </div>
               </td>
             </tr>
@@ -421,5 +558,55 @@ function fullTime(iso: string): string {
         </button>
       </div>
     </div>
+
+    <!-- 完整请求详情弹窗 -->
+    <DialogRoot :open="detailOpen" @update:open="(open) => !open && closeDetail()">
+      <DialogPortal>
+        <DialogOverlay
+          class="fixed inset-0 z-50 bg-ink/25 backdrop-blur-sm data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
+        />
+        <DialogContent
+          class="glass-thick glass-specular fixed top-1/2 left-1/2 z-50 flex max-h-[85vh] w-[calc(100%-2rem)] max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col p-6 outline-none"
+        >
+          <DialogTitle class="text-lg font-semibold">完整请求</DialogTitle>
+          <DialogDescription class="mt-1 font-mono text-xs text-ink-faint">
+            {{ detail?.request_id ?? '' }}
+          </DialogDescription>
+
+          <div v-if="detailLoading" class="py-10 text-center text-sm text-ink-faint">加载中…</div>
+          <p v-else-if="detailError" class="mt-4 text-sm text-danger">{{ detailError }}</p>
+
+          <div v-else-if="detail" class="mt-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+            <section>
+              <h3 class="mb-1.5 text-xs font-semibold text-ink-soft uppercase">请求</h3>
+              <pre
+                v-if="detail.request_body"
+                class="max-h-72 overflow-auto rounded-lg bg-ink/6 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap"
+                >{{ pretty(detail.request_body) }}</pre>
+              <p v-else class="text-xs text-ink-faint">
+                未记录 —— 正文快照未开启，或该请求是二进制表单。
+              </p>
+            </section>
+
+            <section>
+              <h3 class="mb-1.5 text-xs font-semibold text-ink-soft uppercase">
+                响应{{ detail.stream ? '（流式聚合文本）' : '' }}
+              </h3>
+              <pre
+                v-if="detail.response_body"
+                class="max-h-72 overflow-auto rounded-lg bg-ink/6 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap"
+                >{{ pretty(detail.response_body) }}</pre>
+              <p v-else class="text-xs text-ink-faint">未记录。</p>
+            </section>
+          </div>
+
+          <div class="mt-4 flex justify-end">
+            <button type="button" class="glass-button-ghost px-4 py-2 text-sm" @click="closeDetail">
+              关闭
+            </button>
+          </div>
+        </DialogContent>
+      </DialogPortal>
+    </DialogRoot>
   </div>
 </template>

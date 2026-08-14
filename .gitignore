@@ -1,6 +1,7 @@
 # ---- Rust ----
 /target/
 **/*.rs.bk
+rustc-ice-*.txt
 
 # ---- 运行时数据库（SQLite 及其 WAL/共享内存文件）----
 *.db

@@ -70,6 +70,32 @@ Gateway API keys can carry a token quota (0 = unlimited). Enforcement is **soft*
 
 For a personal gateway this is the right trade — hard mid-stream cutoffs would waste the tokens already generated. Treat quotas as budget guards, not billing enforcement.
 
+## Rate limits (RPM / TPM)
+
+Each gateway key can additionally carry per-minute limits: requests per minute and tokens per minute (0 = unlimited). Windows are fixed calendar minutes kept in gateway memory — a restart clears them, which is acceptable because limits are protective, not billing. TPM is "post-paid, pre-checked": token usage is booked after a request completes, and a new request is rejected once the current window is already at or over the cap, so one large request may overshoot before the next one is blocked. Rejections return 429 with a `Retry-After` header pointing at the next window.
+
+HTTP 200 generation responses with no text, reasoning, refusal, or tool call can be retried on the same channel. The default policy retries responses that finish within 3 seconds of the first upstream body byte, up to 5 additional attempts. Configure the global values under **Settings → Routing**, or leave either channel override blank to inherit its global value. Setting either effective value to 0 disables this retry. Streaming responses are buffered only until real model output appears or the configured window expires, so a fast empty stream can be retried before any frame reaches the client.
+
+The same settings section also has a strict-response switch. When enabled, an HTTP 200 generation response that cannot be recognized as the configured protocol (for example plain text, HTML, unknown JSON, or a non-SSE stream) is returned as an explicit, non-retryable HTTP 500 error. The switch is off by default, so existing behavior does not change until it is enabled.
+
+Realtime WebSocket handshakes count toward key and gateway RPM, and each open session holds one global concurrency slot until it closes. Realtime token events are not decoded, so they do not accrue TPM or token cost; the session log still records channel, model, status, and duration.
+
+## Alerts and automatic recovery
+
+Configure a webhook URL and retest interval in Settings to close the unattended-operation loop. Endpoint suspension/recovery and terminal authentication failures emit deduplicated JSON webhook events. Repeated terminal failures mark a channel as automatically disabled; periodic retesting only touches automatically disabled channels and re-enables them after a successful probe. Manually disabled channels stay disabled.
+
+## Relay balances and database backup
+
+Balance refresh uses the common one-api/new-api billing endpoints where a relay exposes them; unsupported relays fail without changing the last cached balance. The dashboard derives channel and time-series accounting from immutable request logs. Settings also reports SQLite size/log age and creates an online `VACUUM INTO` backup without stopping request traffic.
+
+## Request body capture
+
+By default every log row stores a snapshot of the request body and the response body (streaming responses store the aggregated text; binary payloads such as audio and multipart uploads are skipped). Snapshots are truncated at 64 KB with an explicit marker. The list API never returns bodies — only `GET /api/logs/{id}` does, which backs the "查看完整请求" dialog in the logs page. If conversation content must not touch disk, disable the switch under **Settings → 日志保留**; metadata logging is unaffected.
+
+## Pricing and spend
+
+Settings → 模型价表 maintains per-million-token prices keyed by exact model name or a `*` prefix wildcard (exact wins, then longest prefix). Each request's cost is computed with the table in effect at write time and frozen into its log row — changing prices later does not rewrite history. Spend appears on the dashboard summary, the per-model table, per-key usage, and is included in backups.
+
 ## Graceful shutdown
 
 On SIGTERM/Ctrl-C Refract stops accepting new connections and waits up to `shutdown_grace_secs` (default 30) for in-flight requests — including long streams — to finish, then aborts whatever remains. Raise the window if your workload routinely streams for minutes and you prefer clean completion over fast restarts; container orchestrators must allow at least this long before SIGKILL (Compose `stop_grace_period`, Kubernetes `terminationGracePeriodSeconds`).

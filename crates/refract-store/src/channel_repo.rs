@@ -33,8 +33,33 @@ struct ChannelRow {
     proxy: Option<String>,
     param_override: Option<String>,
     note: Option<String>,
+    auto_disabled: bool,
+    balance: Option<f64>,
+    balance_updated_at: Option<String>,
+    extra_headers: Option<String>,
+    test_model: Option<String>,
+    empty_response_retry: Option<String>,
 }
 
+macro_rules! channel_cols {
+    () => {
+        "id, owner_id, name, kind, enabled, priority, weight, credential, address, \
+         tags, timeout_secs, proxy, param_override, note, auto_disabled, balance, \
+         balance_updated_at, extra_headers, test_model, empty_response_retry"
+    };
+}
+
+const SELECT_CHANNELS_LIST: &str = concat!(
+    "SELECT ",
+    channel_cols!(),
+    " FROM channels WHERE owner_id = ? ORDER BY priority DESC, id ASC"
+);
+
+const SELECT_CHANNEL_BY_ID: &str = concat!(
+    "SELECT ",
+    channel_cols!(),
+    " FROM channels WHERE owner_id = ? AND id = ?"
+);
 impl ChannelRepo {
     /// 绑定到一个数据库。
     pub fn new(db: Database) -> Self {
@@ -43,14 +68,10 @@ impl ChannelRepo {
 
     /// 列出某个所有者的全部渠道（含端点）。
     pub async fn list(&self, owner_id: i64) -> Result<Vec<Channel>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT id, owner_id, name, kind, enabled, priority, weight, credential, address, \
-             tags, timeout_secs, proxy, param_override, note \
-             FROM channels WHERE owner_id = ? ORDER BY priority DESC, id ASC",
-        )
-        .bind(owner_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = sqlx::query(SELECT_CHANNELS_LIST)
+            .bind(owner_id)
+            .fetch_all(self.db.pool())
+            .await?;
 
         let mut channels = Vec::with_capacity(rows.len());
         for row in rows {
@@ -63,16 +84,12 @@ impl ChannelRepo {
 
     /// 按 ID 取单个渠道。
     pub async fn get(&self, owner_id: i64, id: ChannelId) -> Result<Channel, StoreError> {
-        let row = sqlx::query(
-            "SELECT id, owner_id, name, kind, enabled, priority, weight, credential, address, \
-             tags, timeout_secs, proxy, param_override, note \
-             FROM channels WHERE owner_id = ? AND id = ?",
-        )
-        .bind(owner_id)
-        .bind(id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| StoreError::not_found("channel", id))?;
+        let row = sqlx::query(SELECT_CHANNEL_BY_ID)
+            .bind(owner_id)
+            .bind(id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| StoreError::not_found("channel", id))?;
 
         let parsed = Self::row_to_parts(&row)?;
         let endpoints = self.load_endpoints(id).await?;
@@ -100,8 +117,9 @@ impl ChannelRepo {
         let id: i64 = sqlx::query(
             "INSERT INTO channels \
              (owner_id, name, kind, enabled, priority, weight, credential, address, tags, \
-              timeout_secs, proxy, param_override, note) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              timeout_secs, proxy, param_override, note, extra_headers, test_model, \
+              empty_response_retry) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(channel.owner_id)
         .bind(&channel.name)
@@ -121,6 +139,15 @@ impl ChannelRepo {
                 .map(|v| serde_json::to_string(v).expect("param_override serializes")),
         )
         .bind(channel.note.as_deref())
+        .bind(
+            (!channel.extra_headers.is_empty())
+                .then(|| serde_json::to_string(&channel.extra_headers).expect("headers serialize")),
+        )
+        .bind(channel.test_model.as_deref())
+        .bind((!channel.empty_response_retry.is_inherited()).then(|| {
+            serde_json::to_string(&channel.empty_response_retry)
+                .expect("empty response retry override serializes")
+        }))
         .fetch_one(&mut *tx)
         .await?
         .get(0);
@@ -217,7 +244,9 @@ impl ChannelRepo {
         let affected = sqlx::query(
             "UPDATE channels SET name = ?, kind = ?, enabled = ?, priority = ?, weight = ?, \
              credential = ?, address = ?, tags = ?, timeout_secs = ?, proxy = ?, \
-             param_override = ?, note = ?, updated_at = datetime('now') \
+             param_override = ?, note = ?, extra_headers = ?, test_model = ?, \
+             empty_response_retry = ?, \
+             updated_at = datetime('now') \
              WHERE id = ? AND owner_id = ?",
         )
         .bind(&channel.name)
@@ -237,15 +266,22 @@ impl ChannelRepo {
                 .map(|v| serde_json::to_string(v).expect("param_override serializes")),
         )
         .bind(channel.note.as_deref())
+        .bind(
+            (!channel.extra_headers.is_empty())
+                .then(|| serde_json::to_string(&channel.extra_headers).expect("headers serialize")),
+        )
+        .bind(channel.test_model.as_deref())
+        .bind((!channel.empty_response_retry.is_inherited()).then(|| {
+            serde_json::to_string(&channel.empty_response_retry)
+                .expect("empty response retry override serializes")
+        }))
         .bind(channel.id)
         .bind(channel.owner_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
 
-        if affected == 0 {
-            return Err(StoreError::not_found("channel", channel.id));
-        }
+        crate::ensure_affected(affected, "channel", channel.id)?;
 
         sqlx::query("DELETE FROM channel_endpoints WHERE channel_id = ?")
             .bind(channel.id)
@@ -267,9 +303,7 @@ impl ChannelRepo {
             .execute(self.db.pool())
             .await?
             .rows_affected();
-        if affected == 0 {
-            return Err(StoreError::not_found("channel", id));
-        }
+        crate::ensure_affected(affected, "channel", id)?;
         Ok(())
     }
 
@@ -290,8 +324,10 @@ impl ChannelRepo {
         id: ChannelId,
         enabled: bool,
     ) -> Result<(), StoreError> {
+        // 手动改启用状态时清掉自动禁用标记：用户显式启用等于「我知道并
+        // 认为它好了」，显式禁用则转为手动禁用（不再参与重测自愈）。
         let affected = sqlx::query(
-            "UPDATE channels SET enabled = ?, updated_at = datetime('now') \
+            "UPDATE channels SET enabled = ?, auto_disabled = 0, updated_at = datetime('now') \
              WHERE id = ? AND owner_id = ?",
         )
         .bind(enabled)
@@ -300,10 +336,65 @@ impl ChannelRepo {
         .execute(self.db.pool())
         .await?
         .rows_affected();
-        if affected == 0 {
-            return Err(StoreError::not_found("channel", id));
-        }
+        crate::ensure_affected(affected, "channel", id)?;
         Ok(())
+    }
+
+    /// 记录一次余额探测结果。观测数据的窄更新，不触碰配置。
+    pub async fn set_balance(
+        &self,
+        owner_id: i64,
+        id: ChannelId,
+        balance: f64,
+    ) -> Result<(), StoreError> {
+        let affected = sqlx::query(
+            "UPDATE channels SET balance = ?, balance_updated_at = ? \
+             WHERE id = ? AND owner_id = ?",
+        )
+        .bind(balance)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .bind(owner_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        crate::ensure_affected(affected, "channel", id)?;
+        Ok(())
+    }
+
+    /// 因终态错误（凭据失效等）自动禁用渠道。
+    ///
+    /// 与手动禁用的区别：保留自愈资格 —— 定时重测成功后会自动恢复。
+    pub async fn set_auto_disabled(&self, owner_id: i64, id: ChannelId) -> Result<(), StoreError> {
+        let affected = sqlx::query(
+            "UPDATE channels SET enabled = 0, auto_disabled = 1, updated_at = datetime('now') \
+             WHERE id = ? AND owner_id = ?",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        crate::ensure_affected(affected, "channel", id)?;
+        Ok(())
+    }
+    /// 自动禁用的渠道经重测成功后恢复。只作用于 `auto_disabled` 的行 ——
+    /// 手动禁用的渠道即使重测通过也不动，那是用户的显式决定。
+    pub async fn restore_auto_disabled(
+        &self,
+        owner_id: i64,
+        id: ChannelId,
+    ) -> Result<bool, StoreError> {
+        let affected = sqlx::query(
+            "UPDATE channels SET enabled = 1, auto_disabled = 0, updated_at = datetime('now') \
+             WHERE id = ? AND owner_id = ? AND auto_disabled = 1",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
     }
 
     async fn load_endpoints(&self, channel_id: i64) -> Result<Vec<ChannelEndpoint>, StoreError> {
@@ -382,6 +473,12 @@ impl ChannelRepo {
             proxy: row.get("proxy"),
             param_override: row.get("param_override"),
             note: row.get("note"),
+            auto_disabled: row.get("auto_disabled"),
+            balance: row.get("balance"),
+            balance_updated_at: row.get("balance_updated_at"),
+            extra_headers: row.get("extra_headers"),
+            test_model: row.get("test_model"),
+            empty_response_retry: row.get("empty_response_retry"),
         })
     }
 
@@ -412,6 +509,25 @@ impl ChannelRepo {
                 .transpose()
                 .map_err(StoreError::json("channels.param_override"))?,
             note: row.note,
+            auto_disabled: row.auto_disabled,
+            balance: row.balance,
+            balance_updated_at: row
+                .balance_updated_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc)),
+            extra_headers: row
+                .extra_headers
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .map_err(StoreError::json("channels.extra_headers"))?
+                .unwrap_or_default(),
+            test_model: row.test_model,
+            empty_response_retry: row
+                .empty_response_retry
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(StoreError::json("channels.empty_response_retry"))?
+                .unwrap_or_default(),
         })
     }
 }
@@ -420,7 +536,7 @@ impl ChannelRepo {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use refract_core::{DEFAULT_OWNER_ID, ProtocolSet};
+    use refract_core::{DEFAULT_OWNER_ID, EmptyResponseRetryOverride, ProtocolSet};
 
     async fn repo() -> ChannelRepo {
         ChannelRepo::new(Database::open_in_memory().await.unwrap())
@@ -449,6 +565,15 @@ mod tests {
             proxy: None,
             param_override: None,
             note: Some("main".into()),
+            auto_disabled: false,
+            balance: None,
+            balance_updated_at: None,
+            extra_headers: Vec::new(),
+            test_model: None,
+            empty_response_retry: EmptyResponseRetryOverride {
+                window_secs: Some(6),
+                max_retries: Some(2),
+            },
         }
     }
 

@@ -1,3 +1,7 @@
+// warp 过滤器的 or 链会产生深度嵌套的类型，路由数量增长后会撞上
+// 编译器默认的查询深度上限 —— 与 refract-server 相同的处理。
+#![recursion_limit = "256"]
+
 //! HTTP 层。
 //!
 //! 两组路由，边界清晰：
@@ -10,16 +14,23 @@
 
 // lint 配置统一在 workspace `Cargo.toml` 的 [workspace.lints] 里维护。
 
+#[macro_use]
+pub mod router;
+
 pub mod admin;
 pub mod auth;
 pub mod error;
 pub mod gateway;
 pub mod metrics;
+pub mod notify;
 pub mod ops;
+pub mod rate;
+pub mod realtime;
 pub mod state;
 pub mod statics;
 
 pub use error::{ApiError, ErrorEnvelope};
+pub use router::any_of;
 pub use state::AppState;
 
 use warp::{Filter, Reply as _};
@@ -39,11 +50,14 @@ pub fn routes(
         warp::reply::with_status(warp::reply(), warp::http::StatusCode::NO_CONTENT).into_response()
     });
 
-    let api = preflight
-        .or(ops::routes(state.clone()))
-        .or(admin::routes(state.clone()))
-        .or(gateway::routes(state.clone()))
-        .or(statics::routes());
+    let api = routes![
+        preflight,
+        ops::routes(state.clone()),
+        admin::routes(state.clone()),
+        realtime::routes(state.clone()),
+        gateway::routes(state.clone()),
+        statics::routes(),
+    ];
 
     warp::path::full()
         .and(api.recover(error::recover))

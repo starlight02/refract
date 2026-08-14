@@ -15,7 +15,7 @@ use crate::db::{Database, StoreError};
 pub const KEY_PREFIX: &str = "rk-";
 
 /// 一个 API 密钥（不含明文）。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ApiKey {
     /// 主键。
     pub id: i64,
@@ -35,6 +35,16 @@ pub struct ApiKey {
     pub quota: i64,
     /// 已用配额。
     pub used_quota: i64,
+    /// 每分钟请求数上限。0 表示不限。
+    pub rpm_limit: i64,
+    /// 每分钟 token 数上限。0 表示不限。
+    pub tpm_limit: i64,
+    /// 金额预算上限。0 表示不限。
+    pub budget: f64,
+    /// 已用金额。
+    pub used_budget: f64,
+    /// 备注。
+    pub note: Option<String>,
     /// 过期时间。
     pub expires_at: Option<DateTime<Utc>>,
     /// 最后使用时间。
@@ -57,6 +67,9 @@ impl ApiKey {
         if self.quota > 0 && self.used_quota >= self.quota {
             return false;
         }
+        if self.budget > 0.0 && self.used_budget >= self.budget {
+            return false;
+        }
         true
     }
 
@@ -69,7 +82,7 @@ impl ApiKey {
 /// 备份导出形态的 API 密钥：含 `key_hash`，可在另一实例恢复后继续用原密钥。
 ///
 /// 明文不可导出 —— 库里从未存过。哈希本身不可逆，泄漏面等同数据库文件。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExportedApiKey {
     /// 展示名。
     pub name: String,
@@ -91,6 +104,21 @@ pub struct ExportedApiKey {
     /// 已用配额。
     #[serde(default)]
     pub used_quota: i64,
+    /// 每分钟请求数上限。
+    #[serde(default)]
+    pub rpm_limit: i64,
+    /// 每分钟 token 数上限。
+    #[serde(default)]
+    pub tpm_limit: i64,
+    /// 金额预算上限。
+    #[serde(default)]
+    pub budget: f64,
+    /// 已用金额。
+    #[serde(default)]
+    pub used_budget: f64,
+    /// 备注。
+    #[serde(default)]
+    pub note: Option<String>,
     /// 过期时间。
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
@@ -110,6 +138,18 @@ pub struct NewApiKey {
     /// 配额上限。
     #[serde(default)]
     pub quota: i64,
+    /// 每分钟请求数上限。0 表示不限。
+    #[serde(default)]
+    pub rpm_limit: i64,
+    /// 每分钟 token 数上限。0 表示不限。
+    #[serde(default)]
+    pub tpm_limit: i64,
+    /// 金额预算上限。0 表示不限。
+    #[serde(default)]
+    pub budget: f64,
+    /// 备注。
+    #[serde(default)]
+    pub note: Option<String>,
     /// 过期时间。
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
@@ -138,14 +178,40 @@ impl ApiKeyRepo {
 
     /// 生成一个新的明文密钥。
     pub fn generate_plaintext() -> String {
-        let mut bytes = [0_u8; 32];
+        let mut bytes = [0u8; 32];
         rand::rng().fill(&mut bytes);
         format!(
             "{KEY_PREFIX}{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
         )
     }
+}
 
+macro_rules! api_key_cols {
+    () => {
+        "id, owner_id, name, key_prefix, enabled, allowed_models, allowed_tags, \
+         quota, used_quota, rpm_limit, tpm_limit, budget, used_budget, note, expires_at, \
+         last_used_at, created_at"
+    };
+}
+
+const SELECT_API_KEY_BY_HASH: &str = concat!(
+    "SELECT ",
+    api_key_cols!(),
+    " FROM api_keys WHERE key_hash = ?"
+);
+const SELECT_API_KEY_BY_ID: &str = concat!(
+    "SELECT ",
+    api_key_cols!(),
+    " FROM api_keys WHERE owner_id = ? AND id = ?"
+);
+const SELECT_API_KEYS_LIST: &str = concat!(
+    "SELECT ",
+    api_key_cols!(),
+    " FROM api_keys WHERE owner_id = ? ORDER BY id DESC"
+);
+
+impl ApiKeyRepo {
     /// 创建密钥，返回 `(记录, 明文)`。明文此后无法再取回。
     pub async fn create(
         &self,
@@ -162,8 +228,9 @@ impl ApiKeyRepo {
 
         let id: i64 = sqlx::query(
             "INSERT INTO api_keys \
-             (owner_id, name, key_hash, key_prefix, allowed_models, allowed_tags, quota, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+             (owner_id, name, key_hash, key_prefix, allowed_models, allowed_tags, quota, \
+              rpm_limit, tpm_limit, budget, note, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(owner_id)
         .bind(spec.name.trim())
@@ -172,6 +239,10 @@ impl ApiKeyRepo {
         .bind(serde_json::to_string(&spec.allowed_models).expect("models serialize"))
         .bind(serde_json::to_string(&spec.allowed_tags).expect("tags serialize"))
         .bind(spec.quota)
+        .bind(spec.rpm_limit.max(0))
+        .bind(spec.tpm_limit.max(0))
+        .bind(spec.budget.max(0.0))
+        .bind(spec.note.as_deref())
         .bind(spec.expires_at.map(|d| d.to_rfc3339()))
         .fetch_one(self.db.pool())
         .await?
@@ -184,43 +255,80 @@ impl ApiKeyRepo {
     /// 按明文查密钥。鉴权热路径。
     pub async fn find_by_plaintext(&self, plaintext: &str) -> Result<Option<ApiKey>, StoreError> {
         let hash = Self::hash(plaintext);
-        let row = sqlx::query(
-            "SELECT id, owner_id, name, key_prefix, enabled, allowed_models, allowed_tags, \
-             quota, used_quota, expires_at, last_used_at, created_at \
-             FROM api_keys WHERE key_hash = ?",
-        )
-        .bind(hash)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let row = sqlx::query(SELECT_API_KEY_BY_HASH)
+            .bind(hash)
+            .fetch_optional(self.db.pool())
+            .await?;
         row.map(|r| Self::from_row(&r)).transpose()
     }
 
     /// 按 ID 取。
     pub async fn get(&self, owner_id: i64, id: i64) -> Result<ApiKey, StoreError> {
-        let row = sqlx::query(
-            "SELECT id, owner_id, name, key_prefix, enabled, allowed_models, allowed_tags, \
-             quota, used_quota, expires_at, last_used_at, created_at \
-             FROM api_keys WHERE owner_id = ? AND id = ?",
-        )
-        .bind(owner_id)
-        .bind(id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| StoreError::not_found("api key", id))?;
+        let row = sqlx::query(SELECT_API_KEY_BY_ID)
+            .bind(owner_id)
+            .bind(id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| StoreError::not_found("api key", id))?;
         Self::from_row(&row)
     }
 
     /// 列出全部。
     pub async fn list(&self, owner_id: i64) -> Result<Vec<ApiKey>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT id, owner_id, name, key_prefix, enabled, allowed_models, allowed_tags, \
-             quota, used_quota, expires_at, last_used_at, created_at \
-             FROM api_keys WHERE owner_id = ? ORDER BY id DESC",
-        )
-        .bind(owner_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = sqlx::query(SELECT_API_KEYS_LIST)
+            .bind(owner_id)
+            .fetch_all(self.db.pool())
+            .await?;
         rows.iter().map(Self::from_row).collect()
+    }
+
+    /// 更新密钥的治理属性。密钥本体（key_hash/key_prefix）永不改变 ——
+    /// 「调大 TPM」不应该等于「轮换密钥、重配所有客户端」。
+    pub async fn update(
+        &self,
+        owner_id: i64,
+        id: i64,
+        spec: &NewApiKey,
+    ) -> Result<ApiKey, StoreError> {
+        if spec.name.trim().is_empty() {
+            return Err(StoreError::Invalid("api key name must not be empty".into()));
+        }
+        let affected = sqlx::query(
+            "UPDATE api_keys SET name = ?, allowed_models = ?, allowed_tags = ?, quota = ?, \
+             rpm_limit = ?, tpm_limit = ?, budget = ?, note = ?, expires_at = ? \
+             WHERE id = ? AND owner_id = ?",
+        )
+        .bind(spec.name.trim())
+        .bind(serde_json::to_string(&spec.allowed_models).expect("models serialize"))
+        .bind(serde_json::to_string(&spec.allowed_tags).expect("tags serialize"))
+        .bind(spec.quota.max(0))
+        .bind(spec.rpm_limit.max(0))
+        .bind(spec.tpm_limit.max(0))
+        .bind(spec.budget.max(0.0))
+        .bind(spec.note.as_deref())
+        .bind(spec.expires_at.map(|d| d.to_rfc3339()))
+        .bind(id)
+        .bind(owner_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        crate::ensure_affected(affected, "api key", id)?;
+        self.get(owner_id, id).await
+    }
+
+    /// 把已用配额清零 —— 软配额的实用形态是「周期预算」，不可重置的
+    /// 配额只能当一次性保险丝。
+    pub async fn reset_usage(&self, owner_id: i64, id: i64) -> Result<(), StoreError> {
+        let affected = sqlx::query(
+            "UPDATE api_keys SET used_quota = 0, used_budget = 0 WHERE id = ? AND owner_id = ?",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        crate::ensure_affected(affected, "api key", id)?;
+        Ok(())
     }
 
     /// 启用/停用。
@@ -237,9 +345,7 @@ impl ApiKeyRepo {
             .execute(self.db.pool())
             .await?
             .rows_affected();
-        if affected == 0 {
-            return Err(StoreError::not_found("api key", id));
-        }
+        crate::ensure_affected(affected, "api key", id)?;
         Ok(())
     }
 
@@ -251,9 +357,7 @@ impl ApiKeyRepo {
             .execute(self.db.pool())
             .await?
             .rows_affected();
-        if affected == 0 {
-            return Err(StoreError::not_found("api key", id));
-        }
+        crate::ensure_affected(affected, "api key", id)?;
         Ok(())
     }
 
@@ -261,7 +365,7 @@ impl ApiKeyRepo {
     pub async fn export(&self, owner_id: i64) -> Result<Vec<ExportedApiKey>, StoreError> {
         let rows = sqlx::query(
             "SELECT name, key_hash, key_prefix, enabled, allowed_models, allowed_tags, \
-             quota, used_quota, expires_at \
+             quota, used_quota, rpm_limit, tpm_limit, budget, used_budget, note, expires_at \
              FROM api_keys WHERE owner_id = ? ORDER BY id",
         )
         .bind(owner_id)
@@ -282,6 +386,11 @@ impl ApiKeyRepo {
                         .map_err(StoreError::json("api_keys.allowed_tags"))?,
                     quota: row.get("quota"),
                     used_quota: row.get("used_quota"),
+                    rpm_limit: row.get("rpm_limit"),
+                    tpm_limit: row.get("tpm_limit"),
+                    budget: row.get("budget"),
+                    used_budget: row.get("used_budget"),
+                    note: row.get("note"),
                     expires_at: parse_ts(row.get::<Option<String>, _>("expires_at")),
                 })
             })
@@ -334,8 +443,8 @@ impl ApiKeyRepo {
         let affected = sqlx::query(
             "INSERT INTO api_keys \
              (owner_id, name, key_hash, key_prefix, enabled, allowed_models, allowed_tags, \
-              quota, used_quota, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+              quota, used_quota, rpm_limit, tpm_limit, budget, used_budget, note, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (key_hash) DO NOTHING",
         )
         .bind(owner_id)
@@ -347,6 +456,11 @@ impl ApiKeyRepo {
         .bind(serde_json::to_string(&key.allowed_tags).expect("tags serialize"))
         .bind(key.quota)
         .bind(key.used_quota)
+        .bind(key.rpm_limit.max(0))
+        .bind(key.tpm_limit.max(0))
+        .bind(key.budget.max(0.0))
+        .bind(key.used_budget.max(0.0))
+        .bind(key.note.as_deref())
         .bind(key.expires_at.map(|d| d.to_rfc3339()))
         .execute(&mut *conn)
         .await?
@@ -365,12 +479,13 @@ impl ApiKeyRepo {
     }
 
     /// 记录一次使用：累加配额并更新最后使用时间。
-    pub async fn record_usage(&self, id: i64, tokens: i64) -> Result<(), StoreError> {
+    pub async fn record_usage(&self, id: i64, tokens: i64, cost: f64) -> Result<(), StoreError> {
         sqlx::query(
-            "UPDATE api_keys SET used_quota = used_quota + ?, last_used_at = datetime('now') \
-             WHERE id = ?",
+            "UPDATE api_keys SET used_quota = used_quota + ?, used_budget = used_budget + ?, \
+             last_used_at = datetime('now') WHERE id = ?",
         )
         .bind(tokens)
+        .bind(cost.max(0.0))
         .bind(id)
         .execute(self.db.pool())
         .await?;
@@ -392,6 +507,11 @@ impl ApiKeyRepo {
                 .map_err(StoreError::json("api_keys.allowed_tags"))?,
             quota: row.get("quota"),
             used_quota: row.get("used_quota"),
+            rpm_limit: row.get("rpm_limit"),
+            tpm_limit: row.get("tpm_limit"),
+            budget: row.get("budget"),
+            used_budget: row.get("used_budget"),
+            note: row.get("note"),
             expires_at: parse_ts(row.get::<Option<String>, _>("expires_at")),
             last_used_at: parse_ts(row.get::<Option<String>, _>("last_used_at")),
             created_at: parse_ts(row.get::<Option<String>, _>("created_at"))
@@ -490,6 +610,11 @@ mod tests {
                 allowed_tags: vec![],
                 quota: 0,
                 used_quota: 0,
+                rpm_limit: 0,
+                tpm_limit: 0,
+                budget: 0.0,
+                used_budget: 0.0,
+                note: None,
                 expires_at: None,
             },
             // 与第一把 key_hash 相同：应被去重跳过，而不是报错。
@@ -502,6 +627,11 @@ mod tests {
                 allowed_tags: vec![],
                 quota: 0,
                 used_quota: 0,
+                rpm_limit: 0,
+                tpm_limit: 0,
+                budget: 0.0,
+                used_budget: 0.0,
+                note: None,
                 expires_at: None,
             },
         ];
@@ -536,6 +666,11 @@ mod tests {
             allowed_tags: vec![],
             quota: 0,
             used_quota: 0,
+            rpm_limit: 0,
+            tpm_limit: 0,
+            budget: 0.0,
+            used_budget: 0.0,
+            note: None,
             expires_at: None,
         };
         let err = repo
@@ -662,6 +797,11 @@ mod tests {
             allowed_tags: vec![],
             quota: 0,
             used_quota: 0,
+            rpm_limit: 0,
+            tpm_limit: 0,
+            budget: 0.0,
+            used_budget: 0.0,
+            note: None,
             expires_at: None,
             last_used_at: None,
             created_at: now,
@@ -713,6 +853,11 @@ mod tests {
             allowed_tags: vec![],
             quota: 0,
             used_quota: 0,
+            rpm_limit: 0,
+            tpm_limit: 0,
+            budget: 0.0,
+            used_budget: 0.0,
+            note: None,
             expires_at: None,
             last_used_at: None,
             created_at: Utc::now(),
@@ -742,8 +887,8 @@ mod tests {
             .unwrap();
         assert!(key.last_used_at.is_none());
 
-        repo.record_usage(key.id, 120).await.unwrap();
-        repo.record_usage(key.id, 30).await.unwrap();
+        repo.record_usage(key.id, 120, 0.0).await.unwrap();
+        repo.record_usage(key.id, 30, 0.0).await.unwrap();
 
         let after = repo.get(DEFAULT_OWNER_ID, key.id).await.unwrap();
         assert_eq!(after.used_quota, 150);
@@ -761,6 +906,10 @@ mod tests {
                     allowed_models: vec!["gpt-4o".into(), "claude-sonnet-4-6".into()],
                     allowed_tags: vec!["prod".into()],
                     quota: 1_000,
+                    rpm_limit: 0,
+                    tpm_limit: 0,
+                    budget: 0.0,
+                    note: None,
                     expires_at: None,
                 },
             )

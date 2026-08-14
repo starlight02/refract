@@ -16,9 +16,11 @@
 
 // lint 配置统一在 workspace `Cargo.toml` 的 [workspace.lints] 里维护。
 
+pub mod events;
 pub mod executor;
 pub mod plan;
 
+pub use events::{EventSender, RouterEvent};
 pub use executor::{
     InboundPayload, RouteExecutor, RouteOutcome, RoutedResponse, RoutedStream, RouterConfig,
 };

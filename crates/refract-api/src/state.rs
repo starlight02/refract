@@ -20,6 +20,7 @@ use refract_store::{
     ApiKeyRepo, ChannelRepo, Database, HealthRepo, LogRepo, SettingsRepo, StoreError,
 };
 use refract_upstream::UpstreamClient;
+use warp::Filter;
 
 use crate::auth::{Authenticator, SingleUserAuthenticator};
 
@@ -43,6 +44,29 @@ struct Inner {
     /// 共享的健康仓储 —— 它内部有熔断内存缓存，必须全进程同一份，
     /// 否则管理端解除熔断后路由还在用旧缓存。
     health: HealthRepo,
+    /// 每密钥速率限制的分钟窗口。
+    rate_limiter: crate::rate::RateLimiter,
+    /// 模型价表快照。管理端更新后热替换。
+    pricing: ArcSwap<Vec<refract_store::ModelPrice>>,
+    /// 是否把请求/响应正文写进日志。热路径每请求读一次，用原子布尔。
+    capture_bodies: std::sync::atomic::AtomicBool,
+    /// 路由事件出口（自动禁用 + webhook 通知的输入源）。
+    events: refract_router::EventSender,
+    /// 告警 webhook 地址快照。空 = 不通知。
+    webhook_url: ArcSwap<Option<String>>,
+    /// 网关级全局限制快照。
+    global_limits: ArcSwap<refract_store::GlobalLimits>,
+    /// HTTP 200 空回复重试全局策略快照。
+    empty_response_retry: ArcSwap<refract_core::EmptyResponseRetryPolicy>,
+    /// 并发上限信号量。`None` = 不限。改上限时整体重建 ——
+    /// 旧 permit 归还旧信号量，新请求走新的，无需迁移。
+    concurrency: ArcSwap<Option<Arc<tokio::sync::Semaphore>>>,
+}
+
+/// 由限制值构造并发信号量。0 = 不限（None）。
+fn build_semaphore(limits: &refract_store::GlobalLimits) -> Option<Arc<tokio::sync::Semaphore>> {
+    (limits.max_concurrency > 0)
+        .then(|| Arc::new(tokio::sync::Semaphore::new(limits.max_concurrency as usize)))
 }
 
 impl std::fmt::Debug for AppState {
@@ -76,7 +100,15 @@ impl AppState {
         let breaker = SettingsRepo::new(db.clone()).breaker_policy().await?;
         let health = HealthRepo::with_policy(db.clone(), breaker);
         health.warm_cache().await?;
-        Ok(Self {
+        let pricing = SettingsRepo::new(db.clone()).pricing().await?;
+        let capture_bodies = SettingsRepo::new(db.clone()).capture_bodies().await?;
+        let webhook_url = SettingsRepo::new(db.clone()).webhook_url().await?;
+        let global_limits = SettingsRepo::new(db.clone()).global_limits().await?;
+        let empty_response_retry = SettingsRepo::new(db.clone()).empty_response_retry().await?;
+        let concurrency = build_semaphore(&global_limits);
+        // 事件通道在这里建立；消费端由 `spawn_event_worker` 拉起。
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let state = Self {
             inner: Arc::new(Inner {
                 db,
                 channels: ArcSwap::from_pointee(channels),
@@ -87,13 +119,124 @@ impl AppState {
                 route_cursors: refract_router::RoundRobinCursors::default(),
                 metrics: crate::metrics::GatewayMetrics::default(),
                 health,
+                rate_limiter: crate::rate::RateLimiter::new(),
+                pricing: ArcSwap::from_pointee(pricing),
+                capture_bodies: std::sync::atomic::AtomicBool::new(capture_bodies),
+                events,
+                webhook_url: ArcSwap::from_pointee(webhook_url),
+                global_limits: ArcSwap::from_pointee(global_limits),
+                empty_response_retry: ArcSwap::from_pointee(empty_response_retry),
+                concurrency: ArcSwap::from_pointee(concurrency),
             }),
-        })
+        };
+        crate::notify::spawn_event_worker(state.clone(), receiver);
+        Ok(state)
+    }
+
+    /// 当前全局限制快照。
+    pub fn global_limits(&self) -> refract_store::GlobalLimits {
+        **self.inner.global_limits.load()
+    }
+
+    /// 并发上限信号量。
+    pub fn concurrency_semaphore(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.inner.concurrency.load().as_ref().clone()
+    }
+
+    /// 从库里重读全局限制并重建并发信号量。
+    pub async fn reload_global_limits(&self) -> Result<(), StoreError> {
+        let limits = self.settings_repo().global_limits().await?;
+        self.inner
+            .concurrency
+            .store(Arc::new(build_semaphore(&limits)));
+        self.inner.global_limits.store(Arc::new(limits));
+        Ok(())
+    }
+
+    /// 当前 HTTP 200 空回复重试全局策略。
+    pub fn empty_response_retry(&self) -> refract_core::EmptyResponseRetryPolicy {
+        **self.inner.empty_response_retry.load()
+    }
+
+    /// 从库里重读空回复重试策略。
+    pub async fn reload_empty_response_retry(&self) -> Result<(), StoreError> {
+        let policy = self.settings_repo().empty_response_retry().await?;
+        self.inner.empty_response_retry.store(Arc::new(policy));
+        Ok(())
+    }
+
+    /// 发出一条路由事件（供不经 executor 的路径使用，如流式终态记录）。
+    pub fn emit_router_event(&self, event: refract_router::RouterEvent) {
+        let _ = self.inner.events.send(event);
+    }
+
+    /// 当前告警 webhook 地址。
+    pub fn webhook_url(&self) -> Option<String> {
+        self.inner.webhook_url.load().as_ref().clone()
+    }
+
+    /// 从库里重读 webhook 地址。管理端保存后调用。
+    pub async fn reload_webhook(&self) -> Result<(), StoreError> {
+        let url = self.settings_repo().webhook_url().await?;
+        self.inner.webhook_url.store(Arc::new(url));
+        Ok(())
+    }
+
+    /// 是否记录请求/响应正文快照。
+    pub fn capture_bodies(&self) -> bool {
+        self.inner
+            .capture_bodies
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 从库里重读正文快照开关。管理端保存后调用。
+    pub async fn reload_capture_bodies(&self) -> Result<(), StoreError> {
+        let enabled = SettingsRepo::new(self.inner.db.clone())
+            .capture_bodies()
+            .await?;
+        self.inner
+            .capture_bodies
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 从库里重读价表并热替换。管理端保存后调用。
+    pub async fn reload_pricing(&self) -> Result<(), StoreError> {
+        let pricing = SettingsRepo::new(self.inner.db.clone()).pricing().await?;
+        self.inner.pricing.store(Arc::new(pricing));
+        Ok(())
+    }
+
+    /// 按当前价表计算一次请求的成本。没有匹配规则时为 0。
+    pub fn cost_for(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        cache_write_tokens: u64,
+    ) -> f64 {
+        let pricing = self.inner.pricing.load();
+        refract_store::price_for(&pricing, model)
+            .map(|price| {
+                price.cost(
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    cache_write_tokens,
+                )
+            })
+            .unwrap_or(0.0)
     }
 
     /// 进程内指标计数器。
     pub fn metrics(&self) -> &crate::metrics::GatewayMetrics {
         &self.inner.metrics
+    }
+
+    /// 每密钥速率限制器。
+    pub fn rate_limiter(&self) -> &crate::rate::RateLimiter {
+        &self.inner.rate_limiter
     }
 
     /// 当前渠道快照。读取是一次原子加载，无锁。
@@ -158,12 +301,17 @@ impl AppState {
 
     /// 构造执行器。
     pub fn executor(&self) -> RouteExecutor {
+        let config = refract_router::RouterConfig {
+            empty_response_retry: self.empty_response_retry(),
+            ..Default::default()
+        };
         RouteExecutor::new(
             self.inner.client.clone(),
             self.inner.codecs,
             self.health_repo(),
-            refract_router::RouterConfig::default(),
+            config,
         )
+        .with_events(self.inner.events.clone())
     }
 
     /// 从数据库重新载入渠道快照。
@@ -191,6 +339,13 @@ impl AppState {
         self.inner.health.set_policy(breaker);
         Ok(())
     }
+}
+
+/// 把应用状态注入 warp 过滤器链的统一 helper。
+pub fn with_state(
+    state: AppState,
+) -> impl warp::Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || state.clone())
 }
 
 #[cfg(test)]
@@ -226,6 +381,12 @@ mod tests {
             proxy: None,
             param_override: None,
             note: None,
+            auto_disabled: false,
+            balance: None,
+            balance_updated_at: None,
+            extra_headers: Vec::new(),
+            test_model: None,
+            empty_response_retry: Default::default(),
         }
     }
 

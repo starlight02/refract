@@ -95,6 +95,7 @@ function blankChannel(): Channel {
     proxy: null,
     param_override: null,
     note: null,
+    empty_response_retry: { window_secs: null, max_retries: null },
   }
 }
 
@@ -118,6 +119,52 @@ const probeError = ref<Record<string, string>>({})
 const pendingDelete = ref(false)
 /** 已保存的探测相关配置快照 —— 地址或凭据改了没保存时，探测走的还是旧配置。 */
 const savedProbeConfig = ref('')
+
+// ── 高级配置 ──
+// param_override 与 extra_headers 都用文本编辑，提交时解析 ——
+// 逐键维护结构化编辑器的复杂度对个位数条目不值得。
+const showAdvanced = ref(false)
+const paramOverrideText = ref('')
+const headersText = ref('')
+
+const paramOverrideError = computed(() => {
+  const text = paramOverrideText.value.trim()
+  if (!text) return null
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return '必须是 JSON 对象'
+    }
+    return null
+  } catch (e) {
+    return e instanceof Error ? `JSON 解析失败：${e.message}` : 'JSON 解析失败'
+  }
+})
+
+/** 每行 `Name: Value`；空行忽略。 */
+function parseHeaders(text: string): [string, string][] | string {
+  const out: [string, string][] = []
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line) continue
+    const colon = line.indexOf(':')
+    if (colon <= 0) return `无法解析：「${line}」（应为 Name: Value）`
+    out.push([line.slice(0, colon).trim(), line.slice(colon + 1).trim()])
+  }
+  return out
+}
+
+const headersError = computed(() => {
+  const parsed = parseHeaders(headersText.value)
+  return typeof parsed === 'string' ? parsed : null
+})
+
+function normalizeEmptyRetryOverride(key: 'window_secs' | 'max_retries') {
+  const value = form.value.empty_response_retry[key]
+  if (value === null || (value as unknown) === '' || Number.isNaN(value)) {
+    form.value.empty_response_retry[key] = null
+  }
+}
 
 /** 只序列化影响探测的字段：改模型列表这类字段不应该把探测按钮锁掉。 */
 function probeConfigOf(ch: Channel): string {
@@ -144,8 +191,21 @@ onMounted(async () => {
   loading.value = true
   try {
     const ch = await channelsApi.get(editingId.value as number)
+    ch.empty_response_retry ??= { window_secs: null, max_retries: null }
     form.value = ch
     tagsText.value = (ch.tags ?? []).join(', ')
+    paramOverrideText.value = ch.param_override ? JSON.stringify(ch.param_override, null, 2) : ''
+    headersText.value = (ch.extra_headers ?? []).map(([k, v]) => `${k}: ${v}`).join('\n')
+    if (
+      ch.param_override ||
+      (ch.extra_headers ?? []).length > 0 ||
+      ch.proxy ||
+      ch.test_model ||
+      ch.empty_response_retry.window_secs !== null ||
+      ch.empty_response_retry.max_retries !== null
+    ) {
+      showAdvanced.value = true
+    }
     savedProbeConfig.value = probeConfigOf(ch)
   } catch (e) {
     saveError.value = e instanceof Error ? e.message : '加载渠道失败'
@@ -273,6 +333,21 @@ const validation = computed<string[]>(() => {
   if (!f.name.trim()) errors.push('渠道名不能为空')
   if (f.endpoints.length === 0) errors.push('至少需要一个协议端点')
 
+  const emptyWindow = f.empty_response_retry.window_secs
+  if (
+    emptyWindow !== null &&
+    (!Number.isInteger(emptyWindow) || emptyWindow < 0 || emptyWindow > 3600)
+  ) {
+    errors.push('空回复判定窗口必须留空，或填写 0–3600 的整数')
+  }
+  const emptyRetries = f.empty_response_retry.max_retries
+  if (
+    emptyRetries !== null &&
+    (!Number.isInteger(emptyRetries) || emptyRetries < 0 || emptyRetries > 100)
+  ) {
+    errors.push('空回复最大重试必须留空，或填写 0–100 的整数')
+  }
+
   if (f.kind !== 'aggregate') {
     if (f.endpoints.length !== 1) errors.push('单协议渠道必须恰好一个端点')
     else if (f.endpoints[0]!.protocol !== f.kind)
@@ -300,19 +375,34 @@ const validation = computed<string[]>(() => {
   return errors
 })
 
-const canSave = computed(() => validation.value.length === 0 && !saving.value)
+const canSave = computed(
+  () =>
+    validation.value.length === 0 &&
+    !saving.value &&
+    paramOverrideError.value === null &&
+    headersError.value === null,
+)
 
 async function save() {
   if (!canSave.value) return
   saving.value = true
   saveError.value = null
 
+  const parsedHeaders = parseHeaders(headersText.value)
   const payload: Channel = {
     ...form.value,
     tags: tagsText.value
       .split(',')
       .map((t) => t.trim())
       .filter(Boolean),
+    param_override: paramOverrideText.value.trim()
+      ? (JSON.parse(paramOverrideText.value) as Record<string, unknown>)
+      : null,
+    extra_headers: typeof parsedHeaders === 'string' ? [] : parsedHeaders,
+    proxy: form.value.proxy?.trim() || null,
+    note: form.value.note?.trim() || null,
+    test_model: form.value.test_model?.trim() || null,
+    empty_response_retry: { ...form.value.empty_response_retry },
   }
 
   try {
@@ -814,6 +904,138 @@ function previewUrl(ep: ChannelEndpoint): string {
               </p>
             </div>
           </article>
+        </div>
+      </section>
+
+      <!-- 高级 -->
+      <section class="glass glass-specular p-5">
+        <button
+          type="button"
+          class="flex w-full items-center justify-between text-left"
+          :aria-expanded="showAdvanced"
+          @click="showAdvanced = !showAdvanced"
+        >
+          <span>
+            <span class="text-sm font-semibold text-ink-soft uppercase">高级</span>
+            <span class="ml-2 text-xs text-ink-faint">
+              参数覆盖、自定义请求头、空回复重试、代理、测试模型、备注
+            </span>
+          </span>
+          <span class="text-xs text-ink-faint">{{ showAdvanced ? '收起' : '展开' }}</span>
+        </button>
+
+        <div v-if="showAdvanced" class="mt-4 flex flex-col gap-4">
+          <label class="flex flex-col gap-1.5">
+            <span class="text-xs font-medium text-ink-soft">
+              参数覆盖（JSON）
+              <span class="font-normal text-ink-faint">
+                — 顶层键合并进请求体；值为 null 表示删除该字段；键名为协议名
+                （chat/messages/…）且值为对象时只对该协议生效
+              </span>
+            </span>
+            <textarea
+              v-model="paramOverrideText"
+              rows="5"
+              spellcheck="false"
+              placeholder='{ "temperature": 0.7, "logprobs": null, "gemini": { "generationConfig": { "topK": 40 } } }'
+              class="glass-field px-3 py-2 font-mono text-xs leading-relaxed outline-none"
+            ></textarea>
+            <span v-if="paramOverrideError" class="text-xs text-danger" role="alert">
+              {{ paramOverrideError }}
+            </span>
+          </label>
+
+          <label class="flex flex-col gap-1.5">
+            <span class="text-xs font-medium text-ink-soft">
+              自定义请求头
+              <span class="font-normal text-ink-faint">
+                — 每行一条 Name: Value，随所有上游调用发送；鉴权头由网关掌管不可覆盖
+              </span>
+            </span>
+            <textarea
+              v-model="headersText"
+              rows="3"
+              spellcheck="false"
+              placeholder="x-site-token: abc123"
+              class="glass-field px-3 py-2 font-mono text-xs leading-relaxed outline-none"
+            ></textarea>
+            <span v-if="headersError" class="text-xs text-danger" role="alert">
+              {{ headersError }}
+            </span>
+          </label>
+
+          <div>
+            <span class="text-xs font-medium text-ink-soft">上游 200 空回复重试</span>
+            <p class="mt-1 text-[0.7rem] text-ink-faint">
+              留空继承全局设置；填写 0 可为本渠道关闭对应限制。耗时按“完成时刻 − 首字节时刻”计算。
+            </p>
+            <div class="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <label class="flex flex-col gap-1.5">
+                <span class="text-xs text-ink-soft">判定窗口（秒）</span>
+                <input
+                  v-model.number="form.empty_response_retry.window_secs"
+                  type="number"
+                  min="0"
+                  max="3600"
+                  step="1"
+                  placeholder="留空继承全局"
+                  class="glass-field tabular px-3 py-2 text-sm outline-none"
+                  @change="normalizeEmptyRetryOverride('window_secs')"
+                />
+              </label>
+              <label class="flex flex-col gap-1.5">
+                <span class="text-xs text-ink-soft">最大重试次数</span>
+                <input
+                  v-model.number="form.empty_response_retry.max_retries"
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  placeholder="留空继承全局"
+                  class="glass-field tabular px-3 py-2 text-sm outline-none"
+                  @change="normalizeEmptyRetryOverride('max_retries')"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <label class="flex flex-col gap-1.5">
+              <span class="text-xs font-medium text-ink-soft">
+                出站代理<span class="font-normal text-ink-faint">，http/socks5</span>
+              </span>
+              <input
+                v-model="form.proxy"
+                type="text"
+                placeholder="socks5://127.0.0.1:1080"
+                class="glass-field px-3 py-2 font-mono text-sm outline-none"
+              />
+            </label>
+
+            <label class="flex flex-col gap-1.5">
+              <span class="text-xs font-medium text-ink-soft">
+                测试模型<span class="font-normal text-ink-faint">，连通性测试与定时重测用</span>
+              </span>
+              <input
+                v-model="form.test_model"
+                type="text"
+                placeholder="留空用端点第一个模型"
+                class="glass-field px-3 py-2 font-mono text-sm outline-none"
+              />
+            </label>
+          </div>
+
+          <label class="flex flex-col gap-1.5">
+            <span class="text-xs font-medium text-ink-soft">
+              备注<span class="font-normal text-ink-faint">，仅自己可见</span>
+            </span>
+            <input
+              v-model="form.note"
+              type="text"
+              placeholder="主力站，月底记得续费"
+              class="glass-field px-3 py-2 text-sm outline-none"
+            />
+          </label>
         </div>
       </section>
 

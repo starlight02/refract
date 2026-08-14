@@ -53,8 +53,96 @@ pub enum Action {
     Stream,
     /// 列出模型。
     ListModels,
-    /// 向量嵌入（仅 OpenAI 形状协议有意义）。
+    /// 非对话类端点的字节直通（嵌入、图像、音频等）。
+    Passthrough(PassKind),
+}
+
+/// 直通端点的种类。
+///
+/// 这些端点没有跨协议转换语义（Anthropic 没有图像 API，Gemini 的嵌入形状
+/// 完全不同），只在**同协议原生端点**之间路由：请求与响应字节原样往返，
+/// 网关提供的是路由、重试、熔断、密钥治理与日志，而不是格式转换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassKind {
+    /// OpenAI `POST /v1/embeddings`。
     Embeddings,
+    /// OpenAI `POST /v1/completions`（legacy text completion / FIM）。
+    Completions,
+    /// OpenAI `POST /v1/images/generations`。
+    Images,
+    /// OpenAI `POST /v1/images/edits`（multipart）。
+    ImageEdits,
+    /// OpenAI `POST /v1/audio/speech`（TTS，响应为音频字节）。
+    AudioSpeech,
+    /// OpenAI `POST /v1/audio/transcriptions`（STT，multipart）。
+    AudioTranscriptions,
+    /// OpenAI `POST /v1/audio/translations`（multipart）。
+    AudioTranslations,
+    /// OpenAI `POST /v1/moderations`。
+    Moderations,
+    /// Cohere/Jina 形状的 `POST /v1/rerank`。
+    Rerank,
+    /// Anthropic `POST /v1/messages/count_tokens`。
+    CountTokens,
+    /// Gemini `POST /v1beta/models/{model}:countTokens`。
+    GeminiCountTokens,
+    /// Gemini `POST /v1beta/models/{model}:embedContent`。
+    GeminiEmbed,
+    /// Gemini `POST /v1beta/models/{model}:batchEmbedContents`。
+    GeminiBatchEmbed,
+}
+
+impl PassKind {
+    /// 该端点挂靠的协议 —— 直通只路由到此协议的原生端点。
+    pub const fn protocol(self) -> Protocol {
+        match self {
+            PassKind::CountTokens => Protocol::Messages,
+            PassKind::GeminiCountTokens | PassKind::GeminiEmbed | PassKind::GeminiBatchEmbed => {
+                Protocol::Gemini
+            }
+            _ => Protocol::Chat,
+        }
+    }
+
+    /// 官方地址与拼接模式下使用的默认路径。
+    pub const fn default_path(self) -> &'static str {
+        match self {
+            PassKind::Embeddings => "/embeddings",
+            PassKind::Completions => "/completions",
+            PassKind::Images => "/images/generations",
+            PassKind::ImageEdits => "/images/edits",
+            PassKind::AudioSpeech => "/audio/speech",
+            PassKind::AudioTranscriptions => "/audio/transcriptions",
+            PassKind::AudioTranslations => "/audio/translations",
+            PassKind::Moderations => "/moderations",
+            PassKind::Rerank => "/rerank",
+            PassKind::CountTokens => "/messages/count_tokens",
+            // Gemini 的模型与动作编码在路径里，交给占位符替换。
+            PassKind::GeminiCountTokens | PassKind::GeminiEmbed | PassKind::GeminiBatchEmbed => {
+                "/models/{model}:{action}"
+            }
+        }
+    }
+
+    /// 非完整地址模式下的路径形状校验后缀。
+    const fn path_suffix(self) -> &'static str {
+        match self {
+            PassKind::GeminiCountTokens => ":countTokens",
+            PassKind::GeminiEmbed => ":embedContent",
+            PassKind::GeminiBatchEmbed => ":batchEmbedContents",
+            kind => kind.default_path(),
+        }
+    }
+
+    /// Gemini URL 中的动作片段。
+    const fn gemini_verb(self) -> &'static str {
+        match self {
+            PassKind::GeminiCountTokens => "countTokens",
+            PassKind::GeminiEmbed => "embedContent",
+            PassKind::GeminiBatchEmbed => "batchEmbedContents",
+            _ => "",
+        }
+    }
 }
 
 impl Action {
@@ -63,8 +151,9 @@ impl Action {
         match self {
             Action::Generate => "generateContent",
             Action::Stream => "streamGenerateContent",
-            // 列表与嵌入动作不走 `{action}` 占位符，此值不会被使用。
-            Action::ListModels | Action::Embeddings => "",
+            Action::Passthrough(kind) => kind.gemini_verb(),
+            // 列表动作不走 `{action}` 占位符，此值不会被使用。
+            Action::ListModels => "",
         }
     }
 }
@@ -152,10 +241,10 @@ impl UpstreamAddress {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| protocol.default_version_prefix());
-        // 自定义 `path` 描述的是**对话端点**。模型列表与嵌入有自己的路径语义，
-        // 继承对话 path 会把它们打到一个必然 4xx 的地址上。
+        // 自定义 `path` 描述的是**对话端点**。模型列表与各直通端点有自己的
+        // 路径语义，继承对话 path 会把它们打到一个必然 4xx 的地址上。
         let path = match action {
-            Action::ListModels | Action::Embeddings => default_path_for(protocol, action),
+            Action::ListModels | Action::Passthrough(_) => default_path_for(protocol, action),
             _ => self
                 .path
                 .as_deref()
@@ -170,10 +259,13 @@ impl UpstreamAddress {
 
         // 非完整地址模式下做协议校验：拼错了要尽早报错，而不是把请求打到
         // 一个语义不对的端点然后收到看不懂的 4xx。模型列表动作不校验 ——
-        // 各家的列表路径长得都一样；嵌入动作校验自己的路径形状。
+        // 各家的列表路径长得都一样；直通动作校验自己的路径形状。
         let path_ok = match action {
             Action::ListModels => true,
-            Action::Embeddings => url.path().trim_end_matches('/').ends_with("/embeddings"),
+            Action::Passthrough(kind) => url
+                .path()
+                .trim_end_matches('/')
+                .ends_with(kind.path_suffix()),
             _ => protocol.path_looks_native(url.path()),
         };
         if !path_ok {
@@ -225,8 +317,8 @@ fn append_gemini_sse_query(url: &mut url::Url, protocol: Protocol, action: Actio
 const fn default_path_for(protocol: Protocol, action: Action) -> &'static str {
     match action {
         Action::ListModels => protocol.default_models_path(),
-        // 嵌入端点只在 OpenAI 形状下存在；调用方（网关层）保证协议为 Chat。
-        Action::Embeddings => "/embeddings",
+        // 直通端点的路径由种类自带；协议归属由调用方（网关层）保证。
+        Action::Passthrough(kind) => kind.default_path(),
         _ => protocol.default_path(),
     }
 }
@@ -557,7 +649,7 @@ mod tests {
             resolved(
                 &UpstreamAddress::OFFICIAL,
                 Protocol::Chat,
-                Action::Embeddings,
+                Action::Passthrough(PassKind::Embeddings),
                 "text-embedding-3-small"
             ),
             "https://api.openai.com/v1/embeddings"
@@ -570,7 +662,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolved(&addr, Protocol::Chat, Action::Embeddings, "m"),
+            resolved(
+                &addr,
+                Protocol::Chat,
+                Action::Passthrough(PassKind::Embeddings),
+                "m"
+            ),
             "https://relay.example.com/openai/v1/embeddings"
         );
     }
@@ -586,7 +683,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolved(&addr, Protocol::Chat, Action::Embeddings, "m"),
+            resolved(
+                &addr,
+                Protocol::Chat,
+                Action::Passthrough(PassKind::Embeddings),
+                "m"
+            ),
             "https://relay.example.com/v1/embeddings"
         );
         assert_eq!(

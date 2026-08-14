@@ -546,6 +546,48 @@ impl Usage {
     pub const fn is_empty(&self) -> bool {
         self.input_tokens == 0 && self.output_tokens == 0
     }
+
+    /// 把各协议的 usage 统一到**计费口径**：`input_tokens` = 总输入
+    /// （含缓存读与缓存写）。
+    ///
+    /// OpenAI 与 Gemini 的输入计数已包含缓存命中；Anthropic 的
+    /// `input_tokens` 既不含 `cache_read_input_tokens` 也不含
+    /// `cache_creation_input_tokens` —— 不归一直接记账，Claude 的缓存
+    /// 流量就从账单里消失了。只用于记账/计价，协议往返仍用原始值。
+    pub fn billing_normalized(mut self, upstream: refract_core::Protocol) -> Self {
+        if upstream == refract_core::Protocol::Messages {
+            self.input_tokens = self
+                .input_tokens
+                .saturating_add(self.cached_input_tokens)
+                .saturating_add(self.cache_write_tokens);
+        }
+        self
+    }
+
+    /// 合并两个 Usage 快照（取各项最大值）。
+    ///
+    /// 大多数上游流式响应（如 OpenAI、Anthropic）在每个 SSE 块中发送的是全量累计用量，
+    /// 取最大值可正确保留最终的完整账单数据。
+    pub fn merge_max(&mut self, other: &Usage) {
+        self.input_tokens = self.input_tokens.max(other.input_tokens);
+        self.output_tokens = self.output_tokens.max(other.output_tokens);
+        self.cached_input_tokens = self.cached_input_tokens.max(other.cached_input_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
+    }
+
+    /// 累加两个 Usage（各项求和）。
+    pub fn merge_sum(&mut self, other: &Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+    }
 }
 
 /// 统一响应。

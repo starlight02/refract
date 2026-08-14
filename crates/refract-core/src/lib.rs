@@ -11,10 +11,10 @@ pub mod error;
 pub mod protocol;
 pub mod routing;
 
-pub use address::{Action, AddressError, UpstreamAddress};
+pub use address::{Action, AddressError, PassKind, UpstreamAddress};
 pub use channel::{
-    Channel, ChannelEndpoint, ChannelError, ChannelId, ChannelKind, Credential, ModelEntry,
-    TranscodePolicy,
+    Channel, ChannelEndpoint, ChannelError, ChannelId, ChannelKind, Credential,
+    EmptyResponseRetryOverride, EmptyResponseRetryPolicy, ModelEntry, TranscodePolicy,
 };
 pub use error::{ErrorKind, GatewayError};
 pub use protocol::{AuthScheme, ParseProtocolError, Protocol, ProtocolSet};

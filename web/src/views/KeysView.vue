@@ -42,9 +42,21 @@ const createError = ref<string | null>(null)
 const plaintext = ref('')
 const copied = ref(false)
 const pendingDelete = ref<number | null>(null)
+/** 编辑目标；null 表示新建。 */
+const editingId = ref<number | null>(null)
 
 /** 表单草稿。逗号分隔文本，提交时切分。 */
-const draft = ref({ name: '', models: '', tags: '', quota: 0, expiresAt: '' })
+const draft = ref({
+  name: '',
+  models: '',
+  tags: '',
+  quota: 0,
+  budget: 0,
+  rpm: 0,
+  tpm: 0,
+  note: '',
+  expiresAt: '',
+})
 
 onMounted(() => {
   store.fetch()
@@ -52,9 +64,46 @@ onMounted(() => {
 })
 
 function openForm() {
-  draft.value = { name: '', models: '', tags: '', quota: 0, expiresAt: '' }
+  editingId.value = null
+  draft.value = {
+    name: '',
+    models: '',
+    tags: '',
+    quota: 0,
+    budget: 0,
+    rpm: 0,
+    tpm: 0,
+    note: '',
+    expiresAt: '',
+  }
   createError.value = null
   dialog.value = 'form'
+}
+
+/** 编辑已有密钥：预填全部治理属性，提交走 update 而非 create。 */
+function openEdit(key: ApiKey) {
+  editingId.value = key.id
+  draft.value = {
+    name: key.name,
+    models: key.allowed_models.join(', '),
+    tags: key.allowed_tags.join(', '),
+    quota: key.quota,
+    budget: key.budget,
+    rpm: key.rpm_limit,
+    tpm: key.tpm_limit,
+    note: key.note ?? '',
+    expiresAt: key.expires_at ? toLocalInput(key.expires_at) : '',
+  }
+  createError.value = null
+  dialog.value = 'form'
+}
+
+/** ISO 时间转 datetime-local 输入格式（本地时区，分钟精度）。 */
+function toLocalInput(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 function closeDialog() {
@@ -91,18 +140,36 @@ async function submit() {
     allowed_models: splitList(draft.value.models),
     allowed_tags: splitList(draft.value.tags),
     quota: draft.value.quota > 0 ? draft.value.quota : 0,
+    budget: draft.value.budget > 0 ? draft.value.budget : 0,
+    rpm_limit: draft.value.rpm > 0 ? draft.value.rpm : 0,
+    tpm_limit: draft.value.tpm > 0 ? draft.value.tpm : 0,
+    note: draft.value.note.trim() || null,
     // datetime-local 给的是无时区字符串，补上秒并交给后端按 UTC 解析。
     expires_at: draft.value.expiresAt ? new Date(draft.value.expiresAt).toISOString() : null,
   }
 
   try {
-    const created = await store.create(spec)
-    plaintext.value = created.plaintext
-    dialog.value = 'created'
+    if (editingId.value !== null) {
+      await store.update(editingId.value, spec)
+      closeDialog()
+    } else {
+      const created = await store.create(spec)
+      plaintext.value = created.plaintext
+      dialog.value = 'created'
+    }
   } catch (e) {
-    createError.value = e instanceof Error ? e.message : '创建失败'
+    createError.value = e instanceof Error ? e.message : '保存失败'
   } finally {
     creating.value = false
+  }
+}
+
+/** 重置已用配额（周期预算的手动形态）。 */
+async function resetUsage(id: number) {
+  try {
+    await store.resetUsage(id)
+  } catch {
+    // store.error 已记录，卡片上方会显示。
   }
 }
 
@@ -217,7 +284,17 @@ function isExpired(key: ApiKey): boolean {
               <span>创建 {{ fmtTime(key.created_at) }}</span>
               <span>最后使用 {{ fmtTime(key.last_used_at) }}</span>
               <span v-if="key.expires_at">过期 {{ fmtTime(key.expires_at) }}</span>
+              <span v-if="key.rpm_limit > 0" class="tabular">{{ key.rpm_limit }} RPM</span>
+              <span v-if="key.tpm_limit > 0" class="tabular">
+                {{ key.tpm_limit.toLocaleString() }} TPM
+              </span>
+              <span v-if="key.budget > 0" class="tabular">
+                预算 ${{ key.used_budget.toFixed(2)
+                }}<span class="text-ink-faint">/{{ key.budget.toFixed(2) }}</span>
+              </span>
             </div>
+
+            <p v-if="key.note" class="mt-1.5 text-xs text-ink-soft">{{ key.note }}</p>
 
             <div
               v-if="usageByKey.get(key.id)"
@@ -238,6 +315,9 @@ function isExpired(key: ApiKey): boolean {
                   usageByKey.get(key.id)!.output_tokens.toLocaleString()
                 }}
                 tokens
+              </span>
+              <span v-if="usageByKey.get(key.id)!.cost > 0" class="tabular text-ink-soft">
+                ${{ usageByKey.get(key.id)!.cost.toFixed(4) }}
               </span>
             </div>
 
@@ -304,6 +384,26 @@ function isExpired(key: ApiKey): boolean {
               @update:model-value="store.toggleEnabled(key.id, $event).catch(() => {})"
             />
 
+            <button
+              type="button"
+              class="glass-button-ghost px-2.5 py-1.5 text-xs"
+              @click="openEdit(key)"
+            >
+              <AppIcon name="pencil" :size="13" />
+              编辑
+            </button>
+
+            <button
+              v-if="key.used_quota > 0"
+              type="button"
+              class="glass-button-ghost px-2.5 py-1.5 text-xs"
+              title="已用配额清零"
+              @click="resetUsage(key.id)"
+            >
+              <AppIcon name="refresh" :size="13" />
+              重置用量
+            </button>
+
             <template v-if="pendingDelete === key.id">
               <button
                 type="button"
@@ -347,9 +447,15 @@ function isExpired(key: ApiKey): boolean {
         >
           <!-- 填表 -->
           <template v-if="dialog === 'form'">
-            <DialogTitle class="text-lg font-semibold">新建 API 密钥</DialogTitle>
+            <DialogTitle class="text-lg font-semibold">
+              {{ editingId !== null ? '编辑 API 密钥' : '新建 API 密钥' }}
+            </DialogTitle>
             <DialogDescription class="mt-1 text-xs text-ink-faint">
-              明文只会出现一次，创建后请立刻保存。
+              {{
+                editingId !== null
+                  ? '只改治理属性，密钥本体不变，客户端无需换钥匙。'
+                  : '明文只会出现一次，创建后请立刻保存。'
+              }}
             </DialogDescription>
 
             <form class="mt-5 flex flex-col gap-4" @submit.prevent="submit">
@@ -410,7 +516,56 @@ function isExpired(key: ApiKey): boolean {
                     class="glass-field px-3 py-2 text-sm outline-none"
                   />
                 </label>
+
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-xs font-medium text-ink-soft">
+                    预算 $<span class="font-normal text-ink-faint">，按价表累计，0 不限</span>
+                  </span>
+                  <input
+                    v-model.number="draft.budget"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    class="glass-field tabular px-3 py-2 text-sm outline-none"
+                  />
+                </label>
+
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-xs font-medium text-ink-soft">
+                    RPM<span class="font-normal text-ink-faint">，每分钟请求数，0 不限</span>
+                  </span>
+                  <input
+                    v-model.number="draft.rpm"
+                    type="number"
+                    min="0"
+                    class="glass-field tabular px-3 py-2 text-sm outline-none"
+                  />
+                </label>
+
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-xs font-medium text-ink-soft">
+                    TPM<span class="font-normal text-ink-faint">，每分钟 token 数，0 不限</span>
+                  </span>
+                  <input
+                    v-model.number="draft.tpm"
+                    type="number"
+                    min="0"
+                    class="glass-field tabular px-3 py-2 text-sm outline-none"
+                  />
+                </label>
               </div>
+
+              <label class="flex flex-col gap-1.5">
+                <span class="text-xs font-medium text-ink-soft">
+                  备注<span class="font-normal text-ink-faint">，仅自己可见</span>
+                </span>
+                <input
+                  v-model="draft.note"
+                  type="text"
+                  placeholder="给 Cursor 用的"
+                  class="glass-field px-3 py-2 text-sm outline-none"
+                />
+              </label>
 
               <p v-if="createError" class="text-sm text-danger">{{ createError }}</p>
 
@@ -420,7 +575,7 @@ function isExpired(key: ApiKey): boolean {
                   class="glass-button-primary px-4 py-2.5 text-sm font-medium disabled:opacity-50"
                   :disabled="creating || !draft.name.trim()"
                 >
-                  {{ creating ? '创建中…' : '创建' }}
+                  {{ creating ? '保存中…' : editingId !== null ? '保存' : '创建' }}
                 </button>
                 <button
                   type="button"

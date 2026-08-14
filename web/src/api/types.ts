@@ -60,6 +60,11 @@ export interface ChannelEndpoint {
   transcode: TranscodePolicy
 }
 
+export interface EmptyResponseRetryOverride {
+  window_secs: number | null
+  max_retries: number | null
+}
+
 // ── 渠道 ──
 
 export interface Channel {
@@ -78,6 +83,18 @@ export interface Channel {
   proxy?: string | null
   param_override?: Record<string, unknown> | null
   note?: string | null
+  /** 因终态错误被网关自动禁用（保留定时重测自愈资格）。 */
+  auto_disabled?: boolean
+  /** 上游余额缓存。 */
+  balance?: number | null
+  /** 余额最后刷新时间。 */
+  balance_updated_at?: string | null
+  /** 注入到上游请求的自定义头。 */
+  extra_headers?: [string, string][]
+  /** 连通性测试/定时重测使用的模型。 */
+  test_model?: string | null
+  /** HTTP 200 空回复重试覆盖；null 表示继承全局值。 */
+  empty_response_retry: EmptyResponseRetryOverride
 }
 
 // ── 渠道类型 ──
@@ -97,6 +114,11 @@ export interface ApiKey {
   allowed_tags: string[]
   quota: number
   used_quota: number
+  rpm_limit: number
+  tpm_limit: number
+  budget: number
+  used_budget: number
+  note?: string | null
   expires_at?: string | null
   last_used_at?: string | null
   created_at: string
@@ -107,6 +129,10 @@ export interface NewApiKey {
   allowed_models?: string[]
   allowed_tags?: string[]
   quota?: number
+  rpm_limit?: number
+  tpm_limit?: number
+  budget?: number
+  note?: string | null
   expires_at?: string | null
 }
 
@@ -137,15 +163,25 @@ export interface RequestLog {
   input_tokens: number
   output_tokens: number
   cached_tokens: number
+  cache_write_tokens: number
   reasoning_tokens: number
   retries: number
+  cost: number
   error_kind?: string | null
   error_message?: string | null
+  /** 请求正文快照。仅单条详情接口返回。 */
+  request_body?: string | null
+  /** 响应正文快照（流式为聚合文本）。仅单条详情接口返回。 */
+  response_body?: string | null
 }
 
 export interface LogFilter {
   model?: string
   channel_id?: number
+  api_key_id?: number
+  request_id?: string
+  since?: string
+  until?: string
   failures_only?: boolean
   limit?: number
   offset?: number
@@ -161,6 +197,7 @@ export interface StatsSummary {
   avg_duration_ms: number
   avg_ttfb_ms?: number | null
   transcoded: number
+  cost: number
 }
 
 export interface ModelStat {
@@ -168,6 +205,45 @@ export interface ModelStat {
   requests: number
   input_tokens: number
   output_tokens: number
+  cost: number
+  avg_ttfb_ms?: number | null
+  avg_duration_ms: number
+  tokens_per_sec?: number | null
+}
+
+/** 按渠道聚合的用量。 */
+export interface ChannelStat {
+  channel_id?: number | null
+  channel_name: string
+  requests: number
+  failures: number
+  input_tokens: number
+  output_tokens: number
+  cost: number
+  avg_ttfb_ms?: number | null
+  avg_duration_ms: number
+}
+
+/** 一个时间桶的聚合。 */
+export interface TimeBucket {
+  bucket: string
+  requests: number
+  failures: number
+  input_tokens: number
+  output_tokens: number
+  cost: number
+}
+
+/** 网关级全局限制。 */
+export interface GlobalLimits {
+  rpm: number
+  max_concurrency: number
+}
+
+export interface EmptyResponseRetryPolicy {
+  window_secs: number
+  max_retries: number
+  reject_nonstandard_200: boolean
 }
 
 /** 按网关密钥聚合的用量。 */
@@ -177,6 +253,7 @@ export interface KeyUsageStat {
   failures: number
   input_tokens: number
   output_tokens: number
+  cost: number
 }
 
 // ── 路由策略 ──
@@ -193,6 +270,23 @@ export interface RoutingPolicy {
 /** 自动清理请求日志的保留周期。 */
 export interface LogRetentionSetting {
   days: number
+}
+
+/** 通知与自愈设置。 */
+export interface NotifySettings {
+  webhook_url?: string | null
+  retest_minutes: number
+}
+
+/** 一条模型计价规则。pattern 为精确名或 `*` 结尾的前缀通配。 */
+export interface ModelPrice {
+  pattern: string
+  input_per_m: number
+  output_per_m: number
+  /** 缓存命中价（每百万）。缺省按输入价。 */
+  cached_input_per_m?: number | null
+  /** 缓存写入价（每百万）。缺省按输入价。 */
+  cache_write_per_m?: number | null
 }
 
 /** 熔断策略。threshold 为 0 表示关闭熔断。 */
@@ -233,4 +327,6 @@ export interface ChannelTestResult {
   message: string
   /** 上游返回的 HTTP 状态；连接层面就失败时为 null。 */
   upstream_status?: number | null
+  /** 测试请求耗时（毫秒）。 */
+  latency_ms?: number
 }

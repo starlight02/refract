@@ -2019,11 +2019,7 @@ impl ResponsesStreamEncoder {
 
     /// 取每字段最大值合并 usage，语义与 [`StreamAggregator`] 一致。
     fn merge_usage(&mut self, u: Usage) {
-        self.usage.input_tokens = self.usage.input_tokens.max(u.input_tokens);
-        self.usage.output_tokens = self.usage.output_tokens.max(u.output_tokens);
-        self.usage.cached_input_tokens = self.usage.cached_input_tokens.max(u.cached_input_tokens);
-        self.usage.cache_write_tokens = self.usage.cache_write_tokens.max(u.cache_write_tokens);
-        self.usage.reasoning_tokens = self.usage.reasoning_tokens.max(u.reasoning_tokens);
+        self.usage.merge_max(&u);
     }
 }
 

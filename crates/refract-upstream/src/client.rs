@@ -1,17 +1,19 @@
 //! 上游请求执行器。
 
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
+use futures_util::Stream;
 use refract_core::{
     Action, AuthScheme, Credential, ErrorKind, GatewayError, Protocol, UpstreamAddress,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
-use crate::sse::{ByteStream, SseStream};
+use crate::sse::{ByteStream, SseEvent, SseStream};
 
 /// Anthropic 要求的 API 版本头。
 ///
@@ -73,8 +75,11 @@ pub struct UpstreamRequest<'a> {
     pub action: Action,
     /// 请求体。`None` 表示 GET（如模型列表）。
     pub body: Option<&'a Value>,
-    /// 原始 JSON 请求体。原生协议直通时使用，与 `body` 互斥。
+    /// 原始请求体。原生协议直通时使用，与 `body` 互斥。
     pub raw_body: Option<&'a [u8]>,
+    /// `raw_body` 的 Content-Type。缺省按 JSON 发送；multipart 直通
+    /// （音频转写、图像编辑）必须原样携带客户端的 boundary。
+    pub raw_content_type: Option<&'a str>,
     /// 需要透传给上游的额外请求头。
     pub extra_headers: &'a [(String, String)],
     /// 渠道级出站代理。设置时覆盖客户端的全局代理。
@@ -101,6 +106,7 @@ impl<'a> UpstreamRequest<'a> {
             action,
             body: Some(body),
             raw_body: None,
+            raw_content_type: None,
             extra_headers: &[],
             proxy: None,
             timeout: None,
@@ -121,6 +127,7 @@ impl<'a> UpstreamRequest<'a> {
             action: Action::ListModels,
             body: None,
             raw_body: None,
+            raw_content_type: None,
             extra_headers: &[],
             proxy: None,
             timeout: None,
@@ -144,6 +151,7 @@ impl<'a> UpstreamRequest<'a> {
             action,
             body: None,
             raw_body: Some(body),
+            raw_content_type: None,
             extra_headers: &[],
             proxy: None,
             timeout: None,
@@ -160,6 +168,8 @@ pub struct UpstreamResponse {
     pub body: Value,
     /// 上游返回的响应头中我们关心的部分（限流信息等）。
     pub headers: HeaderMap,
+    /// 从收到首个响应 body 字节到 body 完整结束的时间。
+    pub first_byte_to_end: Duration,
 }
 
 /// 原生协议非流式响应，body 保持上游返回的原始字节。
@@ -171,6 +181,8 @@ pub struct UpstreamRawResponse {
     pub body: Bytes,
     /// 上游返回的响应头中我们关心的部分。
     pub headers: HeaderMap,
+    /// 从收到首个响应 body 字节到 body 完整结束的时间。
+    pub first_byte_to_end: Duration,
 }
 
 /// 原生协议流式响应，保留建立流时收到的 HTTP 元数据。
@@ -181,6 +193,37 @@ pub struct UpstreamRawStream {
     pub headers: HeaderMap,
     /// 未解析的响应字节流。
     pub stream: ByteStream,
+}
+
+/// 解析型 SSE 响应，保留严格响应校验需要的 HTTP 元数据。
+pub struct UpstreamSseStream {
+    /// HTTP 状态码。
+    pub status: u16,
+    /// 上游响应头。
+    pub headers: HeaderMap,
+    /// 解析后的 SSE 事件流。
+    pub stream: SseStream,
+}
+
+impl std::fmt::Debug for UpstreamSseStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamSseStream")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Stream for UpstreamSseStream {
+    type Item = Result<SseEvent, GatewayError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
 }
 
 impl std::fmt::Debug for UpstreamRawStream {
@@ -222,6 +265,46 @@ impl UpstreamClient {
     ///
     /// 上游的非 2xx 响应会被转成 [`GatewayError`]，并带上原始状态码与响应体
     /// —— 上层要用它们决定是否重试，也要把上游的错误信息展示给客户端。
+    /// 对任意 URL 发一个带 Bearer 鉴权的 GET 并解析 JSON。
+    ///
+    /// 面向余额探测这类**非协议标准端点**的辅助调用 —— 地址不经
+    /// `UpstreamAddress::resolve` 的形状校验，调用方自己对 URL 负责。
+    pub async fn get_json(
+        &self,
+        url: &str,
+        credential: &Credential,
+        proxy: Option<&str>,
+    ) -> Result<serde_json::Value, GatewayError> {
+        let http = self.http_for(proxy)?;
+        let response = http
+            .get(url)
+            .headers(auth_headers(Protocol::Chat, credential)?)
+            .timeout(self.config.timeout)
+            .send()
+            .await
+            .map_err(|e| classify_transport_error(&e, "upstream request failed"))?;
+
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| classify_transport_error(&e, "failed to read upstream response"))?;
+        if !(200..300).contains(&status) {
+            return Err(GatewayError::new(
+                ErrorKind::UpstreamError,
+                format!("upstream returned {status}"),
+            )
+            .with_upstream(status, String::from_utf8_lossy(&body).as_ref()));
+        }
+        serde_json::from_slice(&body).map_err(|e| {
+            GatewayError::new(
+                ErrorKind::UpstreamError,
+                format!("upstream returned malformed JSON: {e}"),
+            )
+        })
+    }
+
+    /// 发送请求并把响应体解析为 JSON。
     pub async fn send(&self, req: UpstreamRequest<'_>) -> Result<UpstreamResponse, GatewayError> {
         let raw = self.send_raw(req).await?;
 
@@ -242,6 +325,7 @@ impl UpstreamClient {
             status: raw.status,
             body,
             headers: raw.headers,
+            first_byte_to_end: raw.first_byte_to_end,
         })
     }
 
@@ -250,13 +334,23 @@ impl UpstreamClient {
         &self,
         req: UpstreamRequest<'_>,
     ) -> Result<UpstreamRawResponse, GatewayError> {
-        let response = self.dispatch(&req).await?;
+        let mut response = self.dispatch(&req).await?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        let body = response
-            .bytes()
+        let mut body = BytesMut::new();
+        let mut first_byte_at = None;
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| classify_transport_error(&e, "failed to read upstream response body"))?;
+            .map_err(|e| classify_transport_error(&e, "failed to read upstream response body"))?
+        {
+            if first_byte_at.is_none() && !chunk.is_empty() {
+                first_byte_at = Some(std::time::Instant::now());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let first_byte_to_end = first_byte_at.map_or(Duration::ZERO, |at| at.elapsed());
+        let body = body.freeze();
 
         if !(200..300).contains(&status) {
             return Err(attach_retry_after(
@@ -269,6 +363,7 @@ impl UpstreamClient {
             status,
             body,
             headers,
+            first_byte_to_end,
         })
     }
 
@@ -277,7 +372,10 @@ impl UpstreamClient {
     /// 错误响应在这里就地判定：上游返回 4xx/5xx 时 body 是一个完整的 JSON
     /// 错误对象而非 SSE 流，此时读完它并转成 `GatewayError`，而不是把错误
     /// 文本当成 SSE 帧喂给下游解析器。
-    pub async fn stream(&self, req: UpstreamRequest<'_>) -> Result<SseStream, GatewayError> {
+    pub async fn stream(
+        &self,
+        req: UpstreamRequest<'_>,
+    ) -> Result<UpstreamSseStream, GatewayError> {
         let response = self.dispatch(&req).await?;
         let status = response.status().as_u16();
 
@@ -290,10 +388,14 @@ impl UpstreamClient {
             ));
         }
 
-        Ok(crate::sse::sse_stream(
-            response.bytes_stream(),
-            self.config.stream_idle_timeout,
-        ))
+        let headers = response.headers().clone();
+        let stream =
+            crate::sse::sse_stream(response.bytes_stream(), self.config.stream_idle_timeout);
+        Ok(UpstreamSseStream {
+            status,
+            headers,
+            stream,
+        })
     }
 
     /// 发送一次流式请求，返回原始字节流（不做 SSE 解析）。
@@ -373,7 +475,10 @@ impl UpstreamClient {
             builder = builder.json(body);
         } else if let Some(body) = req.raw_body {
             builder = builder
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    req.raw_content_type.unwrap_or("application/json"),
+                )
                 .body(body.to_owned());
         }
 

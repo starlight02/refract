@@ -253,8 +253,84 @@ impl ChannelEndpoint {
     }
 }
 
+/// 上游 HTTP 200 响应处理策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmptyResponseRetryPolicy {
+    /// 从首字节到响应完成的最长判定窗口（秒）。0 = 关闭。
+    pub window_secs: u32,
+    /// 同一渠道最多额外重试次数。0 = 关闭。
+    pub max_retries: u32,
+    /// 是否把不符合所配置协议的 HTTP 200 响应转换为明确的 500 错误。
+    pub reject_nonstandard_200: bool,
+}
+
+impl Default for EmptyResponseRetryPolicy {
+    fn default() -> Self {
+        Self {
+            window_secs: 3,
+            max_retries: 5,
+            reject_nonstandard_200: false,
+        }
+    }
+}
+
+impl EmptyResponseRetryPolicy {
+    /// 防止误配置制造超长缓冲或失控的上游请求循环。
+    pub fn validate(self) -> Result<(), &'static str> {
+        if self.window_secs > 3600 {
+            return Err("empty response retry window must be at most 3600 seconds");
+        }
+        if self.max_retries > 100 {
+            return Err("empty response retries must be at most 100");
+        }
+        Ok(())
+    }
+
+    /// 两个值任一为 0 都表示关闭。
+    pub const fn enabled(self) -> bool {
+        self.window_secs > 0 && self.max_retries > 0
+    }
+}
+
+/// 渠道对全局空回复重试策略的逐项覆盖。`None` 表示继承全局值。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmptyResponseRetryOverride {
+    /// 判定窗口覆盖值。
+    pub window_secs: Option<u32>,
+    /// 最大重试次数覆盖值。
+    pub max_retries: Option<u32>,
+}
+
+impl EmptyResponseRetryOverride {
+    /// 是否完全继承全局设置。
+    pub const fn is_inherited(&self) -> bool {
+        self.window_secs.is_none() && self.max_retries.is_none()
+    }
+
+    /// 把渠道覆盖应用到全局策略。
+    pub fn resolve(self, global: EmptyResponseRetryPolicy) -> EmptyResponseRetryPolicy {
+        EmptyResponseRetryPolicy {
+            window_secs: self.window_secs.unwrap_or(global.window_secs),
+            max_retries: self.max_retries.unwrap_or(global.max_retries),
+            reject_nonstandard_200: global.reject_nonstandard_200,
+        }
+    }
+
+    /// 校验已填写的覆盖值。
+    pub fn validate(self) -> Result<(), &'static str> {
+        self.resolve(EmptyResponseRetryPolicy {
+            window_secs: 0,
+            max_retries: 0,
+            reject_nonstandard_200: false,
+        })
+        .validate()
+    }
+}
+
 /// 上游渠道。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Channel {
     /// 主键。新建时为 0。
     #[serde(default)]
@@ -304,6 +380,29 @@ pub struct Channel {
     /// 备注。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// 是否因终态错误（凭据失效等）被网关自动禁用。
+    ///
+    /// 与手动禁用分开：自动禁用的渠道参与定时重测自愈，手动禁用的不碰。
+    /// 手动重新启用会清掉这个标记。
+    #[serde(default)]
+    pub auto_disabled: bool,
+    /// 上游余额缓存（美元或中转站自定币种）。观测数据，非配置 ——
+    /// 由余额刷新单独更新，渠道编辑不触碰。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<f64>,
+    /// 余额最后刷新时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 注入到上游请求的自定义头。`param_override` 只管 body ——
+    /// 要求自有鉴权头或机房路由头的中转站靠这个。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<(String, String)>,
+    /// 连通性测试与定时重测使用的模型；空则用被测端点的第一个模型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_model: Option<String>,
+    /// HTTP 200 空回复重试覆盖。两项都为空时完全继承全局设置。
+    #[serde(default)]
+    pub empty_response_retry: EmptyResponseRetryOverride,
 }
 
 /// 渠道校验失败。
@@ -339,6 +438,15 @@ pub enum ChannelError {
     /// 与其让用户困惑「为什么不生效」，不如在保存时就拒绝。
     #[error("param_override must be a JSON object, got {0}")]
     ParamOverrideNotObject(&'static str),
+    /// 自定义头名不是合法的 HTTP header 名。
+    #[error("extra header name `{0}` is not a valid HTTP header name")]
+    InvalidExtraHeader(String),
+    /// 自定义头试图覆盖网关掌管的鉴权/传输语义头。
+    #[error("extra header `{0}` is managed by the gateway and cannot be overridden")]
+    ForbiddenExtraHeader(String),
+    /// 渠道空回复重试覆盖超出安全范围。
+    #[error("{0}")]
+    InvalidEmptyResponseRetry(&'static str),
 }
 
 impl Channel {
@@ -399,6 +507,25 @@ impl Channel {
             return Err(ChannelError::ParamOverrideNotObject(kind));
         }
 
+        for (name, _) in &self.extra_headers {
+            let normalized = name.trim().to_ascii_lowercase();
+            if normalized.is_empty() || !normalized.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(ChannelError::InvalidExtraHeader(name.clone()));
+            }
+            // 鉴权与传输语义头由网关掌管 —— 允许覆盖等于允许配置出一个
+            // 无法排障的「幽灵鉴权」。
+            if matches!(
+                normalized.as_str(),
+                "authorization" | "host" | "content-length" | "content-type" | "x-api-key"
+            ) {
+                return Err(ChannelError::ForbiddenExtraHeader(normalized));
+            }
+        }
+
+        self.empty_response_retry
+            .validate()
+            .map_err(ChannelError::InvalidEmptyResponseRetry)?;
+
         Ok(())
     }
 
@@ -447,6 +574,24 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    #[test]
+    fn empty_response_retry_defaults_and_channel_overrides_resolve() {
+        let global = EmptyResponseRetryPolicy::default();
+        assert_eq!(global.window_secs, 3);
+        assert_eq!(global.max_retries, 5);
+
+        let inherited = EmptyResponseRetryOverride::default().resolve(global);
+        assert_eq!(inherited, global);
+
+        let partial = EmptyResponseRetryOverride {
+            window_secs: Some(8),
+            max_retries: None,
+        }
+        .resolve(global);
+        assert_eq!(partial.window_secs, 8);
+        assert_eq!(partial.max_retries, 5);
+    }
+
     fn single(protocol: Protocol) -> Channel {
         Channel {
             id: 1,
@@ -467,6 +612,12 @@ mod tests {
             proxy: None,
             param_override: None,
             note: None,
+            auto_disabled: false,
+            balance: None,
+            balance_updated_at: None,
+            extra_headers: Vec::new(),
+            test_model: None,
+            empty_response_retry: EmptyResponseRetryOverride::default(),
         }
     }
 

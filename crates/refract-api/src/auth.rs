@@ -164,6 +164,7 @@ fn extract_token(
     x_api_key: Option<String>,
     x_goog_api_key: Option<String>,
     query_key: Option<String>,
+    websocket_protocols: Option<String>,
 ) -> Option<String> {
     if let Some(raw) = authorization {
         let trimmed = raw.trim();
@@ -189,6 +190,15 @@ fn extract_token(
             return Some(token.to_owned());
         }
     }
+    if let Some(protocols) = websocket_protocols {
+        for protocol in protocols.split(',').map(str::trim) {
+            if let Some(token) = protocol.strip_prefix("openai-insecure-api-key.")
+                && !token.is_empty()
+            {
+                return Some(token.to_owned());
+            }
+        }
+    }
     None
 }
 
@@ -209,10 +219,11 @@ pub fn authenticate(
         .and(warp::header::optional::<String>("x-api-key"))
         .and(warp::header::optional::<String>("x-goog-api-key"))
         .and(warp::query::<KeyQuery>())
-        .and_then(move |auth, xapi, xgoog, q: KeyQuery| {
+        .and(warp::header::optional::<String>("sec-websocket-protocol"))
+        .and_then(move |auth, xapi, xgoog, q: KeyQuery, protocols| {
             let authenticator = authenticator.clone();
             async move {
-                let token = extract_token(auth, xapi, xgoog, q.key);
+                let token = extract_token(auth, xapi, xgoog, q.key, protocols);
                 authenticator
                     .authenticate(token.as_deref())
                     .await
@@ -243,7 +254,7 @@ pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Re
                     return Ok(());
                 };
 
-                let token = extract_token(auth, x_admin, None, None).ok_or_else(|| {
+                let token = extract_token(auth, x_admin, None, None, None).ok_or_else(|| {
                     warp::reject::custom(ApiError(GatewayError::unauthenticated(
                         "missing admin token",
                     )))
@@ -306,7 +317,7 @@ mod tests {
     fn bearer_prefix_is_stripped_case_insensitively() {
         for header in ["Bearer sk-1", "bearer sk-1", "BEARER sk-1"] {
             assert_eq!(
-                extract_token(Some(header.into()), None, None, None).as_deref(),
+                extract_token(Some(header.into()), None, None, None, None).as_deref(),
                 Some("sk-1")
             );
         }
@@ -316,7 +327,7 @@ mod tests {
     fn bare_token_without_bearer_is_accepted() {
         // 简易客户端常常直接把 key 放进 Authorization。
         assert_eq!(
-            extract_token(Some("sk-raw".into()), None, None, None).as_deref(),
+            extract_token(Some("sk-raw".into()), None, None, None, None).as_deref(),
             Some("sk-raw")
         );
     }
@@ -324,7 +335,7 @@ mod tests {
     #[test]
     fn anthropic_header_is_recognized() {
         assert_eq!(
-            extract_token(None, Some("sk-ant".into()), None, None).as_deref(),
+            extract_token(None, Some("sk-ant".into()), None, None, None).as_deref(),
             Some("sk-ant")
         );
     }
@@ -332,7 +343,7 @@ mod tests {
     #[test]
     fn google_header_is_recognized() {
         assert_eq!(
-            extract_token(None, None, Some("AIza".into()), None).as_deref(),
+            extract_token(None, None, Some("AIza".into()), None, None).as_deref(),
             Some("AIza")
         );
     }
@@ -341,7 +352,7 @@ mod tests {
     fn gemini_query_key_is_recognized() {
         // Google 的 SDK 会把 key 放 query string。
         assert_eq!(
-            extract_token(None, None, None, Some("AIza-q".into())).as_deref(),
+            extract_token(None, None, None, Some("AIza-q".into()), None).as_deref(),
             Some("AIza-q")
         );
     }
@@ -353,7 +364,8 @@ mod tests {
                 Some("Bearer primary".into()),
                 Some("secondary".into()),
                 Some("tertiary".into()),
-                Some("quaternary".into())
+                Some("quaternary".into()),
+                Some("realtime, openai-insecure-api-key.fifth".into())
             )
             .as_deref(),
             Some("primary")
@@ -362,10 +374,25 @@ mod tests {
 
     #[test]
     fn empty_and_whitespace_tokens_are_rejected() {
-        assert!(extract_token(Some("Bearer    ".into()), None, None, None).is_none());
-        assert!(extract_token(Some("   ".into()), None, None, None).is_none());
-        assert!(extract_token(None, Some("  ".into()), None, None).is_none());
-        assert!(extract_token(None, None, None, None).is_none());
+        assert!(extract_token(Some("Bearer    ".into()), None, None, None, None).is_none());
+        assert!(extract_token(Some("   ".into()), None, None, None, None).is_none());
+        assert!(extract_token(None, Some("  ".into()), None, None, None).is_none());
+        assert!(extract_token(None, None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn realtime_websocket_subprotocol_key_is_recognized() {
+        assert_eq!(
+            extract_token(
+                None,
+                None,
+                None,
+                None,
+                Some("realtime, openai-insecure-api-key.sk-refract-browser".into()),
+            )
+            .as_deref(),
+            Some("sk-refract-browser")
+        );
     }
 
     #[test]
@@ -397,6 +424,11 @@ mod tests {
             allowed_tags: vec!["private".into()],
             quota: 0,
             used_quota: 0,
+            rpm_limit: 0,
+            tpm_limit: 0,
+            budget: 0.0,
+            used_budget: 0.0,
+            note: None,
             expires_at: None,
             last_used_at: None,
             created_at: now,
@@ -434,6 +466,10 @@ mod tests {
                     allowed_models: vec!["gpt-4o".into()],
                     allowed_tags: vec!["private".into()],
                     quota: 10,
+                    rpm_limit: 0,
+                    tpm_limit: 0,
+                    budget: 0.0,
+                    note: None,
                     expires_at: None,
                 },
             )

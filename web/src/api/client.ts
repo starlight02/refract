@@ -11,6 +11,11 @@
 
 import type {
   ApiKey,
+  ChannelStat,
+  EmptyResponseRetryPolicy,
+  GlobalLimits,
+  NotifySettings,
+  TimeBucket,
   BreakerPolicy,
   Channel,
   ChannelTestResult,
@@ -19,6 +24,7 @@ import type {
   KeyUsageStat,
   LogFilter,
   LogRetentionSetting,
+  ModelPrice,
   ModelStat,
   NewApiKey,
   ProbeResult,
@@ -71,6 +77,20 @@ const TOKEN_KEY = 'refract.admin_token'
  */
 export const AUTH_REQUIRED_EVENT = 'refract:auth-required'
 
+/**
+ * 后端不可达时派发的事件名（dev 下 cargo 编译窗口、生产下服务重启）。
+ * App.vue 据此显示「后端启动中」横幅并轮询 `/health/live` 直到恢复。
+ */
+export const BACKEND_DOWN_EVENT = 'refract:backend-down'
+
+/** GET 在后端不可达时的自动重试间隔与上限（约等 60 秒的编译窗口）。 */
+const UNAVAILABLE_RETRY_MS = 1_500
+const UNAVAILABLE_RETRY_MAX = 40
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 /** 读取已保存的管理令牌。 */
 export function getAdminToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
@@ -99,47 +119,74 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   const token = getAdminToken()
   if (token) headers['x-admin-token'] = token
 
-  const response = await fetch(path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-
-  if (!response.ok) {
-    // 管理 API 的 401/403 值得一个全局恢复入口，而不只是让当前页面报错。
-    // 先派发再抛异常：监听者（App.vue）打开令牌弹窗，调用方照常拿到错误。
-    if (response.status === 401 || response.status === 403) {
-      window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
-    }
-
-    // 后端总是回 ErrorEnvelope，但网络层故障（502 网关页、连接重置）
-    // 可能给出 HTML。解析失败时退回状态码文本，不能让 UI 崩在这里。
-    let envelope: ErrorEnvelope
+  // 后端不可达（dev 的 cargo 编译窗口、生产的服务重启）时，GET 自动重试
+  // 到后端恢复为止 —— 打开着的页面不需要手动刷新。只重试 GET：这类失败
+  // 意味着请求从未送达（连接被拒），但写操作仍交给用户显式重试更稳妥。
+  const retriable = method === 'GET'
+  for (let attempt = 0; ; attempt += 1) {
+    let response: Response
     try {
-      envelope = (await response.json()) as ErrorEnvelope
-    } catch {
-      envelope = {
-        code: 'network_error',
-        message: `${response.status} ${response.statusText}`,
+      response = await fetch(path, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      })
+    } catch (e) {
+      // fetch 本身抛错 = 连 vite/网关都没够到。与 503 同等对待。
+      window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
+      if (retriable && attempt < UNAVAILABLE_RETRY_MAX) {
+        await sleep(UNAVAILABLE_RETRY_MS)
+        continue
       }
+      throw new ApiError(0, 'backend_unavailable', '后端不可达，请稍后重试', String(e))
     }
-    throw new ApiError(
-      response.status,
-      envelope.code ?? 'unknown',
-      envelope.message ?? 'request failed',
-      envelope.detail,
-    )
+
+    if (!response.ok) {
+      // 管理 API 的 401/403 值得一个全局恢复入口，而不只是让当前页面报错。
+      // 先派发再抛异常：监听者（App.vue）打开令牌弹窗，调用方照常拿到错误。
+      if (response.status === 401 || response.status === 403) {
+        window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+      }
+
+      // 后端总是回 ErrorEnvelope，但网络层故障（502 网关页、连接重置）
+      // 可能给出 HTML。解析失败时退回状态码文本，不能让 UI 崩在这里。
+      let envelope: ErrorEnvelope
+      try {
+        envelope = (await response.json()) as ErrorEnvelope
+      } catch {
+        envelope = {
+          code: 'network_error',
+          message: `${response.status} ${response.statusText}`,
+        }
+      }
+
+      // dev 代理在后端编译期间回结构化 503（见 vite.config.ts）。
+      if (response.status === 503 && envelope.code === 'backend_unavailable') {
+        window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
+        if (retriable && attempt < UNAVAILABLE_RETRY_MAX) {
+          await sleep(UNAVAILABLE_RETRY_MS)
+          continue
+        }
+      }
+
+      throw new ApiError(
+        response.status,
+        envelope.code ?? 'unknown',
+        envelope.message ?? 'request failed',
+        envelope.detail,
+      )
+    }
+
+    if (response.status === 204) return undefined as T
+    const text = await response.text()
+    if (!text) return undefined as T
+
+    const parsed = JSON.parse(text) as Envelope<T> | T
+    // 管理 API 一律带 `data`；网关 API（/v1/models）不带。两者都要支持。
+    return parsed && typeof parsed === 'object' && 'data' in parsed
+      ? (parsed as Envelope<T>).data
+      : (parsed as T)
   }
-
-  if (response.status === 204) return undefined as T
-  const text = await response.text()
-  if (!text) return undefined as T
-
-  const parsed = JSON.parse(text) as Envelope<T> | T
-  // 管理 API 一律带 `data`；网关 API（/v1/models）不带。两者都要支持。
-  return parsed && typeof parsed === 'object' && 'data' in parsed
-    ? (parsed as Envelope<T>).data
-    : (parsed as T)
 }
 
 /** 仅把 URL 查询串支持的标量写进去；拒绝对象被悄悄编码成 `[object Object]`。 */
@@ -179,6 +226,9 @@ export const channels = {
   /** 批量启用/禁用/删除。 */
   bulk: (ids: number[], action: 'enable' | 'disable' | 'delete') =>
     request<{ affected: number }>('POST', '/api/channels/bulk', { ids, action }),
+  /** 查询上游余额（OpenAI 兼容 billing 端点）并缓存。 */
+  balance: (id: number) =>
+    request<{ id: number; balance: number }>('POST', `/api/channels/${id}/balance`),
 }
 
 /** 网关自身的 API 密钥。 */
@@ -186,6 +236,11 @@ export const keys = {
   list: () => request<ApiKey[]>('GET', '/api/keys'),
   /** 返回值里的 `plaintext` 只在创建时出现一次，之后无法再取回。 */
   create: (spec: NewApiKey) => request<CreatedApiKey>('POST', '/api/keys', spec),
+  /** 编辑治理属性；密钥本体不变，客户端无需换钥匙。 */
+  update: (id: number, spec: NewApiKey) => request<ApiKey>('PUT', `/api/keys/${id}`, spec),
+  /** 已用配额清零。 */
+  resetUsage: (id: number) =>
+    request<{ id: number; used_quota: number }>('POST', `/api/keys/${id}/reset-usage`),
   remove: (id: number) => request<{ deleted: number }>('DELETE', `/api/keys/${id}`),
   setEnabled: (id: number, enabled: boolean) =>
     request<{ id: number; enabled: boolean }>('POST', `/api/keys/${id}/enabled`, { enabled }),
@@ -194,10 +249,18 @@ export const keys = {
 /** 请求日志与统计。 */
 export const logs = {
   query: (filter: LogFilter = {}) => request<RequestLog[]>('GET', `/api/logs${query(filter)}`),
+  /** 单条完整记录，含请求/响应正文快照。 */
+  get: (id: number) => request<RequestLog>('GET', `/api/logs/${id}`),
   prune: (days: number) => request<{ removed: number }>('POST', '/api/logs/prune', { days }),
   summary: (hours = 24) => request<StatsSummary>('GET', `/api/stats${query({ hours })}`),
   byModel: (hours = 24) => request<ModelStat[]>('GET', `/api/stats/models${query({ hours })}`),
   byKey: (hours = 24) => request<KeyUsageStat[]>('GET', `/api/stats/keys${query({ hours })}`),
+  byChannel: (hours = 24) =>
+    request<ChannelStat[]>('GET', `/api/stats/channels${query({ hours })}`),
+  timeseries: (hours = 24, bucket: 'hour' | 'day' = 'hour') =>
+    request<TimeBucket[]>('GET', `/api/stats/timeseries${query({ hours, bucket })}`),
+  /** 按当前筛选导出 NDJSON 的地址（供 <a download> 使用）。 */
+  exportUrl: (filter: LogFilter = {}) => `/api/logs/export${query(filter)}`,
 }
 
 /** 运行时设置。 */
@@ -211,12 +274,39 @@ export const settings = {
   breakerPolicy: () => request<BreakerPolicy>('GET', '/api/settings/breaker'),
   setBreakerPolicy: (policy: BreakerPolicy) =>
     request<BreakerPolicy>('PUT', '/api/settings/breaker', policy),
+  pricing: () => request<ModelPrice[]>('GET', '/api/settings/pricing'),
+  setPricing: (prices: ModelPrice[]) =>
+    request<ModelPrice[]>('PUT', '/api/settings/pricing', prices),
+  logBodies: () => request<{ enabled: boolean }>('GET', '/api/settings/log-bodies'),
+  setLogBodies: (enabled: boolean) =>
+    request<{ enabled: boolean }>('PUT', '/api/settings/log-bodies', { enabled }),
+  globalLimits: () => request<GlobalLimits>('GET', '/api/settings/limits'),
+  setGlobalLimits: (limits: GlobalLimits) =>
+    request<GlobalLimits>('PUT', '/api/settings/limits', limits),
+  emptyResponseRetry: () =>
+    request<EmptyResponseRetryPolicy>('GET', '/api/settings/empty-response-retry'),
+  setEmptyResponseRetry: (policy: EmptyResponseRetryPolicy) =>
+    request<EmptyResponseRetryPolicy>('PUT', '/api/settings/empty-response-retry', policy),
+  notify: () => request<NotifySettings>('GET', '/api/settings/notify'),
+  setNotify: (settings: NotifySettings) =>
+    request<NotifySettings>('PUT', '/api/settings/notify', settings),
+  testNotify: () => request<{ sent: boolean }>('POST', '/api/settings/notify/test'),
   /** 传 null 关闭管理鉴权。设置后无法读回，只能覆盖或清除。 */
   setAdminToken: (token: string | null) =>
     request<{ configured: boolean }>('PUT', '/api/settings/admin-token', { token }),
 }
 
 /** 渠道健康度与熔断。 */
+export const data = {
+  stats: () =>
+    request<{ db_bytes: number; log_rows: number; oldest_log_at: string | null }>(
+      'GET',
+      '/api/data/stats',
+    ),
+  /** 在线备份的下载地址（供 <a download> 使用）。 */
+  backupUrl: () => '/api/data/backup',
+}
+
 export const health = {
   channels: () => request<EndpointHealth[]>('GET', '/api/health/channels'),
   reset: (channelId: number, protocol: Protocol) =>
@@ -229,6 +319,25 @@ export const health = {
 /** 派生的可用模型清单。 */
 export const models = {
   list: () => request<string[]>('GET', '/api/models'),
+}
+
+/**
+ * 模型调试台。
+ *
+ * 不走统一的 `request()`：流式响应需要调用方直接消费 ReadableStream，
+ * JSON 拆包在这里没有意义。鉴权头照常携带。
+ */
+export const playground = {
+  chat: (body: Record<string, unknown>): Promise<Response> => {
+    const headers: Record<string, string> = { 'content-type': 'application/json' }
+    const token = getAdminToken()
+    if (token) headers['x-admin-token'] = token
+    return fetch('/api/playground/chat', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    })
+  },
 }
 
 /** 导入结果统计。 */

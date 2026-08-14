@@ -234,6 +234,34 @@ enum StreamEvent {
 
 所以编码器持有 `EncoderState`，负责补齐目标协议要求的仪式性事件。
 
+### 4.4 直通端点（Passthrough）
+
+嵌入、图像、音频、审核、重排序与 token 计数没有跨协议转换语义 —— Anthropic
+没有图像 API，Gemini 的嵌入形状与 OpenAI 完全不同。为它们发明「统一 IR」
+只会制造有损转换，所以这类端点走独立的直通管线：
+
+- `Action::Passthrough(PassKind)` 声明端点种类；每个 `PassKind` 自带协议归属
+  （`count_tokens` 挂 Messages、`:countTokens` 挂 Gemini、其余挂 Chat）、
+  默认路径与地址校验后缀。
+- 路由复用同一个 planner，但候选被过滤为**入口协议的原生端点** —— 直通
+  永远不转码。
+- 请求与响应字节原样往返。唯一的改写是模型别名与（JSON 体的）参数覆盖；
+  multipart 表单（音频转写、图像编辑）按 RFC 7578 的结构只替换 `model`
+  字段的值，boundary 与文件字节原封不动。
+- 重试、熔断、健康记录、密钥治理（白名单/配额/限速）与日志和对话流量
+  完全一致；`model` 字段是路由依据，因此对直通请求是必填的。
+
+### 4.5 Realtime WebSocket
+
+`GET /v1/realtime?model=...` 是独立的原生 Chat 桥接路径。HTTP 升级前完成网关
+鉴权、模型白名单、RPM/全局并发准入、渠道权限、路由和熔断排序；升级后再用
+渠道凭据连接上游，并把文本、二进制、ping/pong 与 close 帧双向转发。并发
+permit 持有到整个会话结束，连接时长和异常状态写入统一请求日志。
+
+Realtime 事件是有状态会话协议，不进入对话 IR，也不做跨协议转换。地址由同一
+Chat 端点的 `{base}{prefix}` 推导为 `/realtime`；完整地址只接受明确的
+`/chat/completions` 或 `/realtime` 后缀，模型别名通过 URL query builder 编码。
+
 ## 5. Crate 划分
 
 ```

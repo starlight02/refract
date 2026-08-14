@@ -455,6 +455,12 @@ mod tests {
             proxy: None,
             param_override: None,
             note: None,
+            auto_disabled: false,
+            balance: None,
+            balance_updated_at: None,
+            extra_headers: Vec::new(),
+            test_model: None,
+            empty_response_retry: Default::default(),
         }
     }
 

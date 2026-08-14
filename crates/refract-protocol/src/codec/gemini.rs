@@ -1362,12 +1362,9 @@ impl GeminiStreamEncoder {
     /// Anthropic 分两次给（Start 给 input、message_delta 给累积 output），
     /// OpenAI 最后一次性给全量，取 max 对两种语义都正确。
     fn merge_usage(&mut self, incoming: Usage) {
-        let merged = self.pending_usage.get_or_insert_with(Usage::default);
-        merged.input_tokens = merged.input_tokens.max(incoming.input_tokens);
-        merged.output_tokens = merged.output_tokens.max(incoming.output_tokens);
-        merged.cached_input_tokens = merged.cached_input_tokens.max(incoming.cached_input_tokens);
-        merged.cache_write_tokens = merged.cache_write_tokens.max(incoming.cache_write_tokens);
-        merged.reasoning_tokens = merged.reasoning_tokens.max(incoming.reasoning_tokens);
+        self.pending_usage
+            .get_or_insert_with(Usage::default)
+            .merge_max(&incoming);
     }
 
     /// 取出某个下标上的工具调用缓冲。

@@ -67,6 +67,38 @@ function ms(v: number | null | undefined): string {
 }
 
 /** 按模型统计里最大的请求数，用来画占比条。 */
+/** 趋势折线图的几何参数。纯 SVG 手绘 —— 一张折线图不值得引图表库。 */
+const CHART_W = 640
+const CHART_H = 150
+const CHART_PAD = 8
+
+interface ChartLine {
+  points: string
+  tone: string
+}
+
+const chart = computed(() => {
+  const buckets = store.timeseries
+  if (buckets.length < 2) return null
+  const maxRequests = Math.max(...buckets.map((b) => b.requests), 1)
+  const step = (CHART_W - CHART_PAD * 2) / (buckets.length - 1)
+  const y = (value: number) =>
+    CHART_H - CHART_PAD - (value / maxRequests) * (CHART_H - CHART_PAD * 2)
+  const line = (pick: (b: (typeof buckets)[number]) => number): string =>
+    buckets.map((b, i) => `${(CHART_PAD + i * step).toFixed(1)},${y(pick(b)).toFixed(1)}`).join(' ')
+  const lines: ChartLine[] = [
+    { points: line((b) => b.requests), tone: 'var(--color-accent)' },
+    { points: line((b) => b.failures), tone: 'var(--color-danger)' },
+  ]
+  return {
+    lines,
+    maxRequests,
+    first: buckets[0]!.bucket,
+    last: buckets[buckets.length - 1]!.bucket,
+    totalCost: buckets.reduce((acc, b) => acc + b.cost, 0),
+  }
+})
+
 const maxModelRequests = computed(() =>
   store.byModel.reduce((max, m) => Math.max(max, m.requests), 0),
 )
@@ -147,9 +179,51 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
         <div class="mt-1 text-xs text-ink-faint">
           入 <span class="tabular">{{ compact(store.summary?.input_tokens ?? 0) }}</span> · 出
           <span class="tabular">{{ compact(store.summary?.output_tokens ?? 0) }}</span>
+          <template v-if="(store.summary?.cost ?? 0) > 0">
+            · <span class="tabular">${{ (store.summary?.cost ?? 0).toFixed(4) }}</span>
+          </template>
         </div>
       </div>
     </div>
+
+    <!-- 趋势 -->
+    <section v-if="chart" class="glass glass-specular mb-6 p-5">
+      <div class="mb-3 flex items-baseline justify-between">
+        <h2 class="text-sm font-semibold text-ink-soft uppercase">趋势</h2>
+        <span class="text-xs text-ink-faint">
+          <span class="mr-3 inline-flex items-center gap-1.5">
+            <span class="inline-block h-0.5 w-4 rounded bg-accent"></span> 请求
+          </span>
+          <span class="inline-flex items-center gap-1.5">
+            <span class="inline-block h-0.5 w-4 rounded bg-danger"></span> 失败
+          </span>
+        </span>
+      </div>
+      <svg
+        :viewBox="`0 0 640 150`"
+        class="h-36 w-full"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label="请求量与失败数趋势"
+      >
+        <polyline
+          v-for="(line, i) in chart.lines"
+          :key="i"
+          :points="line.points"
+          fill="none"
+          :stroke="line.tone"
+          stroke-width="2"
+          stroke-linejoin="round"
+          stroke-linecap="round"
+          vector-effect="non-scaling-stroke"
+        />
+      </svg>
+      <div class="mt-1.5 flex justify-between text-[0.65rem] text-ink-faint">
+        <span class="tabular">{{ chart.first }}</span>
+        <span class="tabular">峰值 {{ chart.maxRequests.toLocaleString() }} 次/桶</span>
+        <span class="tabular">{{ chart.last }}</span>
+      </div>
+    </section>
 
     <!-- 按模型 -->
     <section class="glass glass-specular p-5">
@@ -177,6 +251,10 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
               <th class="pb-2 text-right font-medium">请求</th>
               <th class="pb-2 text-right font-medium">输入</th>
               <th class="pb-2 text-right font-medium">输出</th>
+              <th class="pb-2 text-right font-medium">花费</th>
+              <th class="pb-2 text-right font-medium">首字</th>
+              <th class="pb-2 text-right font-medium">总耗时</th>
+              <th class="pb-2 text-right font-medium">t/s</th>
               <th class="w-32 pb-2 pl-4 font-medium">占比</th>
             </tr>
           </thead>
@@ -191,6 +269,14 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
               <td class="tabular py-2.5 text-right text-ink-soft">{{ compact(m.input_tokens) }}</td>
               <td class="tabular py-2.5 text-right text-ink-soft">
                 {{ compact(m.output_tokens) }}
+              </td>
+              <td class="tabular py-2.5 text-right text-ink-soft">
+                {{ m.cost > 0 ? `$${m.cost.toFixed(4)}` : '—' }}
+              </td>
+              <td class="tabular py-2.5 text-right text-ink-soft">{{ ms(m.avg_ttfb_ms) }}</td>
+              <td class="tabular py-2.5 text-right text-ink-soft">{{ ms(m.avg_duration_ms) }}</td>
+              <td class="tabular py-2.5 text-right text-ink-soft">
+                {{ m.tokens_per_sec != null ? m.tokens_per_sec.toFixed(1) : '—' }}
               </td>
               <td class="py-2.5 pl-4">
                 <div class="h-1.5 overflow-hidden rounded-full bg-ink/8">
@@ -209,6 +295,50 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
                   />
                 </div>
               </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 按渠道 -->
+    <section v-if="store.byChannel.length > 0" class="glass glass-specular mt-6 p-5">
+      <h2 class="mb-4 text-sm font-semibold text-ink-soft uppercase">按渠道</h2>
+      <div class="overflow-x-auto" tabindex="0" aria-label="按渠道统计表">
+        <table class="w-full min-w-[560px] text-sm">
+          <thead>
+            <tr class="border-b border-ink/10 text-left text-xs text-ink-faint">
+              <th class="pb-2 font-medium">渠道</th>
+              <th class="pb-2 text-right font-medium">请求</th>
+              <th class="pb-2 text-right font-medium">失败</th>
+              <th class="pb-2 text-right font-medium">tokens</th>
+              <th class="pb-2 text-right font-medium">花费</th>
+              <th class="pb-2 text-right font-medium">首字</th>
+              <th class="pb-2 text-right font-medium">总耗时</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="c in store.byChannel"
+              :key="`${c.channel_id}-${c.channel_name}`"
+              class="border-b border-ink/5 transition-colors last:border-0 hover:bg-ink/[0.03]"
+            >
+              <td class="py-2.5 font-medium">{{ c.channel_name }}</td>
+              <td class="tabular py-2.5 text-right">{{ c.requests.toLocaleString() }}</td>
+              <td
+                class="tabular py-2.5 text-right"
+                :class="c.failures > 0 ? 'text-danger' : 'text-ink-soft'"
+              >
+                {{ c.failures.toLocaleString() }}
+              </td>
+              <td class="tabular py-2.5 text-right text-ink-soft">
+                {{ compact(c.input_tokens + c.output_tokens) }}
+              </td>
+              <td class="tabular py-2.5 text-right text-ink-soft">
+                {{ c.cost > 0 ? `$${c.cost.toFixed(4)}` : '—' }}
+              </td>
+              <td class="tabular py-2.5 text-right text-ink-soft">{{ ms(c.avg_ttfb_ms) }}</td>
+              <td class="tabular py-2.5 text-right text-ink-soft">{{ ms(c.avg_duration_ms) }}</td>
             </tr>
           </tbody>
         </table>
