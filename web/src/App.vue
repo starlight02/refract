@@ -9,8 +9,14 @@ import {
   DialogRoot,
   DialogTitle,
 } from 'reka-ui'
-import { AUTH_REQUIRED_EVENT, BACKEND_DOWN_EVENT, setAdminToken } from '@/api/client'
+import {
+  AUTH_REQUIRED_EVENT,
+  BACKEND_DOWN_EVENT,
+  BACKEND_RESTORED_EVENT,
+  setAdminToken,
+} from '@/api/client'
 import AppIcon from '@/components/AppIcon.vue'
+import { initLiquidGlass } from '@/utils/liquidGlass'
 
 /** 深色模式偏好的存储键。 */
 const THEME_KEY = 'refract.theme'
@@ -28,6 +34,8 @@ function applyTheme(dark: boolean) {
 }
 
 onMounted(() => {
+  // 挂载物理液态玻璃滤镜
+  initLiquidGlass()
   // 首次访问没有存储值时跟随系统，之后用户的显式选择优先。
   const saved = localStorage.getItem(THEME_KEY)
   const dark =
@@ -74,6 +82,14 @@ onBeforeUnmount(() => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequ
 const backendDown = ref(false)
 let healthTimer: ReturnType<typeof setInterval> | null = null
 
+function onBackendRestored() {
+  if (backendDown.value) {
+    backendDown.value = false
+    if (healthTimer) clearInterval(healthTimer)
+    healthTimer = null
+  }
+}
+
 function onBackendDown() {
   if (backendDown.value) return
   backendDown.value = true
@@ -81,9 +97,7 @@ function onBackendDown() {
     try {
       const response = await fetch('/health/live')
       if (response.ok) {
-        backendDown.value = false
-        if (healthTimer) clearInterval(healthTimer)
-        healthTimer = null
+        onBackendRestored()
       }
     } catch {
       // 还没起来，下一轮再探。
@@ -91,9 +105,13 @@ function onBackendDown() {
   }, 1_500)
 }
 
-onMounted(() => window.addEventListener(BACKEND_DOWN_EVENT, onBackendDown))
+onMounted(() => {
+  window.addEventListener(BACKEND_DOWN_EVENT, onBackendDown)
+  window.addEventListener(BACKEND_RESTORED_EVENT, onBackendRestored)
+})
 onBeforeUnmount(() => {
   window.removeEventListener(BACKEND_DOWN_EVENT, onBackendDown)
+  window.removeEventListener(BACKEND_RESTORED_EVENT, onBackendRestored)
   if (healthTimer) clearInterval(healthTimer)
 })
 
@@ -135,7 +153,7 @@ const version = '0.1.0'
     >
       <div
         v-if="backendDown"
-        class="fixed top-3 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2.5 rounded-pill border border-warning/35 bg-warning/15 px-4 py-2.5 text-sm font-medium text-ink shadow-[0_8px_24px_-8px_oklch(0%_0_0/0.25)] backdrop-blur-xl"
+        class="glass fixed top-20 left-1/2 z-40 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-2.5 border-warning/30 bg-warning/12 px-4 py-2.5 text-sm font-medium text-ink shadow-[0_12px_32px_-14px_oklch(0%_0_0/0.28)] md:top-3"
         role="status"
       >
         <span
@@ -177,18 +195,26 @@ const version = '0.1.0'
         class="glass-thick glass-specular flex h-full flex-col overflow-y-auto px-4 py-5"
         aria-label="主导航"
       >
-        <!-- 标识。
-             不用 @wxperia/liquid-glass-vue 的 <LiquidGlass> 包 logo：它渲染的是
-             多根 Fragment（黑色衬层 ×2 + 玻璃主体 + 镜面高光 ×2），每层都按
-             「绝对居中悬浮」假设定位（top/left 50% + translate(-50%,-50%)），
-             嵌进 flex 侧栏会变成 5 个错位的兄弟项目，把标题挤走并留下白色伪影。
-             logo 直接用设计系统的玻璃语言（accent 渐变 + inset 高光 + 环境色阴影）。 -->
+        <!-- macOS 窗口控制红黄绿按纽 -->
+        <div class="mb-5 flex items-center gap-2 px-2" aria-hidden="true">
+          <span
+            class="size-3 rounded-full bg-[#ff5f56] border border-[#e0443e]/50 shadow-xs"
+          ></span>
+          <span
+            class="size-3 rounded-full bg-[#ffbd2e] border border-[#dea123]/50 shadow-xs"
+          ></span>
+          <span
+            class="size-3 rounded-full bg-[#27c93f] border border-[#1aab29]/50 shadow-xs"
+          ></span>
+        </div>
+
+        <!-- 标识 -->
         <RouterLink
           :to="{ name: 'dashboard' }"
-          class="mb-7 flex items-center gap-3 px-2 no-underline"
+          class="mb-6 flex items-center gap-3 px-2 no-underline"
         >
           <span
-            class="grid size-9 shrink-0 place-items-center rounded-xl bg-linear-to-b from-accent-soft to-accent text-lg font-bold text-white shadow-[0_4px_12px_-2px_oklch(from_var(--color-accent)_l_c_h/0.4),inset_0_1px_0_0_oklch(100%_0_0/0.35)]"
+            class="grid size-9 shrink-0 place-items-center rounded-xl bg-linear-to-b from-accent-soft to-accent text-lg font-bold text-white shadow-md shadow-accent/25"
             aria-hidden="true"
           >
             R
@@ -204,8 +230,8 @@ const version = '0.1.0'
           <li v-for="item in navItems" :key="item.name">
             <RouterLink
               :to="{ name: item.name }"
-              class="group flex items-center gap-3 rounded-glass px-3 py-2.5 text-[0.875rem] font-medium text-ink-faint no-underline transition-[color,background] duration-[--duration-fast] ease-[--ease-glass] hover:bg-[oklch(100%_0_0/0.35)] hover:text-ink-soft dark:hover:bg-[oklch(100%_0_0/0.07)]"
-              active-class="glass-tab-active !text-accent"
+              class="group flex items-center gap-3 rounded-xl px-3 py-2.5 text-[0.875rem] font-medium text-ink-soft no-underline transition-all duration-150 hover:bg-black/5 hover:text-ink dark:hover:bg-white/10"
+              active-class="glass-tab-active"
             >
               <span class="grid w-4 place-items-center" aria-hidden="true">
                 <AppIcon :name="item.icon" />
@@ -219,8 +245,8 @@ const version = '0.1.0'
         <div class="mt-auto flex flex-col gap-1 pt-5">
           <RouterLink
             to="/settings"
-            class="flex items-center gap-3 rounded-glass px-3 py-2.5 text-[0.875rem] font-medium text-ink-faint no-underline transition-[color,background] duration-[--duration-fast] ease-[--ease-glass] hover:bg-[oklch(100%_0_0/0.35)] hover:text-ink-soft dark:hover:bg-[oklch(100%_0_0/0.07)]"
-            active-class="glass-tab-active !text-accent"
+            class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-[0.875rem] font-medium text-ink-soft no-underline transition-all duration-150 hover:bg-black/5 hover:text-ink dark:hover:bg-white/10"
+            active-class="glass-tab-active"
           >
             <span class="grid w-4 place-items-center" aria-hidden="true">
               <AppIcon name="settings" />
@@ -230,8 +256,7 @@ const version = '0.1.0'
 
           <button
             type="button"
-            class="flex w-full cursor-pointer items-center gap-3 rounded-glass border-0 bg-transparent px-3 py-2.5 text-left text-[0.875rem] font-medium text-ink-faint transition-[color,background] duration-[--duration-fast] ease-[--ease-glass] hover:bg-[oklch(100%_0_0/0.35)] hover:text-ink-soft dark:hover:bg-[oklch(100%_0_0/0.07)]"
-            :aria-pressed="isDark"
+            class="flex w-full cursor-pointer items-center gap-3 rounded-xl border-0 bg-transparent px-3 py-2.5 text-left text-[0.875rem] font-medium text-ink-soft transition-all duration-150 hover:bg-black/5 hover:text-ink dark:hover:bg-white/10"
             @click="applyTheme(!isDark)"
           >
             <span class="grid w-4 place-items-center" aria-hidden="true">
@@ -248,6 +273,7 @@ const version = '0.1.0'
     <!-- 主内容区。ml 让出侧栏宽度，min-w-0 防止宽表格把布局撑破。 -->
     <main
       class="min-h-screen min-w-0 flex-1 px-4 pt-24 pb-28 sm:px-5 md:ml-[240px] md:p-5 xl:ml-[264px] xl:p-6"
+      :class="backendDown ? 'max-md:pt-40' : ''"
     >
       <RouterView />
     </main>
@@ -261,7 +287,7 @@ const version = '0.1.0'
         :key="item.name"
         :to="{ name: item.name }"
         class="flex min-w-0 flex-col items-center justify-center gap-0.5 rounded-lg text-[0.65rem] font-medium text-ink-faint no-underline"
-        active-class="glass-tab-active !text-accent"
+        active-class="glass-tab-active"
       >
         <AppIcon :name="item.icon" :size="18" />
         <span class="max-w-full truncate">{{ item.label }}</span>

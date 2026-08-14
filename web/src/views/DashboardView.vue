@@ -116,16 +116,13 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
         </p>
       </div>
 
-      <div class="glass flex gap-1 p-1" style="border-radius: var(--radius-pill)">
+      <div class="segmented-control">
         <button
           v-for="w in WINDOWS"
           :key="w.hours"
           type="button"
-          class="px-3.5 py-1.5 text-xs font-medium transition-colors"
-          style="border-radius: var(--radius-pill)"
-          :class="
-            activeWindow === w.hours ? 'bg-accent text-white' : 'text-ink-soft hover:text-ink'
-          "
+          class="segmented-item"
+          :class="activeWindow === w.hours ? 'segmented-item-active' : ''"
           @click="pick(w.hours)"
         >
           {{ w.label }}

@@ -12,7 +12,9 @@
 //!    但把它做成「从请求里读」会在加多用户那天变成越权漏洞。
 //! 3. **密钥明文只在创建响应里出现一次**。库里只有哈希，取不回来。
 
-use refract_core::{Action, Channel, ChannelId, Credential, GatewayError, Protocol, RoutingPolicy};
+use refract_core::{
+    Action, Channel, ChannelId, Credential, GatewayError, Protocol, RoutingPolicy, UpstreamAddress,
+};
 use refract_store::{LogFilter, NewApiKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -352,6 +354,27 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                 ok(serde_json::json!({ "id": id, "enabled": body.enabled }))
             },
         );
+    // POST /api/channels/probe-direct —— 在保存前直接按草稿配置探测上游模型列表。
+    let probe_direct = base
+        .and(warp::path("probe-direct"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(|body: DirectProbeRequest, state: AppState| async move {
+            let address = body.address.unwrap_or_default();
+            let credential = body.credential.unwrap_or_default();
+            let models = refract_upstream::probe_models(
+                state.upstream(),
+                body.protocol,
+                &address,
+                &credential,
+                body.proxy.as_deref(),
+            )
+            .await
+            .map_err(|e| warp::reject::custom(ApiError(e)))?;
+            ok(serde_json::json!({ "models": models }))
+        });
 
     // POST /api/channels/:id/probe —— 拉取上游真实模型列表。
     let probe = base
@@ -449,8 +472,31 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     // 顺序：具体路径在前，参数路径在后。`/channels/bulk` 与 `/channels/:id/enabled`
     // 必须先匹配，否则 `:id` 会尝试把 "bulk"/"enabled" 解析成数字然后失败。
     routes![
-        list, create, bulk, toggle, probe, test, duplicate, balance, get, update, delete,
+        list,
+        create,
+        bulk,
+        probe_direct,
+        toggle,
+        probe,
+        test,
+        duplicate,
+        balance,
+        get,
+        update,
+        delete,
     ]
+}
+
+/// 直接探测上游模型列表请求体。
+#[derive(Debug, Deserialize)]
+struct DirectProbeRequest {
+    protocol: Protocol,
+    #[serde(default)]
+    address: Option<UpstreamAddress>,
+    #[serde(default)]
+    credential: Option<Credential>,
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
 /// 批量操作请求体。

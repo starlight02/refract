@@ -155,11 +155,7 @@ function clear() {
       <div class="flex flex-wrap items-center gap-2">
         <label class="flex items-center gap-2 text-sm text-ink-soft">
           模型
-          <select
-            v-model="model"
-            class="glass-field min-w-44 px-3 py-2 text-sm outline-none"
-            aria-label="调试模型"
-          >
+          <select v-model="model" class="glass-field min-w-44 outline-none" aria-label="调试模型">
             <option v-if="modelList.length === 0" value="" disabled>没有可用模型</option>
             <option v-for="m in modelList" :key="m" :value="m">{{ m }}</option>
           </select>
@@ -180,7 +176,7 @@ function clear() {
       type="text"
       placeholder="System 提示词（可选）"
       aria-label="System 提示词"
-      class="glass-field w-full px-3 py-2 text-sm outline-none"
+      class="glass-field w-full outline-none"
     />
 
     <!-- 会话区 -->
@@ -202,10 +198,10 @@ function clear() {
           class="max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap"
           :class="
             turn.error
-              ? 'bg-danger/10 text-danger'
+              ? 'bg-danger/10 text-danger border border-danger/25'
               : turn.role === 'user'
-                ? 'bg-accent/12 text-ink'
-                : 'bg-ink/6 text-ink'
+                ? 'bg-accent text-white shadow-sm shadow-accent/25'
+                : 'glass border border-ink/10 text-ink shadow-xs'
           "
         >
           <template v-if="turn.error">{{ turn.error }}</template>
@@ -228,7 +224,7 @@ function clear() {
       <button
         v-if="busy"
         type="button"
-        class="glass-button-ghost shrink-0 px-4 py-2.5 text-sm"
+        class="glass-button-ghost !h-auto shrink-0 px-4 py-2.5 text-sm"
         @click="stop"
       >
         停止
@@ -236,7 +232,7 @@ function clear() {
       <button
         v-else
         type="submit"
-        class="glass-button-primary flex shrink-0 items-center gap-1.5 px-4 py-2.5 text-sm font-medium disabled:opacity-50"
+        class="glass-button-primary !h-auto flex shrink-0 items-center gap-1.5 px-4 py-2.5 text-sm font-medium disabled:opacity-50"
         :disabled="!canSend"
       >
         <AppIcon name="bolt" :size="15" />

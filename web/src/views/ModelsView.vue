@@ -98,9 +98,9 @@ function fmtPrice(value: number): string {
       <input
         v-model="filter"
         type="search"
-        placeholder="筛选模型名"
+        placeholder="筛选模型名…"
         aria-label="筛选模型名"
-        class="glass-field w-56 px-3 py-2 text-sm outline-none"
+        class="glass-field w-56 outline-none"
       />
     </header>
 

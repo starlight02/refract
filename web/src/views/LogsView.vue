@@ -54,6 +54,36 @@ const draftFailuresOnly = ref(false)
 const draftRequestId = ref('')
 const draftSince = ref('')
 const draftUntil = ref('')
+const timePreset = ref<'all' | '1h' | '6h' | '24h' | '7d' | 'custom'>('all')
+
+function pad2(n: number) {
+  return String(n).padStart(2, '0')
+}
+
+function toLocalInputString(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+}
+
+function onTimePresetChange(val: string) {
+  timePreset.value = val as typeof timePreset.value
+  const now = Date.now()
+  if (val === 'all') {
+    draftSince.value = ''
+    draftUntil.value = ''
+  } else if (val === '1h') {
+    draftSince.value = toLocalInputString(new Date(now - 3600 * 1000))
+    draftUntil.value = toLocalInputString(new Date(now))
+  } else if (val === '6h') {
+    draftSince.value = toLocalInputString(new Date(now - 6 * 3600 * 1000))
+    draftUntil.value = toLocalInputString(new Date(now))
+  } else if (val === '24h') {
+    draftSince.value = toLocalInputString(new Date(now - 24 * 3600 * 1000))
+    draftUntil.value = toLocalInputString(new Date(now))
+  } else if (val === '7d') {
+    draftSince.value = toLocalInputString(new Date(now - 7 * 24 * 3600 * 1000))
+    draftUntil.value = toLocalInputString(new Date(now))
+  }
+}
 
 /** datetime-local（本地时区）转后端要的 UTC 秒级时间串。 */
 function toUtcStamp(local: string): string | undefined {
@@ -62,7 +92,6 @@ function toUtcStamp(local: string): string | undefined {
   if (Number.isNaN(date.getTime())) return undefined
   return date.toISOString().replace('T', ' ').slice(0, 19)
 }
-
 /** 展开的行 id 集合。 */
 const expanded = ref<Set<number>>(new Set())
 /** 清理确认与结果提示。 */
@@ -101,6 +130,7 @@ function resetFilter() {
   draftRequestId.value = ''
   draftSince.value = ''
   draftUntil.value = ''
+  timePreset.value = 'all'
   store.fetch({})
 }
 
@@ -231,16 +261,16 @@ function fullTime(iso: string): string {
         <p class="mt-1 text-sm text-ink-faint">点任意一行展开完整的错误与 token 明细。</p>
       </div>
 
-      <div class="flex flex-wrap items-center gap-2">
-        <label class="flex cursor-pointer items-center gap-1.5 text-xs text-ink-soft">
+      <div class="flex flex-wrap items-center gap-2.5">
+        <label class="glass-pill h-[34px] cursor-pointer gap-2 px-3 text-xs text-ink-soft">
           <input v-model="autoRefresh" type="checkbox" class="accent-[var(--color-accent)]" />
-          自动刷新
+          <span>自动刷新</span>
           <span v-if="autoRefresh" class="text-ink-faint">5s</span>
         </label>
 
         <button
           type="button"
-          class="glass-button-ghost flex items-center gap-1.5 px-3 py-2 text-sm"
+          class="glass-button-ghost"
           :disabled="store.items.length === 0"
           @click="exportLogs"
         >
@@ -250,7 +280,7 @@ function fullTime(iso: string): string {
 
         <button
           type="button"
-          class="glass-button-ghost flex items-center gap-1.5 px-3 py-2 text-sm"
+          class="glass-button-ghost"
           title="按当前筛选导出 NDJSON（上限 5 万行）"
           @click="exportAll"
         >
@@ -258,96 +288,121 @@ function fullTime(iso: string): string {
           导出全量
         </button>
 
-        <label class="flex items-center gap-1.5 text-xs text-ink-soft">
-          清理
+        <div class="glass-pill glass-pill-danger h-[34px] gap-1.5 px-2.5">
+          <span class="text-xs text-ink-soft">清理</span>
           <input
             v-model.number="pruneDays"
             type="number"
             min="1"
-            class="glass-field tabular w-16 px-2 py-1 text-sm outline-none"
+            class="glass-field tabular !h-[24px] !w-12 !px-1 text-center text-xs outline-none"
           />
-          天前
-        </label>
-        <button
-          type="button"
-          class="glass-button-ghost glass-button-ghost-danger px-3 py-2 text-sm"
-          :disabled="pruning"
-          @click="prune"
-        >
-          {{ pruning ? '清理中…' : '执行' }}
-        </button>
+          <span class="text-xs text-ink-soft">天前</span>
+          <button
+            type="button"
+            class="glass-button-ghost glass-button-ghost-danger !h-[24px] !px-2 text-xs font-medium"
+            :disabled="pruning"
+            @click="prune"
+          >
+            {{ pruning ? '…' : '执行' }}
+          </button>
+        </div>
         <span v-if="pruneNotice" class="text-xs text-ink-faint">{{ pruneNotice }}</span>
       </div>
     </header>
 
     <!-- 筛选 -->
-    <section class="glass glass-specular flex flex-wrap items-end gap-3 p-4">
-      <label class="flex flex-col gap-1.5">
-        <span class="text-xs font-medium text-ink-soft">模型</span>
-        <input
-          v-model="draftModel"
-          type="text"
-          placeholder="精确匹配"
-          class="glass-field w-40 px-3 py-1.5 font-mono text-sm outline-none"
-          @keydown.enter="applyFilter"
-        />
-      </label>
+    <section class="glass glass-specular p-4">
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <label class="flex flex-col gap-1.5">
+          <span class="text-xs font-medium text-ink-soft">模型</span>
+          <input
+            v-model="draftModel"
+            type="text"
+            placeholder="精确匹配 / 全部模型"
+            class="glass-field w-full outline-none"
+            @keydown.enter="applyFilter"
+          />
+        </label>
 
-      <label class="flex flex-col gap-1.5">
-        <span class="text-xs font-medium text-ink-soft">渠道</span>
-        <select v-model="draftChannel" class="glass-field w-44 px-3 py-1.5 text-sm outline-none">
-          <option value="">全部</option>
-          <option v-for="o in channelsStore.options" :key="o.id" :value="o.id">{{ o.name }}</option>
-        </select>
-      </label>
+        <label class="flex flex-col gap-1.5">
+          <span class="text-xs font-medium text-ink-soft">渠道</span>
+          <select v-model="draftChannel" class="glass-field w-full outline-none">
+            <option value="">全部渠道</option>
+            <option v-for="o in channelsStore.options" :key="o.id" :value="o.id">
+              {{ o.name }}
+            </option>
+          </select>
+        </label>
 
-      <label class="flex flex-col gap-1.5">
-        <span class="text-xs font-medium text-ink-soft">request id</span>
-        <input
-          v-model="draftRequestId"
-          type="text"
-          placeholder="x-refract-request-id"
-          class="glass-field w-52 px-3 py-1.5 font-mono text-xs outline-none"
-          @keydown.enter="applyFilter"
-        />
-      </label>
+        <label class="flex flex-col gap-1.5">
+          <span class="text-xs font-medium text-ink-soft">Request ID</span>
+          <input
+            v-model="draftRequestId"
+            type="text"
+            placeholder="按请求 ID 检索"
+            class="glass-field w-full font-mono text-xs outline-none"
+            @keydown.enter="applyFilter"
+          />
+        </label>
 
-      <label class="flex flex-col gap-1.5">
-        <span class="text-xs font-medium text-ink-soft">从</span>
-        <input
-          v-model="draftSince"
-          type="datetime-local"
-          aria-label="起始时间"
-          class="glass-field px-3 py-1.5 text-sm outline-none"
-        />
-      </label>
+        <label class="flex flex-col gap-1.5">
+          <span class="text-xs font-medium text-ink-soft">状态过滤</span>
+          <select v-model="draftFailuresOnly" class="glass-field w-full outline-none">
+            <option :value="false">全部状态（包含成功与失败）</option>
+            <option :value="true">仅看失败请求</option>
+          </select>
+        </label>
+      </div>
 
-      <label class="flex flex-col gap-1.5">
-        <span class="text-xs font-medium text-ink-soft">到</span>
-        <input
-          v-model="draftUntil"
-          type="datetime-local"
-          aria-label="截止时间"
-          class="glass-field px-3 py-1.5 text-sm outline-none"
-        />
-      </label>
+      <div
+        class="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-ink/8 pt-3"
+      >
+        <div class="flex flex-wrap items-center gap-3">
+          <label class="flex items-center gap-2">
+            <span class="text-xs font-medium text-ink-soft">时间范围</span>
+            <select
+              :value="timePreset"
+              class="glass-field w-36 outline-none"
+              @change="onTimePresetChange(($event.target as HTMLSelectElement).value)"
+            >
+              <option value="all">全部时间</option>
+              <option value="1h">最近 1 小时</option>
+              <option value="6h">最近 6 小时</option>
+              <option value="24h">最近 24 小时</option>
+              <option value="7d">最近 7 天</option>
+              <option value="custom">自定义范围…</option>
+            </select>
+          </label>
 
-      <label class="flex cursor-pointer items-center gap-2 pb-2 text-sm">
-        <input v-model="draftFailuresOnly" type="checkbox" class="accent-[var(--color-accent)]" />
-        只看失败
-      </label>
+          <template v-if="timePreset === 'custom'">
+            <div class="flex items-center gap-1.5">
+              <span class="text-xs text-ink-faint">从</span>
+              <input
+                v-model="draftSince"
+                type="datetime-local"
+                aria-label="起始时间"
+                class="glass-field w-48 outline-none"
+              />
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span class="text-xs text-ink-faint">到</span>
+              <input
+                v-model="draftUntil"
+                type="datetime-local"
+                aria-label="截止时间"
+                class="glass-field w-48 outline-none"
+              />
+            </div>
+          </template>
+        </div>
 
-      <div class="flex w-full items-center gap-2 sm:ml-auto sm:w-auto">
-        <button
-          type="button"
-          class="glass-button-primary px-4 py-2 text-sm font-medium"
-          @click="applyFilter"
-        >
-          应用
-        </button>
-        <button type="button" class="glass-button-ghost px-3 py-2 text-sm" @click="resetFilter">
-          重置
-        </button>
+        <div class="flex items-center gap-2">
+          <button type="button" class="glass-button-primary px-4 font-medium" @click="applyFilter">
+            <AppIcon name="search" :size="14" />
+            应用筛选
+          </button>
+          <button type="button" class="glass-button-ghost px-3.5" @click="resetFilter">重置</button>
+        </div>
       </div>
     </section>
 

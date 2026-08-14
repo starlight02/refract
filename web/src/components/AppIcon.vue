@@ -17,6 +17,7 @@ import {
   Copy,
   Download,
   Gauge,
+  Globe,
   KeyRound,
   List,
   ListChecks,
@@ -25,7 +26,9 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   Settings,
+  Sparkles,
   Sun,
   Trash2,
   Upload,
@@ -60,6 +63,10 @@ const ICONS = {
   bolt: Zap,
   /** 导出：下载。 */
   download: Download,
+  /** 网络 / 上游。 */
+  globe: Globe,
+  /** AI / 推荐预设。 */
+  sparkles: Sparkles,
   /** 导入：上传。 */
   upload: Upload,
   /** 成功 / 选中。 */
@@ -74,8 +81,9 @@ const ICONS = {
   boxes: Boxes,
   /** 调试台：对话气泡。 */
   chat: MessagesSquare,
+  /** 搜索 / 放大镜。 */
+  search: Search,
 } as const
-
 export type IconName = keyof typeof ICONS
 
 withDefaults(

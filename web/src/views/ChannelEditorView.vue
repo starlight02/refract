@@ -9,8 +9,18 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import {
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogOverlay,
+  DialogPortal,
+  DialogRoot,
+  DialogTitle,
+} from 'reka-ui'
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
+import AppIcon from '@/components/AppIcon.vue'
 import { PROTOCOL_ORDER, toggleProtocol, withoutProtocol } from '@/components/protocol'
 import { useChannelsStore } from '@/stores/channels'
 import { channels as channelsApi } from '@/api/client'
@@ -19,6 +29,7 @@ import type {
   ChannelEndpoint,
   ChannelKind,
   ModelEntry,
+  ModelProbe,
   Protocol,
   UpstreamAddress,
 } from '@/api/types'
@@ -296,33 +307,133 @@ function addModel(ep: ChannelEndpoint) {
   const raw = (modelDraft.value[ep.protocol] ?? '').trim()
   modelDraft.value[ep.protocol] = ''
   if (!raw) return
-  // 支持 `别名=上游名` 的映射写法，这是模型重命名最省事的输入方式。
-  const [name, upstream] = raw.includes('=') ? raw.split('=', 2) : [raw, undefined]
-  const entry: ModelEntry = { name: name!.trim(), upstream: upstream?.trim() || null }
-  if (!entry.name || ep.models.some((m) => m.name === entry.name)) return
-  ep.models.push(entry)
+
+  // 支持以逗号、换行、空格分隔的批量输入，也支持 `别名=上游名` 映射
+  const items = raw.split(/[\n,， ]+/).filter(Boolean)
+  const existing = new Set(ep.models.map((m) => m.name))
+
+  for (const item of items) {
+    const [name, upstream] = item.includes('=') ? item.split('=', 2) : [item, undefined]
+    const trimmedName = name!.trim()
+    if (!trimmedName || existing.has(trimmedName)) continue
+    ep.models.push({ name: trimmedName, upstream: upstream?.trim() || null })
+    existing.add(trimmedName)
+  }
 }
 
 function removeModel(ep: ChannelEndpoint, modelIndex: number) {
   ep.models.splice(modelIndex, 1)
 }
 
-/** 拉取上游真实模型列表并合并进当前端点。 */
-async function probeModels(ep: ChannelEndpoint) {
-  if (!isEdit.value || probeStale.value) return
-  probing.value[ep.protocol] = true
-  probeError.value[ep.protocol] = ''
-  try {
-    const result = await store.probe(editingId.value as number, ep.protocol)
-    const existing = new Set(ep.models.map((m) => m.name))
-    for (const m of result.models) {
-      if (!existing.has(m.id)) ep.models.push({ name: m.id, upstream: null })
-    }
-  } catch (e) {
-    probeError.value[ep.protocol] = e instanceof Error ? e.message : '探测失败'
-  } finally {
-    probing.value[ep.protocol] = false
+function clearAllModels(ep: ChannelEndpoint) {
+  ep.models = []
+}
+
+interface ProbeDialogState {
+  open: boolean
+  protocol: Protocol | null
+  targetEndpoint: ChannelEndpoint | null
+  loading: boolean
+  error: string | null
+  models: ModelProbe[]
+  selected: Set<string>
+  filterQuery: string
+}
+
+const probeDialog = ref<ProbeDialogState>({
+  open: false,
+  protocol: null,
+  targetEndpoint: null,
+  loading: false,
+  error: null,
+  models: [],
+  selected: new Set(),
+  filterQuery: '',
+})
+
+const filteredProbeModels = computed(() => {
+  const q = probeDialog.value.filterQuery.trim().toLowerCase()
+  if (!q) return probeDialog.value.models
+  return probeDialog.value.models.filter(
+    (m) =>
+      m.id.toLowerCase().includes(q) ||
+      (m.display_name && m.display_name.toLowerCase().includes(q)),
+  )
+})
+
+async function openProbeDialog(ep: ChannelEndpoint) {
+  probeDialog.value = {
+    open: true,
+    protocol: ep.protocol,
+    targetEndpoint: ep,
+    loading: true,
+    error: null,
+    models: [],
+    selected: new Set(ep.models.map((m) => m.name)),
+    filterQuery: '',
   }
+
+  try {
+    const effectiveAddress =
+      ep.address.unofficial || ep.address.full_address || !!ep.address.base_url
+        ? ep.address
+        : form.value.address
+    const effectiveCredential = ep.credential ?? form.value.credential
+
+    const res = await store.probeDirect({
+      protocol: ep.protocol,
+      address: effectiveAddress,
+      credential: effectiveCredential,
+      proxy: form.value.proxy || null,
+    })
+
+    probeDialog.value.models = res.models
+    probeDialog.value.loading = false
+    const all = new Set(ep.models.map((m) => m.name))
+    for (const m of res.models) all.add(m.id)
+    probeDialog.value.selected = all
+  } catch (e) {
+    probeDialog.value.loading = false
+    probeDialog.value.error =
+      e instanceof Error ? e.message : '探测上游模型列表失败，请检查 Base URL 和密钥是否正确'
+  }
+}
+
+function toggleProbeSelected(id: string) {
+  const s = new Set(probeDialog.value.selected)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  probeDialog.value.selected = s
+}
+
+function selectAllFiltered() {
+  const s = new Set(probeDialog.value.selected)
+  for (const m of filteredProbeModels.value) s.add(m.id)
+  probeDialog.value.selected = s
+}
+
+function deselectAllFiltered() {
+  const s = new Set(probeDialog.value.selected)
+  for (const m of filteredProbeModels.value) s.delete(m.id)
+  probeDialog.value.selected = s
+}
+
+function applyProbeModels() {
+  const ep = probeDialog.value.targetEndpoint
+  if (!ep) return
+  const currentMap = new Map(ep.models.map((m) => [m.name, m]))
+  const newModels: ModelEntry[] = []
+
+  for (const id of probeDialog.value.selected) {
+    if (currentMap.has(id)) {
+      newModels.push(currentMap.get(id)!)
+    } else {
+      newModels.push({ name: id, upstream: null })
+    }
+  }
+
+  ep.models = newModels
+  probeDialog.value.open = false
 }
 
 /** 客户端校验，与后端 `Channel::validate` 的规则一致。 */
@@ -651,9 +762,10 @@ function previewUrl(ep: ChannelEndpoint): string {
           <button
             v-if="isAggregate && availableProtocols.length > 0"
             type="button"
-            class="rounded-lg bg-ink/8 px-3 py-1.5 text-xs font-medium hover:bg-ink/12"
+            class="glass-button-ghost px-3 py-1.5 text-xs font-medium"
             @click="addEndpoint"
           >
+            <AppIcon name="plus" :size="14" />
             添加端点
           </button>
         </div>
@@ -669,7 +781,7 @@ function previewUrl(ep: ChannelEndpoint): string {
           <article
             v-for="(ep, i) in form.endpoints"
             :key="ep.protocol"
-            class="rounded-lg border border-ink/10 bg-ink/[0.02] p-4"
+            class="rounded-xl border border-ink/10 bg-black/5 p-4 dark:bg-white/5"
           >
             <div class="mb-3 flex flex-wrap items-center gap-3">
               <select
@@ -810,49 +922,54 @@ function previewUrl(ep: ChannelEndpoint): string {
               </div>
             </div>
 
-            <!-- 模型 -->
-            <div class="mb-3">
-              <div class="mb-1.5 flex items-center justify-between">
-                <span class="text-xs font-medium text-ink-soft">
-                  模型
-                  <span class="font-normal text-ink-faint">
-                    支持 <code class="rounded bg-ink/8 px-1">别名=上游名</code> 映射
+            <!-- 模型列表与选择 -->
+            <div class="mb-4">
+              <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center gap-2">
+                  <span class="text-xs font-semibold text-ink-soft">模型列表</span>
+                  <span
+                    class="rounded bg-ink/8 px-1.5 py-0.5 text-[0.7rem] font-medium text-ink-faint"
+                  >
+                    已选 {{ ep.models.length }} 个
                   </span>
-                </span>
-                <button
-                  v-if="isEdit"
-                  type="button"
-                  class="rounded px-2 py-0.5 text-[0.7rem] text-accent hover:bg-accent/10 disabled:opacity-50"
-                  :disabled="probing[ep.protocol] || probeStale"
-                  :title="
-                    probeStale
-                      ? '地址或密钥有未保存的修改，探测走的是已保存配置 —— 请先保存'
-                      : undefined
-                  "
-                  @click="probeModels(ep)"
-                >
-                  {{ probing[ep.protocol] ? '探测中…' : '从上游同步' }}
-                </button>
+                </div>
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <!-- 在线拉取模型 (新建或编辑均可用) -->
+                  <button
+                    type="button"
+                    class="glass-button-ghost flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-accent hover:!bg-accent/15"
+                    @click="openProbeDialog(ep)"
+                  >
+                    <AppIcon name="globe" :size="13" />
+                    从上游获取模型
+                  </button>
+
+                  <!-- 清空 -->
+                  <button
+                    v-if="ep.models.length > 0"
+                    type="button"
+                    class="glass-button-ghost px-2 py-1 text-xs text-ink-faint hover:!text-danger"
+                    @click="clearAllModels(ep)"
+                  >
+                    清空
+                  </button>
+                </div>
               </div>
-
-              <p v-if="probeStale && isEdit" class="mb-1.5 text-[0.7rem] text-warning">
-                地址或密钥有未保存的修改，保存后才能按新配置探测。
-              </p>
-              <p v-if="probeError[ep.protocol]" class="mb-1.5 text-xs text-danger">
-                {{ probeError[ep.protocol] }}
-              </p>
-
-              <div v-if="ep.models.length > 0" class="mb-2 flex flex-wrap gap-1.5">
+              <!-- 已选模型标签展示区 -->
+              <div v-if="ep.models.length > 0" class="mb-2.5 flex flex-wrap gap-1.5">
                 <span
                   v-for="(m, mi) in ep.models"
                   :key="m.name"
-                  class="inline-flex items-center gap-1.5 rounded-lg bg-ink/8 px-2 py-1 font-mono text-xs"
+                  class="inline-flex items-center gap-1.5 rounded-lg border border-ink/8 bg-ink/6 px-2 py-1 font-mono text-xs shadow-xs"
                 >
-                  {{ m.name
-                  }}<span v-if="m.upstream" class="text-ink-faint">→{{ m.upstream }}</span>
+                  <span class="font-medium text-ink">{{ m.name }}</span>
+                  <span v-if="m.upstream" class="text-[0.7rem] text-accent-deep"
+                    >→{{ m.upstream }}</span
+                  >
                   <button
                     type="button"
-                    class="text-ink-faint hover:text-danger"
+                    class="grid size-3.5 place-items-center rounded-full text-ink-faint hover:bg-danger/20 hover:text-danger"
+                    title="移除模型"
                     @click="removeModel(ep, mi)"
                   >
                     ×
@@ -860,15 +977,25 @@ function previewUrl(ep: ChannelEndpoint): string {
                 </span>
               </div>
 
-              <input
-                v-model="modelDraft[ep.protocol]"
-                type="text"
-                placeholder="gpt-4o 然后回车"
-                class="glass-field w-full px-3 py-1.5 font-mono text-xs outline-none"
-                @keydown.enter.prevent="addModel(ep)"
-              />
+              <!-- 手动添加输入框 / 批量粘贴 -->
+              <div class="relative">
+                <input
+                  v-model="modelDraft[ep.protocol]"
+                  type="text"
+                  placeholder="输入模型名（支持批量粘贴或 别名=上游名 映射），按回车添加"
+                  class="glass-field w-full px-3 py-1.5 pr-16 font-mono text-xs outline-none"
+                  @keydown.enter.prevent="addModel(ep)"
+                />
+                <button
+                  v-if="(modelDraft[ep.protocol] ?? '').trim()"
+                  type="button"
+                  class="absolute top-1/2 right-1.5 -translate-y-1/2 rounded bg-accent px-2 py-0.5 text-xs text-white"
+                  @click="addModel(ep)"
+                >
+                  添加
+                </button>
+              </div>
             </div>
-
             <!-- 协议转换 -->
             <div>
               <label class="flex cursor-pointer items-center gap-2 text-xs text-ink-soft">
@@ -1076,10 +1203,9 @@ function previewUrl(ep: ChannelEndpoint): string {
             删除渠道
           </button>
           <div v-else class="ml-auto flex items-center gap-2">
-            <span class="text-xs text-ink-faint">确定删除？</span>
             <button
               type="button"
-              class="rounded-full bg-danger px-3.5 py-2 text-sm font-medium text-white hover:brightness-105"
+              class="rounded-lg bg-danger px-3.5 py-2 text-sm font-medium text-white hover:brightness-105"
               @click="destroy"
             >
               删除
@@ -1095,5 +1221,171 @@ function previewUrl(ep: ChannelEndpoint): string {
         </template>
       </div>
     </form>
+
+    <!-- 上游模型在线探测与多选对话框 -->
+    <DialogRoot :open="probeDialog.open" @update:open="probeDialog.open = $event">
+      <DialogPortal>
+        <DialogOverlay
+          class="fixed inset-0 z-50 bg-black/40 backdrop-blur-md transition-opacity data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
+        />
+        <DialogContent
+          class="glass-thick glass-specular fixed top-1/2 left-1/2 z-50 flex max-h-[85vh] w-[calc(100%-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col !bg-canvas/95 p-6 shadow-2xl outline-none dark:!bg-[#12141c]/95"
+        >
+          <DialogTitle class="flex items-center justify-between text-lg font-semibold">
+            <span class="flex items-center gap-2">
+              <AppIcon name="globe" :size="20" class="text-accent" />
+              上游模型在线探测
+            </span>
+            <DialogClose
+              class="rounded-lg p-1 text-ink-faint transition-colors hover:bg-ink/5 hover:text-ink cursor-pointer"
+            >
+              <AppIcon name="x" :size="18" />
+            </DialogClose>
+          </DialogTitle>
+
+          <DialogDescription class="mt-1 text-xs text-ink-faint">
+            已向上游地址探测真实可用模型列表。勾选需要接入的模型后一键导入当前端点。
+          </DialogDescription>
+
+          <!-- 加载中 -->
+          <div
+            v-if="probeDialog.loading"
+            class="flex flex-col items-center justify-center py-16 text-center"
+          >
+            <div
+              class="size-8 animate-spin rounded-full border-2 border-accent border-t-transparent"
+            ></div>
+            <p class="mt-3 text-sm text-ink-soft">正在向目标上游发送模型列表探测请求…</p>
+            <p class="mt-1 text-xs text-ink-faint">
+              走 {{ probeDialog.protocol }} 协议模型列表接口
+            </p>
+          </div>
+
+          <!-- 探测失败 -->
+          <div
+            v-else-if="probeDialog.error"
+            class="my-4 rounded-xl border border-danger/30 bg-danger/10 p-4"
+          >
+            <p class="text-sm font-semibold text-danger">探测失败</p>
+            <p class="mt-1 text-xs text-danger/90">{{ probeDialog.error }}</p>
+            <p class="mt-2 text-[0.75rem] text-ink-faint">
+              请检查上方渠道地址（Base URL）是否正确、API
+              密钥是否已填写且有效，若为私有网络请检查网络连通性。
+            </p>
+            <div class="mt-3 flex justify-end gap-2">
+              <DialogClose as="template">
+                <button type="button" class="glass-button-ghost px-3 py-1.5 text-xs">关闭</button>
+              </DialogClose>
+              <button
+                v-if="probeDialog.targetEndpoint"
+                type="button"
+                class="glass-button-primary px-3 py-1.5 text-xs font-medium"
+                @click="openProbeDialog(probeDialog.targetEndpoint)"
+              >
+                重试
+              </button>
+            </div>
+          </div>
+
+          <!-- 探测成功，显示模型多选列表 -->
+          <div v-else class="mt-4 flex min-h-0 flex-1 flex-col gap-3">
+            <!-- 搜索与快速操作栏 -->
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="relative min-w-56 flex-1">
+                <input
+                  v-model="probeDialog.filterQuery"
+                  type="search"
+                  placeholder="搜索上游模型 ID…"
+                  class="glass-field w-full px-3 py-1.5 text-xs outline-none"
+                />
+              </div>
+              <div class="flex items-center gap-2 text-xs">
+                <span class="text-ink-faint">
+                  发现 {{ probeDialog.models.length }} 个 · 已选 {{ probeDialog.selected.size }} 个
+                </span>
+                <button
+                  type="button"
+                  class="glass-button-ghost px-2 py-1 text-xs"
+                  @click="selectAllFiltered"
+                >
+                  全选{{ probeDialog.filterQuery ? '当前' : '' }}
+                </button>
+                <button
+                  type="button"
+                  class="glass-button-ghost px-2 py-1 text-xs"
+                  @click="deselectAllFiltered"
+                >
+                  全不选
+                </button>
+              </div>
+            </div>
+
+            <!-- 模型列表滚动区域 -->
+            <div
+              v-if="probeDialog.models.length === 0"
+              class="py-10 text-center text-sm text-ink-faint"
+            >
+              上游返回了空模型列表。
+            </div>
+            <div
+              v-else-if="filteredProbeModels.length === 0"
+              class="py-10 text-center text-sm text-ink-faint"
+            >
+              没有匹配 "{{ probeDialog.filterQuery }}" 的模型
+            </div>
+            <div
+              v-else
+              class="glass max-h-72 min-h-36 flex-1 divide-y divide-ink/5 overflow-y-auto rounded-xl p-2.5"
+            >
+              <div
+                v-for="m in filteredProbeModels"
+                :key="m.id"
+                class="flex cursor-pointer items-center justify-between rounded-lg px-2.5 py-1.5 transition-colors hover:bg-ink/5"
+                @click="toggleProbeSelected(m.id)"
+              >
+                <div class="min-w-0 flex-1 pr-2">
+                  <p class="truncate font-mono text-xs font-medium text-ink">{{ m.id }}</p>
+                  <p
+                    v-if="m.display_name && m.display_name !== m.id"
+                    class="truncate text-[0.7rem] text-ink-faint"
+                  >
+                    {{ m.display_name }}
+                  </p>
+                </div>
+                <div
+                  class="grid size-5 shrink-0 place-items-center rounded border transition-colors"
+                  :class="
+                    probeDialog.selected.has(m.id)
+                      ? 'border-accent bg-accent text-white'
+                      : 'border-ink/20 bg-transparent'
+                  "
+                >
+                  <AppIcon v-if="probeDialog.selected.has(m.id)" name="check" :size="12" />
+                </div>
+              </div>
+            </div>
+
+            <!-- 底部确定按钮 -->
+            <div class="mt-2 flex items-center justify-end gap-3 border-t border-ink/8 pt-2">
+              <button
+                type="button"
+                class="glass-button-ghost px-4 py-2 text-xs"
+                @click="probeDialog.open = false"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                class="glass-button-primary px-4 py-2 text-xs font-medium disabled:opacity-50"
+                :disabled="probeDialog.selected.size === 0"
+                @click="applyProbeModels"
+              >
+                导入所选 ({{ probeDialog.selected.size }}) 个模型
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </DialogPortal>
+    </DialogRoot>
   </div>
 </template>

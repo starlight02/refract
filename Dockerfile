@@ -9,7 +9,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 COPY web/ ./
 RUN pnpm run build
 
-FROM rust:1.90-alpine AS rust-builder
+FROM rust:1.94-alpine AS rust-builder
 RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./

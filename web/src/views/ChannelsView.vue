@@ -419,8 +419,7 @@ function addressLabel(ch: Channel): string {
           <!-- 左：身份 -->
           <div class="min-w-0 flex-1">
             <div class="flex flex-wrap items-center gap-2">
-              <h3 class="truncate font-semibold">{{ ch.name }}</h3>
-
+              <h3 class="whitespace-nowrap text-base font-semibold text-ink">{{ ch.name }}</h3>
               <span
                 v-if="ch.kind === 'aggregate'"
                 class="proto-badge"
@@ -608,7 +607,7 @@ function addressLabel(ch: Channel): string {
             <template v-else>
               <button
                 type="button"
-                class="rounded-full bg-danger px-3 py-1.5 text-xs font-medium text-white hover:brightness-105"
+                class="rounded-lg bg-danger px-3 py-1.5 text-xs font-medium text-white hover:brightness-105"
                 @click="confirmDelete(ch.id)"
               >
                 确认

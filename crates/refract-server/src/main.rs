@@ -115,11 +115,20 @@ async fn main() -> Result<()> {
     // 自动禁用渠道的定时重测自愈（间隔从设置读取，0 = 关闭）。
     let retest = tokio::spawn(refract_api::notify::auto_retest_loop(state.clone()));
 
-    // 显式绑定而非 `Server::bind`：后者在端口被占用时直接 panic，
-    // 而「3939 已被占用」是最常见的启动失败，值得一条人话错误。
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
+    // 显式配置套接字（允许地址/端口重用），支持开发与重启时瞬时接管监听
+    let socket = match config.listen {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    let _ = socket.set_reuseport(true);
+    socket
+        .bind(config.listen)
         .with_context(|| format!("failed to bind {}", config.listen))?;
+    let listener = socket
+        .listen(1024)
+        .with_context(|| format!("failed to listen on {}", config.listen))?;
     let local = listener.local_addr().unwrap_or(config.listen);
 
     tracing::info!(address = %local, "refract is listening");

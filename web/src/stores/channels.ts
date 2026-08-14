@@ -1,7 +1,13 @@
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
 import { channels } from '@/api/client'
-import type { Channel, Protocol, ProbeResult, ChannelTestResult } from '@/api/types'
+import type {
+  Channel,
+  Protocol,
+  ProbeResult,
+  ChannelTestResult,
+  UpstreamAddress,
+} from '@/api/types'
 import { toErrorMessage } from './shared'
 
 /**
@@ -98,6 +104,22 @@ export const useChannelsStore = defineStore('channels', () => {
     }
   }
 
+  /** 在未保存时直接按草稿参数探测上游真实模型列表。 */
+  async function probeDirect(spec: {
+    protocol: Protocol
+    address?: UpstreamAddress
+    credential?: string | null
+    proxy?: string | null
+  }): Promise<ProbeResult> {
+    error.value = null
+    try {
+      return await channels.probeDirect(spec)
+    } catch (e) {
+      error.value = toErrorMessage(e)
+      throw e
+    }
+  }
+
   /** 发最小真实请求验证渠道连通性。 */
   async function test(id: number, protocol?: Protocol, model?: string): Promise<ChannelTestResult> {
     error.value = null
@@ -147,6 +169,7 @@ export const useChannelsStore = defineStore('channels', () => {
     remove,
     toggleEnabled,
     probe,
+    probeDirect,
     test,
     duplicate,
     bulk,

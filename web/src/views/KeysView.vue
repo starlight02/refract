@@ -407,7 +407,7 @@ function isExpired(key: ApiKey): boolean {
             <template v-if="pendingDelete === key.id">
               <button
                 type="button"
-                class="rounded-full bg-danger px-3 py-1.5 text-xs font-medium text-white hover:brightness-105"
+                class="rounded-lg bg-danger px-3 py-1.5 text-xs font-medium text-white hover:brightness-105"
                 @click="destroy(key.id)"
               >
                 确认删除
@@ -438,10 +438,10 @@ function isExpired(key: ApiKey): boolean {
     <DialogRoot :open="dialog !== 'closed'" @update:open="onDialogOpenChange">
       <DialogPortal>
         <DialogOverlay
-          class="fixed inset-0 z-50 bg-ink/25 backdrop-blur-sm data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
+          class="fixed inset-0 z-50 bg-black/40 backdrop-blur-md data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
         />
         <DialogContent
-          class="glass-thick glass-specular fixed top-1/2 left-1/2 z-50 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 p-6 outline-none"
+          class="glass-thick glass-specular fixed top-1/2 left-1/2 z-50 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 !bg-canvas/95 p-6 shadow-2xl outline-none dark:!bg-[#12141c]/95"
           @escape-key-down="guardCreatedDismiss"
           @pointer-down-outside="guardCreatedDismiss"
         >

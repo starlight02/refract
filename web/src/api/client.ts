@@ -32,6 +32,7 @@ import type {
   RequestLog,
   RoutingPolicy,
   StatsSummary,
+  UpstreamAddress,
 } from './types'
 
 /** 后端返回的错误信封。 */
@@ -78,11 +79,11 @@ const TOKEN_KEY = 'refract.admin_token'
 export const AUTH_REQUIRED_EVENT = 'refract:auth-required'
 
 /**
- * 后端不可达时派发的事件名（dev 下 cargo 编译窗口、生产下服务重启）。
- * App.vue 据此显示「后端启动中」横幅并轮询 `/health/live` 直到恢复。
+ * 后端不可达 / 恢复时派发的事件名（dev 下 cargo 编译窗口、生产下服务重启）。
+ * App.vue 据此显示 / 隐藏「后端启动中」横幅并重试。
  */
 export const BACKEND_DOWN_EVENT = 'refract:backend-down'
-
+export const BACKEND_RESTORED_EVENT = 'refract:backend-restored'
 /** GET 在后端不可达时的自动重试间隔与上限（约等 60 秒的编译窗口）。 */
 const UNAVAILABLE_RETRY_MS = 1_500
 const UNAVAILABLE_RETRY_MAX = 40
@@ -176,13 +177,13 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
         envelope.detail,
       )
     }
+    window.dispatchEvent(new CustomEvent(BACKEND_RESTORED_EVENT))
 
     if (response.status === 204) return undefined as T
     const text = await response.text()
     if (!text) return undefined as T
 
     const parsed = JSON.parse(text) as Envelope<T> | T
-    // 管理 API 一律带 `data`；网关 API（/v1/models）不带。两者都要支持。
     return parsed && typeof parsed === 'object' && 'data' in parsed
       ? (parsed as Envelope<T>).data
       : (parsed as T)
@@ -215,7 +216,13 @@ export const channels = {
   /** 拉取上游真实模型列表，用于一键同步。`protocol` 省略时用首选端点。 */
   probe: (id: number, protocol?: Protocol) =>
     request<ProbeResult>('POST', `/api/channels/${id}/probe`, { protocol: protocol ?? null }),
-  /** 发一个最小真实请求验证渠道可用。 */
+  /** 在未保存时直接按草稿参数探测上游真实模型列表。 */
+  probeDirect: (spec: {
+    protocol: Protocol
+    address?: UpstreamAddress
+    credential?: string | null
+    proxy?: string | null
+  }) => request<ProbeResult>('POST', '/api/channels/probe-direct', spec),
   test: (id: number, protocol?: Protocol, model?: string) =>
     request<ChannelTestResult>('POST', `/api/channels/${id}/test`, {
       protocol: protocol ?? null,
