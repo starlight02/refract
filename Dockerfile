@@ -1,29 +1,33 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:24.12.0-bookworm-slim AS web-builder
+FROM node:24-alpine AS web-builder
 WORKDIR /build/web
 RUN corepack enable
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
 COPY web/ ./
 RUN pnpm run build
 
-FROM rust:1.90-bookworm AS rust-builder
+FROM rust:1.90-alpine AS rust-builder
+RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY --from=web-builder /build/web/dist ./web/dist
-RUN cargo build --locked --release -p refract-server
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --locked --release -p refract-server && \
+    cp /build/target/release/refract-server /build/refract-server
 
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 refract \
-    && useradd --uid 10001 --gid refract --no-create-home --shell /usr/sbin/nologin refract \
+FROM alpine:3.21 AS runtime
+RUN apk add --no-cache ca-certificates curl tzdata \
+    && addgroup -g 10001 refract \
+    && adduser -u 10001 -G refract -s /sbin/nologin -D refract \
     && install -d -o refract -g refract /data
 
-COPY --from=rust-builder /build/target/release/refract-server /usr/local/bin/refract-server
+COPY --from=rust-builder /build/refract-server /usr/local/bin/refract-server
 
 USER refract
 WORKDIR /data

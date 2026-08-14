@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vp dev",
-    "build": "vp check . && vue-tsc --build && vp build",
+    "build": "vp check . && vue-tsc --build && vp build && node scripts/compress.js",
     "preview": "vp preview",
     "test:unit": "vp test",
     "test:e2e": "playwright test",

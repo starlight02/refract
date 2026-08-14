@@ -8,7 +8,7 @@
 //! SPA fallback 的边界很关键：找不到的路径回 `index.html`，**但 API 前缀除外**。
 //! 不排除的话，一个拼错的 `/api/chanels` 会返回 200 + HTML，前端 `response.json()`
 //! 抛出语法错误，用户看到的是「Unexpected token <」而不是 404。
-use warp::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG};
+use warp::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, VARY};
 use warp::http::{HeaderValue, StatusCode};
 use warp::{Filter, Reply, filters::BoxedFilter};
 
@@ -26,21 +26,79 @@ struct Assets;
 /// 回一个 HTML 页面会把「路径写错了」伪装成「服务器返回了奇怪的数据」。
 const API_PREFIXES: [&str; 4] = ["api/", "health/", "v1/", "v1beta/"];
 
+/// 静态资源支持的内容编码格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentEncoding {
+    /// 原始未压缩。
+    Identity,
+    /// Brotli 压缩。
+    Brotli,
+    /// Gzip 压缩。
+    Gzip,
+}
+
+impl ContentEncoding {
+    /// 对应的 `Content-Encoding` 头部值。
+    pub fn header_value(self) -> Option<&'static str> {
+        match self {
+            Self::Identity => None,
+            Self::Brotli => Some("br"),
+            Self::Gzip => Some("gzip"),
+        }
+    }
+}
+
 /// 静态资源路由。
 pub fn routes() -> BoxedFilter<(warp::reply::Response,)> {
     warp::get()
         .and(warp::path::tail())
+        .and(warp::header::optional::<String>("accept-encoding"))
         .and(warp::header::optional::<String>("if-none-match"))
-        .and_then(|tail: warp::path::Tail, inm: Option<String>| async move {
-            serve(tail.as_str(), inm.as_deref()).ok_or_else(warp::reject::not_found)
-        })
+        .and_then(
+            |tail: warp::path::Tail, accept_encoding: Option<String>, inm: Option<String>| async move {
+                serve(tail.as_str(), accept_encoding.as_deref(), inm.as_deref())
+                    .ok_or_else(warp::reject::not_found)
+            },
+        )
         .boxed()
+}
+
+/// 根据客户端 `Accept-Encoding` 协商选择最佳资源（优先 br，其次 gzip，最后未压缩）。
+fn select_asset<'a>(
+    candidate: &'a str,
+    accept_encoding: Option<&str>,
+) -> Option<(&'a str, rust_embed::EmbeddedFile, ContentEncoding)> {
+    let ae = accept_encoding.unwrap_or("");
+    let supports_br = ae.split(',').any(|part| part.trim().starts_with("br"));
+    let supports_gzip = ae
+        .split(',')
+        .any(|part| part.trim().starts_with("gzip") || part.trim().starts_with('*'));
+
+    if supports_br {
+        let br_path = format!("{candidate}.br");
+        if let Some(file) = Assets::get(&br_path) {
+            return Some((candidate, file, ContentEncoding::Brotli));
+        }
+    }
+
+    if supports_gzip {
+        let gz_path = format!("{candidate}.gz");
+        if let Some(file) = Assets::get(&gz_path) {
+            return Some((candidate, file, ContentEncoding::Gzip));
+        }
+    }
+
+    Assets::get(candidate).map(|file| (candidate, file, ContentEncoding::Identity))
 }
 
 /// 解析一个路径并渲染响应。
 ///
 /// 返回 `None` 表示「应当交给别的过滤器或报 404」。
-fn serve(path: &str, if_none_match: Option<&str>) -> Option<warp::reply::Response> {
+fn serve(
+    path: &str,
+    accept_encoding: Option<&str>,
+    if_none_match: Option<&str>,
+) -> Option<warp::reply::Response> {
     let trimmed = path.trim_start_matches('/');
 
     // API 前缀不走静态资源，也不走 fallback。
@@ -54,24 +112,22 @@ fn serve(path: &str, if_none_match: Option<&str>) -> Option<warp::reply::Respons
         trimmed
     };
 
-    match Assets::get(candidate) {
-        Some(file) => Some(render(candidate, file, if_none_match)),
-        // 找不到的路径交给 SPA：前端路由（/channels、/logs）在服务端不存在，
-        // 但必须能被直接访问和刷新。
-        None => {
-            let index = Assets::get("index.html")?;
-            Some(render("index.html", index, if_none_match))
-        }
+    if let Some((orig_path, file, encoding)) = select_asset(candidate, accept_encoding) {
+        return Some(render(orig_path, file, encoding, if_none_match));
     }
-}
 
+    // 找不到的路径交给 SPA：前端路由（/channels、/logs）在服务端不存在，
+    // 但必须能被直接访问和刷新。
+    let (orig_path, index, encoding) = select_asset("index.html", accept_encoding)?;
+    Some(render(orig_path, index, encoding, if_none_match))
+}
 /// 渲染一个资源为 HTTP 响应。
 fn render(
     path: &str,
     file: rust_embed::EmbeddedFile,
+    encoding: ContentEncoding,
     if_none_match: Option<&str>,
 ) -> warp::reply::Response {
-    // rust-embed 给的是内容哈希，正好当 ETag —— 内容不变则 ETag 不变。
     let etag = format!("\"{}\"", hex_digest(&file.metadata.sha256_hash()));
 
     if if_none_match.is_some_and(|v| v == etag) {
@@ -80,6 +136,11 @@ fn render(
             warp::reply::with_status(warp::reply(), StatusCode::NOT_MODIFIED).into_response();
         if let Ok(value) = HeaderValue::from_str(&etag) {
             response.headers_mut().insert(ETAG, value);
+        }
+        if encoding != ContentEncoding::Identity {
+            response
+                .headers_mut()
+                .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
         }
         return response;
     }
@@ -101,6 +162,10 @@ fn render(
         headers.insert(ETAG, value);
     }
     headers.insert(CACHE_CONTROL, HeaderValue::from_static(cache_policy(path)));
+    if let Some(enc) = encoding.header_value() {
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static(enc));
+        headers.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
 
     response
 }
@@ -147,7 +212,7 @@ mod tests {
             "v1beta/models",
         ] {
             assert!(
-                serve(path, None).is_none(),
+                serve(path, None, None).is_none(),
                 "{path} must not be handled by the static server"
             );
         }
@@ -156,7 +221,7 @@ mod tests {
     #[test]
     fn api_prefix_check_does_not_match_lookalike_paths() {
         // `/apidocs` 不是 API 路径，不该被排除 —— 前缀判断带斜杠正是为此。
-        let handled = serve("apidocs", None);
+        let handled = serve("apidocs", None, None);
         // dist 可能为空（CI 未构建前端），此时返回 None 也算通过；
         // 关键是它不因为「以 api 开头」被主动排除。
         if Assets::get("index.html").is_some() {
@@ -197,7 +262,7 @@ mod tests {
         if Assets::get("index.html").is_none() {
             return;
         }
-        let response = serve("channels", None).expect("SPA route should be served");
+        let response = serve("channels", None, None).expect("SPA route should be served");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/html");
     }
@@ -207,7 +272,7 @@ mod tests {
         if Assets::get("index.html").is_none() {
             return;
         }
-        let first = serve("", None).expect("index");
+        let first = serve("", None, None).expect("index");
         let etag = first
             .headers()
             .get(ETAG)
@@ -216,7 +281,26 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        let second = serve("", Some(&etag)).expect("index");
+        let second = serve("", None, Some(&etag)).expect("index");
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn serves_compressed_assets_when_requested() {
+        if Assets::get("index.html").is_none() {
+            return;
+        }
+        // 请求 gzip
+        if Assets::get("index.html.gz").is_some() {
+            let gz_resp = serve("", Some("gzip, deflate"), None).expect("gzip index");
+            assert_eq!(gz_resp.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
+            assert_eq!(gz_resp.headers().get(VARY).unwrap(), "Accept-Encoding");
+        }
+        // 请求 br
+        if Assets::get("index.html.br").is_some() {
+            let br_resp = serve("", Some("gzip, deflate, br"), None).expect("brotli index");
+            assert_eq!(br_resp.headers().get(CONTENT_ENCODING).unwrap(), "br");
+            assert_eq!(br_resp.headers().get(VARY).unwrap(), "Accept-Encoding");
+        }
     }
 }
