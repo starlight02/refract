@@ -21,7 +21,12 @@ import {
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
 import AppIcon from '@/components/AppIcon.vue'
-import { PROTOCOL_ORDER, toggleProtocol, withoutProtocol } from '@/components/protocol'
+import {
+  PROTOCOL_LABEL,
+  PROTOCOL_ORDER,
+  toggleProtocol,
+  withoutProtocol,
+} from '@/components/protocol'
 import { useChannelsStore } from '@/stores/channels'
 import { channels as channelsApi } from '@/api/client'
 import type {
@@ -982,6 +987,7 @@ function previewUrl(ep: ChannelEndpoint): string {
                 <input
                   v-model="modelDraft[ep.protocol]"
                   type="text"
+                  :aria-label="`${PROTOCOL_LABEL[ep.protocol]} 模型输入`"
                   placeholder="输入模型名（支持批量粘贴或 别名=上游名 映射），按回车添加"
                   class="glass-field w-full px-3 py-1.5 pr-16 font-mono text-xs outline-none"
                   @keydown.enter.prevent="addModel(ep)"

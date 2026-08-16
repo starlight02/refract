@@ -167,7 +167,7 @@ test('通过编辑器创建渠道', async ({ page }) => {
   await page.getByPlaceholder('https://api.example.com').fill(upstreamUrl)
   await page.getByPlaceholder('sk-...').fill('sk-e2e-main')
 
-  const modelInput = page.getByPlaceholder('gpt-4o 然后回车')
+  const modelInput = page.getByRole('textbox', { name: 'Chat 模型输入' })
   await modelInput.fill('gpt-4o')
   await modelInput.press('Enter')
   await expect(page.locator('article')).toContainText('gpt-4o')
