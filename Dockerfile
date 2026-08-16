@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 COPY web/ ./
 RUN pnpm run build
 
-FROM rust:1.94-alpine AS rust-builder
+FROM rust:1.97-alpine AS rust-builder
 ARG ALPINE_MIRROR
 # Alpine package revisions rotate out of stable indexes; pin the release branch instead.
 # hadolint ignore=DL3018
