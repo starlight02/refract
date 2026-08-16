@@ -2,6 +2,9 @@ services:
   refract:
     build:
       context: .
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://mirrors.cloud.tencent.com/npm}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-https://mirrors.cloud.tencent.com/alpine}
     image: refract:local
     init: true
     restart: unless-stopped

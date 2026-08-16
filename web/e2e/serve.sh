@@ -12,12 +12,12 @@ cd "$ROOT"
 # 前端产物必须先存在：二进制用 rust-embed 在编译期内嵌 dist。
 if [ ! -f web/dist/index.html ]; then
   echo "[e2e] web/dist missing — building frontend first" >&2
-  (cd web && pnpm install --silent && pnpm run build)
+  (cd web && pnpm install --frozen-lockfile --silent && pnpm run build)
 fi
 
 # build.rs 监听 web/dist 变化，dist 比二进制新时会重新内嵌；
 # 两者都新鲜时这一步是秒级 no-op。
-cargo build -p refract-server --quiet
+cargo build --locked -p refract-server --quiet
 
 # 在临时目录里运行：避免读到仓库里真实使用的 refract.toml / refract.db，
 # 也保证每次测试都是一份全新数据。

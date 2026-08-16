@@ -1,16 +1,24 @@
 # syntax=docker/dockerfile:1.7
 
+ARG NPM_REGISTRY=https://registry.npmjs.org
+ARG ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 FROM node:24-alpine AS web-builder
+ARG NPM_REGISTRY
 WORKDIR /build/web
 RUN corepack enable
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
+    COREPACK_NPM_REGISTRY="$NPM_REGISTRY" \
+    pnpm install --frozen-lockfile --registry="$NPM_REGISTRY"
 COPY web/ ./
 RUN pnpm run build
 
 FROM rust:1.94-alpine AS rust-builder
-RUN apk add --no-cache musl-dev
+ARG ALPINE_MIRROR
+# Alpine package revisions rotate out of stable indexes; pin the release branch instead.
+# hadolint ignore=DL3018
+RUN sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${ALPINE_MIRROR}|g" /etc/apk/repositories \
+    && apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
@@ -22,7 +30,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /build/target/release/refract-server /build/refract-server
 
 FROM alpine:3.21 AS runtime
-RUN apk add --no-cache ca-certificates curl tzdata \
+ARG ALPINE_MIRROR
+# Alpine package revisions rotate out of stable indexes; pin the release branch instead.
+# hadolint ignore=DL3018
+RUN sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${ALPINE_MIRROR}|g" /etc/apk/repositories \
+    && apk add --no-cache ca-certificates curl tzdata \
     && addgroup -g 10001 refract \
     && adduser -u 10001 -G refract -s /sbin/nologin -D refract \
     && install -d -o refract -g refract /data
