@@ -11,7 +11,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 COPY web/ ./
 RUN pnpm run build
 
-FROM rust:1.94-alpine AS rust-builder
+FROM rust:1.97-alpine AS rust-builder
 ARG ALPINE_MIRROR
 # Alpine package revisions rotate out of stable indexes; pin the release branch instead.
 # hadolint ignore=DL3018
@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release -p refract-server && \
     cp /build/target/release/refract-server /build/refract-server
 
-FROM alpine:3.21 AS runtime
+FROM alpine:3.24 AS runtime
 ARG ALPINE_MIRROR
 # Alpine package revisions rotate out of stable indexes; pin the release branch instead.
 # hadolint ignore=DL3018
