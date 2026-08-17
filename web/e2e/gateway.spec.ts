@@ -295,6 +295,59 @@ test('开启协议转换后 Messages 客户端能打到 Chat 上游', async ({ p
   expect(Array.isArray(lastSeen?.body.messages)).toBe(true)
 })
 
+test('模型映射可原地编辑，保存后上游名被改写', async ({ page, baseURL }) => {
+  await page.goto('/channels')
+  await page.getByRole('button', { name: '编辑' }).click()
+  await expect(page.getByRole('heading', { name: '编辑渠道' })).toBeVisible()
+
+  // 未设映射前，上游收到与对外名相同的模型名。
+  const before = await gatewayFetch(page, baseURL ?? '', '/v1/chat/completions', {
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: 'pre-mapping' }],
+  })
+  expect(before.status).toBe(200)
+  expect(lastSeen?.body.model).toBe('gpt-4o')
+
+  // 点模型 chip 进入原地编辑，填上游名，回车确认。
+  await page.getByRole('button', { name: 'gpt-4o' }).click()
+  const upstreamInput = page.getByRole('textbox', { name: 'gpt-4o 上游名' })
+  // 点击即聚焦是编辑体验的一部分（模板 ref 在 v-for 里会变数组，
+  // 这行断言守住「点开就落光标」的行为）。
+  await expect(upstreamInput).toBeFocused()
+  await upstreamInput.fill('e2e-alias')
+  await upstreamInput.press('Enter')
+  await expect(page.getByRole('button', { name: '→e2e-alias' })).toBeVisible()
+
+  await page.getByRole('button', { name: '保存修改' }).click()
+  await expect(page).toHaveURL(/\/channels$/)
+
+  // 保存后：对外名不变，上游实际收到的是映射后的名字。
+  const mapped = await gatewayFetch(page, baseURL ?? '', '/v1/chat/completions', {
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: 'mapped' }],
+  })
+  expect(mapped.status).toBe(200)
+  expect(lastSeen?.body.model).toBe('e2e-alias')
+
+  // 映射在重新打开编辑器后仍在；清空上游名则回到同名直通。
+  await page.getByRole('button', { name: '编辑' }).click()
+  await page.getByRole('button', { name: '→e2e-alias' }).click()
+  const clearInput = page.getByRole('textbox', { name: 'gpt-4o 上游名' })
+  await clearInput.fill('')
+  await clearInput.press('Enter')
+  await expect(page.getByRole('button', { name: '→e2e-alias' })).toBeHidden()
+
+  await page.getByRole('button', { name: '保存修改' }).click()
+  await expect(page).toHaveURL(/\/channels$/)
+
+  const restored = await gatewayFetch(page, baseURL ?? '', '/v1/chat/completions', {
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: 'restored' }],
+  })
+  expect(restored.status).toBe(200)
+  expect(lastSeen?.body.model).toBe('gpt-4o')
+})
+
 test('复制渠道产生禁用副本，批量操作可以删掉它', async ({ page }) => {
   await page.goto('/channels')
   await page.getByRole('button', { name: '复制' }).click()

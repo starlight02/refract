@@ -7,7 +7,7 @@
  * 同一套端点编辑器，只是单协议时锁死数量为 1 并同步协议 —— 用户不会
  * 感到自己在填两种不同的表单。
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   DialogClose,
@@ -328,6 +328,38 @@ function addModel(ep: ChannelEndpoint) {
 
 function removeModel(ep: ChannelEndpoint, modelIndex: number) {
   ep.models.splice(modelIndex, 1)
+}
+
+/** 正在原地编辑上游名的模型，key 为 `${协议}:${对外名}`。 */
+const editingModelKey = ref<string | null>(null)
+/** 编辑中的上游名草稿。 */
+const editingUpstreamDraft = ref('')
+/** 编辑输入框本体，用于进入编辑态后立刻聚焦并全选。 */
+const editMappingInput = ref<HTMLInputElement | null>(null)
+
+function modelKey(protocol: Protocol, name: string): string {
+  return `${protocol}:${name}`
+}
+
+function startEditMapping(ep: ChannelEndpoint, m: ModelEntry) {
+  editingModelKey.value = modelKey(ep.protocol, m.name)
+  editingUpstreamDraft.value = m.upstream ?? ''
+  void nextTick(() => {
+    editMappingInput.value?.focus()
+    editMappingInput.value?.select()
+  })
+}
+function cancelEditMapping() {
+  editingModelKey.value = null
+  editingUpstreamDraft.value = ''
+}
+
+/** 提交编辑：留空清除映射，回到与对外名相同。 */
+function commitEditMapping(ep: ChannelEndpoint, m: ModelEntry) {
+  if (editingModelKey.value !== modelKey(ep.protocol, m.name)) return
+  const draft = editingUpstreamDraft.value.trim()
+  m.upstream = draft === '' || draft === m.name ? null : draft
+  cancelEditMapping()
 }
 
 function clearAllModels(ep: ChannelEndpoint) {
@@ -967,10 +999,34 @@ function previewUrl(ep: ChannelEndpoint): string {
                   :key="m.name"
                   class="inline-flex items-center gap-1.5 rounded-lg border border-ink/8 bg-ink/6 px-2 py-1 font-mono text-xs shadow-xs"
                 >
-                  <span class="font-medium text-ink">{{ m.name }}</span>
-                  <span v-if="m.upstream" class="text-[0.7rem] text-accent-deep"
-                    >→{{ m.upstream }}</span
+                  <template v-if="editingModelKey === modelKey(ep.protocol, m.name)">
+                    <span class="font-medium text-ink">{{ m.name }}</span>
+                    <span class="text-[0.7rem] text-ink-faint">→</span>
+                    <input
+                      :ref="(el) => (editMappingInput = el as HTMLInputElement | null)"
+                      :value="editingUpstreamDraft"
+                      type="text"
+                      :aria-label="`${m.name} 上游名`"
+                      :placeholder="m.name"
+                      class="glass-field h-auto w-40 px-1.5 py-0.5 font-mono text-[0.7rem] outline-none"
+                      @input="editingUpstreamDraft = ($event.target as HTMLInputElement).value"
+                      @keydown.enter.prevent="commitEditMapping(ep, m)"
+                      @keydown.esc.prevent="cancelEditMapping"
+                      @blur="commitEditMapping(ep, m)"
+                    />
+                  </template>
+                  <button
+                    v-else
+                    type="button"
+                    class="cursor-pointer rounded font-medium text-ink hover:text-accent-deep"
+                    :title="`编辑 ${m.name} 的上游映射`"
+                    @click="startEditMapping(ep, m)"
                   >
+                    {{ m.name
+                    }}<span v-if="m.upstream" class="ml-1 text-[0.7rem] text-accent-deep"
+                      >→{{ m.upstream }}</span
+                    >
+                  </button>
                   <button
                     type="button"
                     class="grid size-3.5 place-items-center rounded-full text-ink-faint hover:bg-danger/20 hover:text-danger"
