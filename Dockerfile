@@ -3,10 +3,10 @@ ARG ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 FROM node:24-alpine AS web-builder
 ARG NPM_REGISTRY
 WORKDIR /build/web
-RUN corepack enable
+RUN npm install -g pnpm@11.21.0 --registry="$NPM_REGISTRY" && \
+    pnpm config set registry "$NPM_REGISTRY"
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    COREPACK_NPM_REGISTRY="$NPM_REGISTRY" \
     pnpm install --frozen-lockfile --registry="$NPM_REGISTRY"
 COPY web/ ./
 RUN pnpm run build

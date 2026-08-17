@@ -13,13 +13,6 @@
     "concurrently": "^10.0.4",
     "lefthook": "^2.1.9"
   },
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": "11.21.0",
-      "onFail": "download"
-    }
-  },
   "engines": {
     "node": "^22.18.0 || >=24.12.0"
   }

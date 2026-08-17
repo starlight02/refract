@@ -75,7 +75,7 @@ Vapor 已并入 Vue core 的 vapor 分支；旧 [`vuejs/core-vapor`](https://git
 
 - `vp dev / build / test / check / fmt / lint` 作为统一入口；
 - Vite 由 Vite+ catalog/override 解析，Vitest 从 `vite-plus/test` 导入；
-- pnpm 版本由 `devEngines.packageManager` 固定为 `11.21.0`；
+- 包管理器使用 pnpm 11+；
 - 验收链为 `vp check`、Vue 类型构建、`vp test`、`vp build`。
 
 依赖安装和包管理遵循 [Vite+ install 指南](https://viteplus.dev/guide/install)。
