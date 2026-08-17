@@ -21,7 +21,7 @@ pre-commit:
     - name: web check
       root: "web/"
       glob: "*.{ts,tsx,vue,css,json,html}"
-      run: pnpm exec vp check .
+      run: pnpm exec vp check
 
     # 4) 后端格式化：cargo fmt 就地修复并回填。
     - name: rust fmt

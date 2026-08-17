@@ -1,8 +1,10 @@
 import { fileURLToPath, URL } from 'node:url'
+import { constants as zlibConstants } from 'node:zlib'
 
-import { defineConfig } from 'vite-plus'
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
+import { compression, defineAlgorithm } from 'vite-plugin-compression2'
+import { configDefaults, defineConfig } from 'vite-plus'
 
 // Vue 3.6 Vapor Mode：编译期去掉虚拟 DOM，直接生成命令式的 DOM 更新代码。
 // 对这个项目的意义很实在 —— 日志页会渲染上千行、渠道列表会频繁增删，
@@ -137,12 +139,25 @@ export default defineConfig({
       },
     ],
   },
+  test: {
+    environment: 'node',
+    exclude: [...configDefaults.exclude, 'e2e/**'],
+  },
   plugins: [
     vue({
       // 全项目启用 Vapor：单文件组件不必逐个加 `<script setup vapor>`。
       features: { vapor: true },
     }),
     tailwindcss(),
+    compression({
+      algorithms: [
+        defineAlgorithm('gzip', { level: 9 }),
+        defineAlgorithm('brotliCompress', {
+          params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11 },
+        }),
+      ],
+      include: /\.(?:html|js|css|svg|json|ico|txt|xml|wasm)$/,
+    }),
   ],
   resolve: {
     alias: {

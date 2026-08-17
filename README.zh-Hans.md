@@ -46,7 +46,7 @@ Refract 的模型是：**渠道类型 = 协议**。只有五种：
 
 ```sh
 # 1. 构建前端（产物在 web/dist，会被内嵌进二进制）
-cd web && pnpm install && pnpm run build && cd ..
+cd web && vp install && vp build && cd ..
 
 # 2. 构建并运行网关
 cargo run --release -p refract-server
@@ -143,9 +143,9 @@ pnpm dev
 ```sh
 cargo test --workspace --all-targets --all-features --locked
 cd web
-pnpm run test:unit              # 前端单元测试
-pnpm run build
-pnpm run test:e2e               # E2E：对真实后端二进制跑完整流程
+vp test                       # 前端单元测试
+vp build
+vp run test:e2e               # E2E：对真实后端二进制跑完整流程
 ```
 
 架构细节见 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)，实现依据见 [`docs/research/FOUNDATIONS.md`](./docs/research/FOUNDATIONS.md)。

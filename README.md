@@ -46,7 +46,7 @@ Building requires Rust (2024-edition toolchain) and Node.js (pnpm):
 
 ```sh
 # 1. Build the frontend (output in web/dist, embedded into the binary)
-cd web && pnpm install && pnpm run build && cd ..
+cd web && vp install && vp build && cd ..
 
 # 2. Build and run the gateway
 cargo run --release -p refract-server
@@ -143,9 +143,9 @@ Full regression (hooks skip tests; run manually before releasing):
 ```sh
 cargo test --workspace --all-targets --all-features --locked
 cd web
-pnpm run test:unit              # frontend unit tests
-pnpm run build
-pnpm run test:e2e               # full flows against the real server binary
+vp test                       # frontend unit tests
+vp build
+vp run test:e2e               # full flows against the real server binary
 ```
 
 Architecture details in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md); implementation rationale in [`docs/research/FOUNDATIONS.md`](./docs/research/FOUNDATIONS.md).
