@@ -101,8 +101,13 @@ fn serve(
 ) -> Option<warp::reply::Response> {
     let trimmed = path.trim_start_matches('/');
 
-    // API 前缀不走静态资源，也不走 fallback。
-    if API_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+    // API 前缀不走静态资源，也不走 fallback。裸前缀（`/api` 本身）同样
+    // 排除：`starts_with("api/")` 对不带尾斜杠的路径不命中，拼错的客户端
+    // 会拿到 200 + HTML 而不是 404。
+    if API_PREFIXES
+        .iter()
+        .any(|p| trimmed.starts_with(p) || trimmed == p.trim_end_matches('/'))
+    {
         return None;
     }
 
@@ -211,6 +216,18 @@ mod tests {
             "v1/chat/completions",
             "v1beta/models",
         ] {
+            assert!(
+                serve(path, None, None).is_none(),
+                "{path} must not be handled by the static server"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_api_prefixes_are_never_swallowed_by_the_spa_fallback() {
+        // `GET /api`（不带后续段）同样必须 404：`starts_with("api/")`
+        // 对裸前缀不命中，之前会被 fallback 吃掉变成 200 + HTML。
+        for path in ["api", "health", "v1", "v1beta"] {
             assert!(
                 serve(path, None, None).is_none(),
                 "{path} must not be handled by the static server"

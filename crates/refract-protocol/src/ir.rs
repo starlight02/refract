@@ -46,6 +46,9 @@ pub enum MediaSource {
     Base64(String),
     /// 上游文件 ID（OpenAI `file_id` / Gemini `fileUri`）。
     FileId(String),
+    /// 纯文本（Anthropic `source.type == "text"`）。**不是** base64，
+    /// 内容本身就是原文；跨协议转码时才按需 base64 编码。
+    Text(String),
 }
 
 impl MediaSource {
@@ -68,7 +71,7 @@ impl MediaSource {
         (MediaSource::Url(raw.to_owned()), None)
     }
 
-    /// 渲染成 data URI（Base64 变体）或原样 URL。
+    /// 渲染成 data URI（Base64/Text 变体）或原样 URL。
     pub fn to_data_uri(&self, mime: Option<&str>) -> String {
         match self {
             MediaSource::Url(u) => u.clone(),
@@ -77,6 +80,13 @@ impl MediaSource {
                 format!("data:{mime};base64,{data}")
             }
             MediaSource::FileId(id) => id.clone(),
+            // 纯文本跨协议时按 base64 data URI 表达，语义等价。
+            MediaSource::Text(text) => {
+                use base64::Engine as _;
+                let mime = mime.unwrap_or("text/plain");
+                let data = base64::engine::general_purpose::STANDARD.encode(text);
+                format!("data:{mime};base64,{data}")
+            }
         }
     }
 }
@@ -347,6 +357,11 @@ impl ReasoningConfig {
         }
         let effort = self.effort.as_deref()?;
         let ceiling = max_output.unwrap_or(32_000);
+        // Anthropic 要求 1024 <= budget_tokens < max_tokens：上限装不下最小
+        // 预算时不存在合法取值，只能放弃思考，而不是发一个必然被拒的请求。
+        if ceiling <= 1_024 {
+            return None;
+        }
         let budget = match effort {
             "minimal" | "none" => return None,
             "low" => ceiling / 5,
@@ -354,8 +369,7 @@ impl ReasoningConfig {
             "high" => ceiling * 4 / 5,
             _ => return None,
         };
-        // Anthropic 要求 budget_tokens >= 1024。
-        Some(budget.max(1_024))
+        Some(budget.max(1_024).min(ceiling - 1))
     }
 
     /// 把 token 预算折算成定性档位。
@@ -748,6 +762,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.budget_or_from_effort(Some(8_000)), None);
+    }
+
+    #[test]
+    fn effort_budget_respects_max_output_ceiling() {
+        let high = ReasoningConfig {
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        // Anthropic 要求 budget < max_tokens：上限勉强容纳最小预算时取 1024。
+        assert_eq!(high.budget_or_from_effort(Some(1_200)), Some(1_024));
+        // 上限装不下 1024 时不存在合法预算，只能放弃思考。
+        assert_eq!(high.budget_or_from_effort(Some(1_024)), None);
+        assert_eq!(high.budget_or_from_effort(Some(512)), None);
     }
 
     #[test]

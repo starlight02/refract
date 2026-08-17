@@ -351,6 +351,16 @@ fn encode_part(part: &ContentPart, tool_names: &HashMap<&str, &str>) -> Option<V
                         "data": data,
                     }
                 })),
+                // 纯文本按 inlineData 表达：inlineData.data 必须是 base64。
+                MediaSource::Text(text) => {
+                    use base64::Engine as _;
+                    Some(json!({
+                        "inlineData": {
+                            "mimeType": mime.unwrap_or_else(|| "text/plain".to_owned()),
+                            "data": base64::engine::general_purpose::STANDARD.encode(text),
+                        }
+                    }))
+                }
                 // Gemini 只接受 Files API 的 URI，普通 URL 也只能塞这里 ——
                 // 上游会自己判断可达性，网关不做预校验。
                 MediaSource::FileId(uri) | MediaSource::Url(uri) => Some(json!({

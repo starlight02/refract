@@ -787,7 +787,8 @@ fn encode_content_part(part: &ContentPart, role: Role) -> Option<Value> {
                 MediaSource::Url(u) => {
                     obj.insert("file_url".into(), json!(u));
                 }
-                MediaSource::Base64(_) => {
+                // base64 与纯文本都要还原成 data URI，Responses 没有独立字段。
+                MediaSource::Base64(_) | MediaSource::Text(_) => {
                     obj.insert(
                         "file_data".into(),
                         json!(source.to_data_uri(mime.as_deref())),

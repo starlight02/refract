@@ -487,7 +487,10 @@ fn passthrough_usage(kind: PassKind, body: &Bytes) -> u64 {
     }
     let envelope = serde_json::from_slice::<Envelope>(body).unwrap_or_default();
     match kind {
-        PassKind::Embeddings => envelope.usage.unwrap_or_default().prompt_tokens,
+        // legacy completions 与 embeddings 一样在 usage.prompt_tokens 里报输入量。
+        PassKind::Embeddings | PassKind::Completions => {
+            envelope.usage.unwrap_or_default().prompt_tokens
+        }
         PassKind::CountTokens => envelope.input_tokens.unwrap_or_default(),
         PassKind::GeminiCountTokens => envelope.total_tokens.unwrap_or_default(),
         _ => 0,
@@ -500,15 +503,29 @@ fn passthrough_usage(kind: PassKind, body: &Bytes) -> u64 {
 /// 单行），这个结构由 RFC 7578 保证；不值得为一个字段引入完整解析器。
 fn multipart_model(raw: &[u8]) -> Option<String> {
     const MARKER: &[u8] = b"name=\"model\"";
-    let marker_at = raw
-        .windows(MARKER.len())
-        .position(|window| window == MARKER)?;
-    let after = &raw[marker_at..];
-    let start = after.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-    let len = after[start..].windows(2).position(|w| w == b"\r\n")?;
-    let value = std::str::from_utf8(&after[start..start + len]).ok()?;
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
+    // 逐次定位 marker：必须出现在属性边界上（`;` 或空白之后），否则
+    // `filename="model"` 这类属性会被误当成 model 字段。
+    let mut search_from = 0usize;
+    loop {
+        let rest = &raw[search_from..];
+        let marker_at = rest
+            .windows(MARKER.len())
+            .position(|window| window == MARKER)?;
+        let abs = search_from + marker_at;
+        let attr_boundary = abs == 0 || {
+            let prev = raw[abs - 1];
+            prev == b';' || prev == b' ' || prev == b'\t'
+        };
+        if attr_boundary {
+            let after = &raw[abs..];
+            let start = after.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+            let len = after[start..].windows(2).position(|w| w == b"\r\n")?;
+            let value = std::str::from_utf8(&after[start..start + len]).ok()?;
+            let value = value.trim();
+            return (!value.is_empty()).then(|| value.to_owned());
+        }
+        search_from = abs + MARKER.len();
+    }
 }
 
 /// `GET /v1/models` —— 模型清单。
@@ -565,13 +582,17 @@ fn visible_model_names(state: &AppState, principal: &Principal) -> Vec<String> {
 ///
 /// 不少 SDK 在启动时用它验证配置的模型是否存在，404 会直接卡死接入。
 fn get_model(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path!("v1" / "models" / String)
+    // 用 tail 而不是单段 String：带命名空间的模型 id（如 `openai/gpt-4o`）
+    // 含 `/`，单段匹配会 404，把 SDK 的启动校验直接卡死。
+    warp::path!("v1" / "models" / ..)
+        .and(warp::path::tail())
         .and(protocol_method(warp::http::Method::GET, Protocol::Chat))
         .and(authenticate(state.authenticator(), Protocol::Chat))
         .and(with_state(state))
         .and_then(
-            |model: String, principal: Principal, state: AppState| async move {
-                if !visible_model_names(&state, &principal).contains(&model) {
+            |tail: warp::path::Tail, principal: Principal, state: AppState| async move {
+                let model = tail.as_str().to_owned();
+                if model.is_empty() || !visible_model_names(&state, &principal).contains(&model) {
                     return Err(ProtocolRejection::reject(
                         GatewayError::not_found(format!("model `{model}` does not exist")),
                         Protocol::Chat,
@@ -2198,6 +2219,23 @@ mod tests {
             .await;
         assert_eq!(missing.status(), 404);
 
+        // 带命名空间的模型 id 含 `/`，也必须能查到（SDK 启动校验依赖）。
+        let ns_state = state_with(vec![channel_at(
+            "https://upstream.invalid",
+            Protocol::Chat,
+            &["openai/gpt-4o"],
+        )])
+        .await;
+        let ns_api = crate::routes(ns_state);
+        let namespaced = warp::test::request()
+            .method("GET")
+            .path("/v1/models/openai/gpt-4o")
+            .reply(&ns_api)
+            .await;
+        assert_eq!(namespaced.status(), 200);
+        let body: Value = serde_json::from_slice(namespaced.body()).unwrap();
+        assert_eq!(body["id"], "openai/gpt-4o");
+
         // Gemini 形状清单。
         let gemini = warp::test::request()
             .method("GET")
@@ -2240,6 +2278,10 @@ mod tests {
         assert_eq!(response.status(), 200);
         let body: Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["object"], "text_completion");
+
+        // legacy completions 的输入侧用量也要记进日志，否则计费缺口。
+        let log = only_log(&state).await;
+        assert_eq!(log.input_tokens, 4);
     }
 
     #[tokio::test]
@@ -2357,6 +2399,12 @@ mod tests {
         let no_model =
             b"--B\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nX\r\n--B--\r\n";
         assert_eq!(multipart_model(no_model), None);
+
+        // 属性边界：`filename="model"` 不能冒充 model 字段；
+        // 真正的 model 字段排在后面也要能找到。
+        let filename_trap =
+            b"--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"model\"\r\nContent-Type: application/octet-stream\r\n\r\nfake\r\n--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--B--\r\n";
+        assert_eq!(multipart_model(filename_trap).as_deref(), Some("whisper-1"));
     }
 
     #[test]

@@ -410,7 +410,8 @@ async function exportBackup() {
     a.href = url
     a.download = `refract-backup-${new Date().toISOString().slice(0, 10)}.json`
     a.click()
-    URL.revokeObjectURL(url)
+    // 下载由浏览器异步启动，立即 revoke 可能抢在它读取 blob 之前。
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
     backupNotice.value = {
       tone: 'success',
       text: '备份已下载。文件包含渠道凭据明文，请像保管密钥一样保管它。',
@@ -419,6 +420,20 @@ async function exportBackup() {
     backupNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '导出失败' }
   } finally {
     exportBusy.value = false
+  }
+}
+
+/** 下载 SQLite 在线热备（带鉴权；裸 <a href> 不带管理令牌会 401）。 */
+async function downloadDatabaseBackup() {
+  backupNotice.value = null
+  try {
+    await dataApi.backup()
+    backupNotice.value = {
+      tone: 'success',
+      text: '数据库备份已下载，包含全部请求日志，体积较大请妥善保管。',
+    }
+  } catch (e) {
+    backupNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '备份失败' }
   }
 }
 
@@ -723,14 +738,14 @@ async function runImport(payload: unknown) {
         </div>
 
         <div>
-          <a
-            :href="dataApi.backupUrl()"
-            download
+          <button
+            type="button"
             class="glass-button-ghost inline-flex items-center gap-1.5 px-3 py-2 text-sm"
+            @click="downloadDatabaseBackup"
           >
             <AppIcon name="download" :size="14" />
             下载数据库备份
-          </a>
+          </button>
         </div>
       </section>
 

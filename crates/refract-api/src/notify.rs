@@ -173,7 +173,16 @@ impl EventWorker {
         self.dedup
             .retain(|_, at| now.duration_since(*at) < DEDUP_WINDOW * 2);
 
-        send_webhook(&url, event, channel, protocol, detail).await;
+        // 投递放到独立任务里：事件循环是串行单消费者，通知端点挂 5 秒
+        // 就会把熔断/恢复事件的处置整体卡住。丢一条通知可以接受，
+        // 卡住事件流不行。
+        let url = url.to_owned();
+        let event = event.to_owned();
+        let channel = channel.to_owned();
+        let detail = detail.to_owned();
+        tokio::spawn(async move {
+            send_webhook(&url, &event, &channel, protocol, &detail).await;
+        });
     }
 }
 

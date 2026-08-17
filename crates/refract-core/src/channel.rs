@@ -444,6 +444,24 @@ pub enum ChannelError {
     /// 自定义头试图覆盖网关掌管的鉴权/传输语义头。
     #[error("extra header `{0}` is managed by the gateway and cannot be overridden")]
     ForbiddenExtraHeader(String),
+    /// 自定义头值含 CR/LF —— 会导致响应拆分/头注入，必须在保存前拒绝。
+    #[error("extra header `{0}` value must not contain CR or LF")]
+    InvalidExtraHeaderValue(String),
+    /// 端点模型条目的对外名为空。
+    #[error("endpoint `{0}` has a model entry with an empty name")]
+    EmptyModelName(Protocol),
+    /// 模型条目映射到的上游名为空（`Some("")` 与缺失同名都无效）。
+    #[error("model `{name}` maps to an empty upstream name")]
+    EmptyUpstreamMapping {
+        /// 对外模型名。
+        name: String,
+    },
+    /// 地址开了非官方模式却没给 base_url，resolve 必然失败。
+    #[error("endpoint `{0}` enables unofficial address but has no base_url")]
+    MissingUnofficialBaseUrl(Protocol),
+    /// 渠道默认地址开了非官方模式却没给 base_url。
+    #[error("channel default address enables unofficial mode but has no base_url")]
+    MissingDefaultUnofficialBaseUrl,
     /// 渠道空回复重试覆盖超出安全范围。
     #[error("{0}")]
     InvalidEmptyResponseRetry(&'static str),
@@ -491,6 +509,31 @@ impl Channel {
             if !has_own && self.credential.is_empty() {
                 return Err(ChannelError::MissingCredential(ep.protocol));
             }
+
+            for entry in &ep.models {
+                if entry.name.trim().is_empty() {
+                    return Err(ChannelError::EmptyModelName(ep.protocol));
+                }
+                if entry
+                    .upstream
+                    .as_deref()
+                    .is_some_and(|u| u.trim().is_empty())
+                {
+                    return Err(ChannelError::EmptyUpstreamMapping {
+                        name: entry.name.clone(),
+                    });
+                }
+            }
+
+            // 端点自定义了非官方地址就必须带 base_url，否则 resolve 必败。
+            // 继承渠道默认的端点由下面的渠道级检查兜住。
+            if ep.address.unofficial && base_url_missing(&ep.address) {
+                return Err(ChannelError::MissingUnofficialBaseUrl(ep.protocol));
+            }
+        }
+
+        if self.address.unofficial && base_url_missing(&self.address) {
+            return Err(ChannelError::MissingDefaultUnofficialBaseUrl);
         }
 
         if let Some(value) = &self.param_override
@@ -507,7 +550,7 @@ impl Channel {
             return Err(ChannelError::ParamOverrideNotObject(kind));
         }
 
-        for (name, _) in &self.extra_headers {
+        for (name, value) in &self.extra_headers {
             let normalized = name.trim().to_ascii_lowercase();
             if normalized.is_empty() || !normalized.bytes().all(|b| b.is_ascii_graphic()) {
                 return Err(ChannelError::InvalidExtraHeader(name.clone()));
@@ -519,6 +562,10 @@ impl Channel {
                 "authorization" | "host" | "content-length" | "content-type" | "x-api-key"
             ) {
                 return Err(ChannelError::ForbiddenExtraHeader(normalized));
+            }
+            // 值里的 CR/LF 会演变成头注入/响应拆分，一律拒绝。
+            if value.contains(['\r', '\n']) {
+                return Err(ChannelError::InvalidExtraHeaderValue(name.clone()));
             }
         }
 
@@ -567,6 +614,15 @@ impl Channel {
         }
         out
     }
+}
+
+/// 非官方地址缺可用 base_url：未填或只有空白。
+fn base_url_missing(address: &UpstreamAddress) -> bool {
+    address
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
 }
 
 #[cfg(test)]
@@ -759,6 +815,86 @@ mod tests {
         let mut ch = single(Protocol::Chat);
         ch.name = "   ".into();
         assert_eq!(ch.validate(), Err(ChannelError::EmptyName));
+    }
+
+    #[test]
+    fn model_entry_validation_catches_empty_names() {
+        let mut ch = single(Protocol::Chat);
+        ch.endpoints[0].models = vec![ModelEntry::plain("  ")];
+        assert_eq!(
+            ch.validate(),
+            Err(ChannelError::EmptyModelName(Protocol::Chat))
+        );
+
+        // 映射到空上游名同样无效（与缺失映射是两码事）。
+        let mut ch = single(Protocol::Chat);
+        ch.endpoints[0].models = vec![ModelEntry::mapped("my-model", "   ")];
+        assert_eq!(
+            ch.validate(),
+            Err(ChannelError::EmptyUpstreamMapping {
+                name: "my-model".into()
+            })
+        );
+
+        // 正常的映射不受影响。
+        let mut ok = single(Protocol::Chat);
+        ok.endpoints[0].models = vec![ModelEntry::mapped("my-model", "gpt-4o")];
+        assert_eq!(ok.validate(), Ok(()));
+    }
+
+    #[test]
+    fn unofficial_address_without_base_url_is_rejected() {
+        // 端点级非官方地址缺 base_url。
+        let mut ch = single(Protocol::Chat);
+        ch.endpoints[0].address = UpstreamAddress {
+            unofficial: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ch.validate(),
+            Err(ChannelError::MissingUnofficialBaseUrl(Protocol::Chat))
+        );
+
+        // 渠道默认非官方地址缺 base_url（端点继承它）。
+        let mut ch = single(Protocol::Chat);
+        ch.address = UpstreamAddress {
+            unofficial: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ch.validate(),
+            Err(ChannelError::MissingDefaultUnofficialBaseUrl)
+        );
+
+        // 带上 base_url 就放行。
+        let mut ok = single(Protocol::Chat);
+        ok.address = UpstreamAddress {
+            unofficial: true,
+            base_url: Some("https://relay.example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(ok.validate(), Ok(()));
+    }
+
+    #[test]
+    fn extra_header_value_with_crlf_is_rejected() {
+        let mut ch = single(Protocol::Chat);
+        ch.extra_headers = vec![("x-route".into(), "evil\r\nx-injected: 1".into())];
+        assert_eq!(
+            ch.validate(),
+            Err(ChannelError::InvalidExtraHeaderValue("x-route".into()))
+        );
+
+        let mut lf = single(Protocol::Chat);
+        lf.extra_headers = vec![("x-route".into(), "a\nb".into())];
+        assert_eq!(
+            lf.validate(),
+            Err(ChannelError::InvalidExtraHeaderValue("x-route".into()))
+        );
+
+        let mut ok = single(Protocol::Chat);
+        ok.extra_headers = vec![("x-route".into(), "value-ok".into())];
+        assert_eq!(ok.validate(), Ok(()));
     }
 
     #[test]

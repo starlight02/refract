@@ -204,7 +204,8 @@ impl ChannelRepo {
         // 动态部分只有 `?` 占位符序列，值全部走绑定，无注入面。
         let placeholders = vec!["?"; ids.len()].join(", ");
         let sql = format!(
-            "UPDATE channels SET enabled = ?, updated_at = datetime('now') \
+            // 与单条 set_enabled 一致：手动操作（无论启停）都清自动禁用标记。
+            "UPDATE channels SET enabled = ?, auto_disabled = 0, updated_at = datetime('now') \
              WHERE owner_id = ? AND id IN ({placeholders})"
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -822,6 +823,11 @@ mod tests {
         second.name = "second".into();
         let b = repo.create(&second).await.unwrap();
 
+        // 与单条 set_enabled 语义对齐：批量手动启停也要清自动禁用标记。
+        repo.set_auto_disabled(DEFAULT_OWNER_ID, a.id)
+            .await
+            .unwrap();
+
         let affected = repo
             .set_enabled_many(DEFAULT_OWNER_ID, &[a.id, b.id, 9_999], false)
             .await
@@ -830,6 +836,10 @@ mod tests {
 
         let all = repo.list(DEFAULT_OWNER_ID).await.unwrap();
         assert!(all.iter().all(|c| !c.enabled));
+        assert!(
+            all.iter().all(|c| !c.auto_disabled),
+            "批量手动禁用必须清掉 auto_disabled"
+        );
     }
 
     #[tokio::test]

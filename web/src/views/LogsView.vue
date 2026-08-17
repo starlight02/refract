@@ -98,6 +98,8 @@ const expanded = ref<Set<number>>(new Set())
 const pruneDays = ref(30)
 const pruning = ref(false)
 const pruneNotice = ref<string | null>(null)
+/** 导出失败提示。 */
+const exportNotice = ref<string | null>(null)
 
 const PROTOCOLS: Protocol[] = ['chat', 'responses', 'messages', 'gemini']
 
@@ -135,11 +137,13 @@ function resetFilter() {
 }
 
 /** 按当前筛选下载全量 NDJSON（上限 5 万行，服务端拼装）。 */
-function exportAll() {
-  const a = document.createElement('a')
-  a.href = logsApi.exportUrl(store.filter)
-  a.download = ''
-  a.click()
+async function exportAll() {
+  exportNotice.value = null
+  try {
+    await logsApi.export(store.filter)
+  } catch (e) {
+    exportNotice.value = e instanceof Error ? `导出失败：${e.message}` : '导出失败'
+  }
 }
 
 // ── 完整请求详情 ──
@@ -212,7 +216,8 @@ function exportLogs() {
   a.href = url
   a.download = `refract-logs-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
   a.click()
-  URL.revokeObjectURL(url)
+  // 下载由浏览器异步启动，立即 revoke 可能抢在它读取 blob 之前。
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
 }
 
 /** 翻页：limit 固定，只推 offset。 */
@@ -307,6 +312,7 @@ function fullTime(iso: string): string {
           </button>
         </div>
         <span v-if="pruneNotice" class="text-xs text-ink-faint">{{ pruneNotice }}</span>
+        <span v-if="exportNotice" class="text-xs text-danger">{{ exportNotice }}</span>
       </div>
     </header>
 

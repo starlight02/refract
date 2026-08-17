@@ -79,10 +79,7 @@ pub fn routes(
 /// 未启用时，任意网页可以用一个简单 GET 跨源读取 `/api/export`，把全部
 /// 上游密钥明文拖走。不发许可头，浏览器的同源策略就替我们挡住这类页面。
 fn cors_eligible(path: &str) -> bool {
-    path.starts_with("/v1/")
-        || path.starts_with("/v1beta/")
-        || path.starts_with("/health/")
-        || path == "/metrics"
+    path.starts_with("/v1/") || path.starts_with("/v1beta/") || path.starts_with("/health/")
 }
 
 /// 给网关面响应补上 CORS 头。
@@ -192,6 +189,25 @@ mod tests {
                 .headers()
                 .contains_key("access-control-allow-origin"),
             "admin preflight must not grant cross-origin access"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_never_carries_cors_headers() {
+        // Prometheus 从服务端抓取，不需要 CORS；给浏览器脚本留一个
+        // 跨源读 /metrics 的口子只会泄漏运行指标（渠道/模型标签、计数）。
+        let response = warp::test::request()
+            .method("GET")
+            .path("/metrics")
+            .header("origin", "https://evil.example")
+            .reply(&routes(test_state().await))
+            .await;
+        assert_eq!(response.status(), 200);
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin"),
+            "/metrics must not grant cross-origin access"
         );
     }
 }

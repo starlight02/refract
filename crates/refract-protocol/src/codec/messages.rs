@@ -590,10 +590,11 @@ fn decode_source(raw: Option<&Value>) -> Result<(MediaSource, Option<String>), G
             })?;
             Ok((MediaSource::FileId(id.to_owned()), mime))
         }
-        // `text` 源用于纯文本文档，内容直接在 data 里。
+        // `text` 源用于纯文本文档，data 是原文而非 base64 —— 必须用
+        // 专属变体表达，误标成 Base64 会让跨协议转码把原文当 base64 解码。
         Some("text") => {
             let data = obj.get("data").and_then(Value::as_str).unwrap_or_default();
-            Ok((MediaSource::Base64(data.to_owned()), mime))
+            Ok((MediaSource::Text(data.to_owned()), mime))
         }
         Some(other) => Err(GatewayError::invalid_request(format!(
             "unsupported source type `{other}`"
@@ -629,6 +630,12 @@ fn encode_source(source: &MediaSource, mime: Option<&str>) -> Value {
             }
         }
         MediaSource::FileId(id) => json!({ "type": "file", "file_id": id }),
+        // 回给 Anthropic 时还原成 text 源；media_type 缺失时兜底 text/plain。
+        MediaSource::Text(text) => json!({
+            "type": "text",
+            "media_type": mime.unwrap_or("text/plain"),
+            "data": text,
+        }),
     }
 }
 
@@ -1856,6 +1863,35 @@ mod tests {
                     name: Some("spec.pdf".into()),
                 },
             ]
+        );
+        let back = MESSAGES.encode_request(&ir).expect("encode");
+        assert_eq!(back["messages"], raw["messages"]);
+    }
+
+    #[test]
+    fn text_source_document_stays_plain_text() {
+        // 回归：source.type == "text" 的 document 必须映射到 MediaSource::Text，
+        // 绝不能当 base64 —— 否则跨协议转码会把原文误当 base64 解码，
+        // 回给 Anthropic 也要还原成 text 源。
+        let raw = json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "document",
+                    "source": { "type": "text", "media_type": "text/plain", "data": "hello world" },
+                    "title": "note.txt",
+                }],
+            }],
+        });
+        let ir = MESSAGES.decode_request(&raw).expect("decode");
+        assert_eq!(
+            ir.messages[0].content,
+            vec![ContentPart::File {
+                source: MediaSource::Text("hello world".into()),
+                mime: Some("text/plain".into()),
+                name: Some("note.txt".into()),
+            }]
         );
         let back = MESSAGES.encode_request(&ir).expect("encode");
         assert_eq!(back["messages"], raw["messages"]);

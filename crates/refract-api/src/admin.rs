@@ -249,6 +249,8 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                 .set_balance(refract_core::DEFAULT_OWNER_ID, id, amount)
                 .await
                 .map_err(reject)?;
+            // 余额是写路径：必须刷快照，否则实时推送与路由读到的还是旧值。
+            commit_channels(&state).await?;
             ok(serde_json::json!({ "id": id, "balance": amount }))
         });
 
@@ -586,6 +588,7 @@ pub(crate) async fn run_channel_test(
 
     // 优先级：本次请求指定 > 渠道配置的测试模型 > 端点第一个模型。
     let model = test_upstream_model(
+        channel,
         endpoint,
         req.model.as_deref().or(channel.test_model.as_deref()),
     );
@@ -630,6 +633,9 @@ pub(crate) async fn run_channel_test(
     let channel_headers = channel.extra_headers.clone();
     req.extra_headers = &channel_headers;
     req.proxy = channel.proxy.as_deref();
+    // 管理端点的同步操作：用探测超时而不是数据面的 300s，
+    // 上游挂死时让管理员拿到可读的超时错误，而不是干等。
+    req.timeout = Some(refract_upstream::probe::PROBE_TIMEOUT);
 
     let started = std::time::Instant::now();
     match state.upstream().send(req).await {
@@ -665,7 +671,11 @@ pub(crate) async fn run_channel_test(
 }
 
 /// 渠道测试必须使用真实上游模型名，而不是对外别名。
+///
+/// 别名先在被测端点上找；找不到再按路由顺序扫全渠道 —— 聚合渠道里
+/// 一个别名可能挂在别的端点上，把它的上游映射拿来才是真实流量会用的名字。
 fn test_upstream_model(
+    channel: &Channel,
     endpoint: &refract_core::ChannelEndpoint,
     requested: Option<&str>,
 ) -> String {
@@ -673,6 +683,13 @@ fn test_upstream_model(
         Some(name) => endpoint
             .find_model(name)
             .map(|entry| entry.upstream_name().to_owned())
+            .or_else(|| {
+                channel
+                    .endpoints_by_order()
+                    .iter()
+                    .find_map(|ep| ep.find_model(name))
+                    .map(|entry| entry.upstream_name().to_owned())
+            })
             // 允许管理员临时输入一个尚未保存到列表里的真实模型名。
             .unwrap_or_else(|| name.to_owned()),
         None => endpoint
@@ -853,9 +870,12 @@ fn data(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(with_state(state))
         .and_then(|state: AppState| async move {
             const MAX_INLINE_BACKUP: u64 = 512 * 1024 * 1024;
+            // 同一秒的并发请求会撞上同一个文件名，而 VACUUM INTO 在目标已存在
+            // 时直接失败 —— 加随机后缀保证唯一。
             let target = std::env::temp_dir().join(format!(
-                "refract-backup-{}.db",
-                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                "refract-backup-{}-{}.db",
+                chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+                uuid::Uuid::new_v4().simple()
             ));
             if let Err(e) = state.db().vacuum_into(&target).await {
                 let _ = tokio::fs::remove_file(&target).await;
@@ -1782,16 +1802,43 @@ mod tests {
             empty_response_retry: Default::default(),
         }
     }
-
     #[test]
     fn channel_test_resolves_model_alias_to_upstream_name() {
         let mut endpoint = ChannelEndpoint::new(Protocol::Chat);
         endpoint.models = vec![ModelEntry::mapped("public-name", "vendor/model-v2")];
+        let mut channel = sample();
+        channel.endpoints = vec![endpoint.clone()];
         assert_eq!(
-            test_upstream_model(&endpoint, Some("public-name")),
+            test_upstream_model(&channel, &endpoint, Some("public-name")),
             "vendor/model-v2"
         );
-        assert_eq!(test_upstream_model(&endpoint, None), "vendor/model-v2");
+        assert_eq!(
+            test_upstream_model(&channel, &endpoint, None),
+            "vendor/model-v2"
+        );
+    }
+
+    #[test]
+    fn channel_test_falls_back_to_other_endpoint_alias() {
+        // 聚合渠道：别名挂在另一个端点上时，也要解析出它的上游名，
+        // 而不是把别名原样发给被测端点。
+        let mut ep_a = ChannelEndpoint::new(Protocol::Chat);
+        ep_a.models = vec![ModelEntry::plain("gpt-4o")];
+        let mut ep_b = ChannelEndpoint::new(Protocol::Responses);
+        ep_b.order = 1;
+        ep_b.models = vec![ModelEntry::mapped("shared-alias", "vendor/other")];
+        let mut channel = sample();
+        channel.kind = ChannelKind::Aggregate;
+        channel.endpoints = vec![ep_a.clone(), ep_b];
+        assert_eq!(
+            test_upstream_model(&channel, &ep_a, Some("shared-alias")),
+            "vendor/other"
+        );
+        // 完全未登记的模型名照旧原样透传。
+        assert_eq!(
+            test_upstream_model(&channel, &ep_a, Some("brand-new-model")),
+            "brand-new-model"
+        );
     }
 
     #[tokio::test]
@@ -2400,6 +2447,55 @@ mod tests {
             .unwrap();
         assert!((channel.balance.unwrap() - 94.5).abs() < 1e-9);
         assert!(channel.balance_updated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn balance_probe_honors_a_path_prefixed_base() {
+        // 中转站的 base 常带路径前缀（如 `…/relay`）：账单端点必须和
+        // `/models` 同级拼出来，而不是被字符串裁剪弄丢前缀。
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/relay/v1/dashboard/billing/subscription",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "hard_limit_usd": 10.0 })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/relay/v1/dashboard/billing/usage",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "total_usage": 0.0 })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = test_state().await;
+        let mut channel = sample();
+        channel.address = UpstreamAddress {
+            unofficial: true,
+            full_address: false,
+            base_url: Some(format!("{}/relay", server.uri())),
+            version_prefix: None,
+            path: None,
+        };
+        state.channel_repo().create(&channel).await.unwrap();
+        state.reload_channels().await.unwrap();
+        let id = state.channels()[0].id;
+
+        let response = warp::test::request()
+            .method("POST")
+            .path(&format!("/api/channels/{id}/balance"))
+            .reply(&routes(state.clone()))
+            .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert!((body["data"]["balance"].as_f64().unwrap() - 10.0).abs() < 1e-9);
     }
 
     #[tokio::test]

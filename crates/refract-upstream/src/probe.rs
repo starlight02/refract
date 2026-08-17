@@ -7,10 +7,19 @@
 //! 四家的列表接口形状不同，但都能归一成「一串模型 ID」。归一化在这里做，
 //! 而不是留给调用方 `match` 协议 —— 那样每个调用点都要重复一次。
 
+use std::time::Duration;
+
 use refract_core::{Credential, ErrorKind, GatewayError, Protocol, UpstreamAddress};
 use serde_json::Value;
 
 use crate::client::{UpstreamClient, UpstreamRequest};
+
+/// 探测类操作（拉模型列表、查余额）的专用超时。
+///
+/// 不能复用数据面的 300s 整体超时：这些是管理端点的同步操作，UI 在等结果，
+/// 让管理员盯着一张转 5 分钟的卡片没有任何意义。列表/余额接口本身毫秒级，
+/// 30s 足够覆盖慢速中转站，同时把「上游挂了」从漫长等待变成可读的错误。
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 一个探测到的模型。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -40,6 +49,7 @@ pub async fn probe_models(
 ) -> Result<Vec<ModelProbe>, GatewayError> {
     let mut request = UpstreamRequest::list_models(protocol, address, credential);
     request.proxy = proxy;
+    request.timeout = Some(PROBE_TIMEOUT);
     let response = client.send(request).await?;
     parse_model_list(protocol, &response.body)
 }
@@ -64,20 +74,24 @@ pub async fn probe_balance(
         ));
     }
 
-    // 复用模型列表的地址解析拿到 `{base}{prefix}/models`，再替换端点段 ——
+    // 复用模型列表的地址解析，再用 `Url::join` 把末段 `models` 换成账单端点 ——
     // 这样自定义 base/前缀（中转站带路径前缀是常态）自然生效。
+    // 不能用 `trim_end_matches("/models")` 手工切：它对 `…/models/models` 会
+    // 过度剥离，也处理不了查询串。相对路径 join 恰好替换最后一个路径段，
+    // 语义正是「和 /models 同级的兄弟端点」。
     let models_url = address
         .resolve(protocol, refract_core::Action::ListModels, "")
         .map_err(|e| GatewayError::new(ErrorKind::Configuration, e.to_string()))?;
-    let base = models_url
-        .as_str()
-        .trim_end_matches('/')
-        .trim_end_matches("/models")
-        .to_owned();
+    let join_sibling = |segment: &str| -> Result<String, GatewayError> {
+        models_url
+            .join(segment)
+            .map(|u| u.to_string())
+            .map_err(|e| GatewayError::new(ErrorKind::Configuration, e.to_string()))
+    };
 
     let subscription: Value = fetch_billing_json(
         client,
-        &format!("{base}/dashboard/billing/subscription"),
+        &join_sibling("dashboard/billing/subscription")?,
         credential,
         proxy,
     )
@@ -100,7 +114,9 @@ pub async fn probe_balance(
         .to_string();
     let usage: Value = fetch_billing_json(
         client,
-        &format!("{base}/dashboard/billing/usage?start_date={start}&end_date={end}"),
+        &join_sibling(&format!(
+            "dashboard/billing/usage?start_date={start}&end_date={end}"
+        ))?,
         credential,
         proxy,
     )
@@ -119,7 +135,9 @@ async fn fetch_billing_json(
     credential: &Credential,
     proxy: Option<&str>,
 ) -> Result<Value, GatewayError> {
-    let response = client.get_json(url, credential, proxy).await?;
+    let response = client
+        .get_json(url, credential, proxy, PROBE_TIMEOUT)
+        .await?;
     Ok(response)
 }
 

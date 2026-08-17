@@ -266,7 +266,18 @@ async fn bridge(
             },
             outbound = upstream.next() => match outbound {
                 Some(Ok(tungstenite::Message::Close(frame))) => {
-                    client_closed_clean = true;
+                    let code = frame.as_ref().map_or(1000, |f| u16::from(f.code));
+                    // 只有正常结束类关闭（1000/1001）算干净收尾；上游用
+                    // 1011 之类的异常码断开时，会话日志里必须留痕，
+                    // 不能记成 200 成功。
+                    client_closed_clean = matches!(code, 1000 | 1001);
+                    if !client_closed_clean {
+                        tracing::debug!(
+                            code,
+                            reason = %frame.as_ref().map_or("", |f| f.reason.as_str()),
+                            "realtime upstream closed session abnormally"
+                        );
+                    }
                     let message = match frame {
                         Some(frame) => warp::ws::Message::close_with(
                             u16::from(frame.code),

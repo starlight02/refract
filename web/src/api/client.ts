@@ -190,6 +190,52 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   }
 }
 
+/**
+ * 带管理令牌的附件下载。
+ *
+ * 为什么不用 `<a href download>`：浏览器跳转不带自定义请求头，管理令牌
+ * 一旦启用，裸链接就会 401 —— 导出/备份必须在 fetch 里走鉴权。
+ *
+ * 文件名优先取 `content-disposition`（服务端生成、含时间戳），
+ * 拿不到时退回调用方给的默认名。
+ */
+export async function download(path: string, fallbackName: string): Promise<void> {
+  const headers: Record<string, string> = {}
+  const token = getAdminToken()
+  if (token) headers['x-admin-token'] = token
+
+  let response: Response
+  try {
+    response = await fetch(path, { headers })
+  } catch (e) {
+    window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
+    throw new ApiError(0, 'backend_unavailable', '后端不可达，请稍后重试', String(e))
+  }
+
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+    }
+    let message = `${response.status} ${response.statusText}`
+    try {
+      message = ((await response.json()) as ErrorEnvelope).message ?? message
+    } catch {
+      /* 非 JSON 错误体：保留状态行 */
+    }
+    throw new ApiError(response.status, 'download_failed', message)
+  }
+
+  const disposition = response.headers.get('content-disposition') ?? ''
+  const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1] ?? fallbackName
+  const url = URL.createObjectURL(await response.blob())
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  // 下载是异步启动的：立刻 revoke 可能抢在浏览器读取 blob 之前。
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
 /** 仅把 URL 查询串支持的标量写进去；拒绝对象被悄悄编码成 `[object Object]`。 */
 function query(params: object): string {
   const search = new URLSearchParams()
@@ -266,8 +312,9 @@ export const logs = {
     request<ChannelStat[]>('GET', `/api/stats/channels${query({ hours })}`),
   timeseries: (hours = 24, bucket: 'hour' | 'day' = 'hour') =>
     request<TimeBucket[]>('GET', `/api/stats/timeseries${query({ hours, bucket })}`),
-  /** 按当前筛选导出 NDJSON 的地址（供 <a download> 使用）。 */
-  exportUrl: (filter: LogFilter = {}) => `/api/logs/export${query(filter)}`,
+  /** 按当前筛选导出 NDJSON（带鉴权下载）。 */
+  export: (filter: LogFilter = {}) =>
+    download(`/api/logs/export${query(filter)}`, 'refract-logs.ndjson'),
 }
 
 /** 运行时设置。 */
@@ -310,8 +357,8 @@ export const data = {
       'GET',
       '/api/data/stats',
     ),
-  /** 在线备份的下载地址（供 <a download> 使用）。 */
-  backupUrl: () => '/api/data/backup',
+  /** 在线备份（带鉴权下载，VACUUM INTO 产物）。 */
+  backup: () => download('/api/data/backup', 'refract-backup.db'),
 }
 
 export const health = {

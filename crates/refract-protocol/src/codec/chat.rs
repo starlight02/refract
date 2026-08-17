@@ -1211,10 +1211,16 @@ impl ProtocolCodec for ChatCodec {
 /// 一个工具调用槽的累积状态。
 #[derive(Default)]
 struct ToolSlot {
-    /// 是否已产出过 [`StreamEvent::ToolCallStart`]。
-    started: bool,
-    /// 是否已经拿到过非空的工具名。
-    named: bool,
+    /// 是否见过该工具的任何帧。
+    seen: bool,
+    /// 是否已产出 [`StreamEvent::ToolCallStart`]。
+    declared: bool,
+    /// 累积的调用 id（取最后一个非空值）。
+    id: String,
+    /// 累积的函数名：少数中转站把 name 切成多帧发送，必须拼回完整名。
+    name: String,
+    /// 名字就位前先到达的 arguments 片段，随声明一并补发。
+    pending_args: Vec<String>,
 }
 
 /// 流式解码器（有状态）。
@@ -1248,6 +1254,32 @@ impl ChatStreamDecoder {
             self.tools.push(ToolSlot::default());
         }
         &mut self.tools[ti]
+    }
+
+    /// 为出现过但从未声明过的工具槽补发 [`StreamEvent::ToolCallStart`]。
+    ///
+    /// 无参调用（`arguments` 始终为空）不会在 decode 阶段触发声明，必须在流
+    /// 终结前补上，否则下游永远看不到这条工具调用。
+    fn flush_undeclared_tools(&mut self, out: &mut Vec<StreamEvent>) {
+        for (ti, slot) in self.tools.iter_mut().enumerate() {
+            if slot.seen && !slot.declared {
+                slot.declared = true;
+                let index = TOOL_INDEX_BASE + ti as u32;
+                out.push(StreamEvent::ToolCallStart {
+                    index,
+                    id: slot.id.clone(),
+                    name: slot.name.clone(),
+                    signature: None,
+                });
+                // 畸形流里参数可能先于名字（甚至没有名字）到达，一并补发。
+                for frag in std::mem::take(&mut slot.pending_args) {
+                    out.push(StreamEvent::ToolCallArgsDelta {
+                        index,
+                        fragment: frag,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1286,7 +1318,10 @@ impl StreamDecoder for ChatStreamDecoder {
         }
         if data == DONE_SENTINEL {
             self.done = true;
-            return Ok(vec![StreamEvent::Done]);
+            let mut out = Vec::new();
+            self.flush_undeclared_tools(&mut out);
+            out.push(StreamEvent::Done);
+            return Ok(out);
         }
 
         let chunk: Value = match serde_json::from_str(data) {
@@ -1382,45 +1417,71 @@ impl StreamDecoder for ChatStreamDecoder {
                     for call in calls {
                         let ti = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                         let ir_index = TOOL_INDEX_BASE + ti as u32;
-                        let id = call
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned();
                         let function = call.get("function");
-                        let name = function
-                            .and_then(|f| f.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned();
-
-                        // 首帧开头；少数中转站把 name 拖到第二帧才发，那时补一条
-                        // 让下游能对齐 —— 但不重复补，否则下游会开两个块。
-                        let (first, needs_name) = {
-                            let slot = self.slot(ti);
-                            let first = !slot.started;
-                            let needs_name = !slot.named && !name.is_empty();
-                            slot.started = true;
-                            slot.named |= !name.is_empty();
-                            (first, needs_name)
-                        };
-                        if first || needs_name {
-                            out.push(StreamEvent::ToolCallStart {
-                                index: ir_index,
-                                id,
-                                name,
-                                signature: None,
-                            });
-                        }
-
-                        if let Some(args) = function
+                        let args = function
                             .and_then(|f| f.get("arguments"))
                             .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                        {
+                            .unwrap_or_default()
+                            .to_owned();
+
+                        // id/name/arguments 都可能被中转站拆帧送达。按槽累积
+                        // id 与 name，每个槽只声明一次 ToolCallStart：优先在
+                        // 首个非空 arguments 且 name 已就位时声明（正常顺序）；
+                        // 参数先于名字到达的畸形流先暂存参数，name 到位再连同
+                        // Start 一起补发；流终结时 flush 兜底。
+                        let mut pending = Vec::new();
+                        let emit = {
+                            let slot = self.slot(ti);
+                            slot.seen = true;
+                            if let Some(id) = call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
+                                slot.id = id.to_owned();
+                            }
+                            if let Some(name) = function
+                                .and_then(|f| f.get("name"))
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
+                                slot.name.push_str(name);
+                            }
+                            if !slot.declared && !args.is_empty() {
+                                if slot.name.is_empty() {
+                                    // 名字还没到：暂存，等声明时补发。
+                                    slot.pending_args.push(args.clone());
+                                    false
+                                } else {
+                                    slot.declared = true;
+                                    pending = std::mem::take(&mut slot.pending_args);
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        };
+                        if emit {
+                            let slot = self.slot(ti);
+                            out.push(StreamEvent::ToolCallStart {
+                                index: ir_index,
+                                id: slot.id.clone(),
+                                name: slot.name.clone(),
+                                signature: None,
+                            });
+                            for frag in pending {
+                                out.push(StreamEvent::ToolCallArgsDelta {
+                                    index: ir_index,
+                                    fragment: frag,
+                                });
+                            }
+                        }
+                        if !args.is_empty() && self.tools[ti].declared {
+                            // 已声明才直接发；未声明的要么进了 pending_args，
+                            // 要么留待 flush，重复发会乱序。
                             out.push(StreamEvent::ToolCallArgsDelta {
                                 index: ir_index,
-                                fragment: args.to_owned(),
+                                fragment: args,
                             });
                         }
                     }
@@ -1428,6 +1489,8 @@ impl StreamDecoder for ChatStreamDecoder {
             }
 
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                // 未声明的工具槽必须先于 Stop 补声明，否则下游见不到它们。
+                self.flush_undeclared_tools(&mut out);
                 out.push(StreamEvent::Stop {
                     reason: finish_reason_to_ir(reason),
                     // Chat 不回报命中了哪条停止序列。
@@ -1449,7 +1512,10 @@ impl StreamDecoder for ChatStreamDecoder {
         }
         // 上游断流没发 [DONE] 时也要给下游一个终结事件，否则编码器不会收尾。
         self.done = true;
-        Ok(vec![StreamEvent::Done])
+        let mut out = Vec::new();
+        self.flush_undeclared_tools(&mut out);
+        out.push(StreamEvent::Done);
+        Ok(out)
     }
 }
 
@@ -2717,6 +2783,132 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn stream_emits_single_start_when_name_split_across_chunks() {
+        // 回归：name 被中转站拆到后续帧时，必须累积拼回后只补发一条 Start，
+        // 不能每帧都补 —— 重复 Start 会让下游编码器开两个块。
+        let events = decode_stream(&[
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"call_x","type":"function",
+                 "function":{"name":"get_","arguments":""}}]}}]}"#,
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"name":"weather","arguments":"{\"ci"}}]}}]}"#,
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"ty\":1}"}}]}}]}"#,
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+
+        // 只允许一条 Start，且 name 是拼接后的完整名。
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+            .collect();
+        assert_eq!(starts.len(), 1, "每个工具只应产出一条 Start：{events:?}");
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Start {
+                    id: "c".into(),
+                    model: "m".into(),
+                    usage: None
+                },
+                StreamEvent::ToolCallStart {
+                    signature: None,
+                    index: 1,
+                    id: "call_x".into(),
+                    name: "get_weather".into(),
+                },
+                StreamEvent::ToolCallArgsDelta {
+                    index: 1,
+                    fragment: "{\"ci".into()
+                },
+                StreamEvent::ToolCallArgsDelta {
+                    index: 1,
+                    fragment: "ty\":1}".into()
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    stop_sequence: None
+                },
+                StreamEvent::Done,
+            ]
+        );
+
+        // name 完全迟到（首帧只有 id + arguments）时也一样：参数先暂存，
+        // 名字到达后连同 Start 一起补发，全程只有一条 Start。
+        let late = decode_stream(&[
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"call_y","type":"function",
+                 "function":{"arguments":"{"}}]}}]}"#,
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"name":"fn","arguments":"}"}}]}}]}"#,
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        assert_eq!(
+            late,
+            vec![
+                StreamEvent::Start {
+                    id: "c".into(),
+                    model: "m".into(),
+                    usage: None
+                },
+                StreamEvent::ToolCallStart {
+                    signature: None,
+                    index: 1,
+                    id: "call_y".into(),
+                    name: "fn".into(),
+                },
+                // 先到的 "{" 随声明补发，顺序不乱。
+                StreamEvent::ToolCallArgsDelta {
+                    index: 1,
+                    fragment: "{".into()
+                },
+                StreamEvent::ToolCallArgsDelta {
+                    index: 1,
+                    fragment: "}".into()
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    stop_sequence: None
+                },
+                StreamEvent::Done,
+            ]
+        );
+
+        // 无参调用（arguments 始终为空）：declare 永远等不到触发，
+        // 必须由流终结前的 flush 补发 Start，否则下游看不到这条调用。
+        let no_args = decode_stream(&[
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"call_z","type":"function",
+                 "function":{"name":"ping","arguments":""}}]}}]}"#,
+            r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        assert!(
+            no_args.contains(
+                &(StreamEvent::ToolCallStart {
+                    signature: None,
+                    index: 1,
+                    id: "call_z".into(),
+                    name: "ping".into(),
+                })
+            ),
+            "无参工具也要声明：{no_args:?}"
+        );
+        // flush 必须先于 Stop，否则下游编码器来不及把块合进响应。
+        let start_pos = no_args
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+            .unwrap();
+        let stop_pos = no_args
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Stop { .. }))
+            .unwrap();
+        assert!(start_pos < stop_pos, "Start 必须先于 Stop：{no_args:?}");
     }
 
     #[test]

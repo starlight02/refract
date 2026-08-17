@@ -261,25 +261,23 @@ impl UpstreamClient {
         &self.config
     }
 
-    /// 发送一次非流式请求。
-    ///
-    /// 上游的非 2xx 响应会被转成 [`GatewayError`]，并带上原始状态码与响应体
-    /// —— 上层要用它们决定是否重试，也要把上游的错误信息展示给客户端。
     /// 对任意 URL 发一个带 Bearer 鉴权的 GET 并解析 JSON。
     ///
     /// 面向余额探测这类**非协议标准端点**的辅助调用 —— 地址不经
     /// `UpstreamAddress::resolve` 的形状校验，调用方自己对 URL 负责。
+    /// `timeout` 由调用方定：这类辅助调用的合理时长与数据面请求不同。
     pub async fn get_json(
         &self,
         url: &str,
         credential: &Credential,
         proxy: Option<&str>,
+        timeout: Duration,
     ) -> Result<serde_json::Value, GatewayError> {
         let http = self.http_for(proxy)?;
         let response = http
             .get(url)
             .headers(auth_headers(Protocol::Chat, credential)?)
-            .timeout(self.config.timeout)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| classify_transport_error(&e, "upstream request failed"))?;
