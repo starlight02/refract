@@ -1,6 +1,6 @@
 ARG NPM_REGISTRY=https://registry.npmjs.org
 ARG ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
-FROM node:24-alpine AS web-builder
+FROM node:26-alpine AS web-builder
 ARG NPM_REGISTRY
 WORKDIR /build/web
 RUN npm install -g pnpm@11.21.0 --registry="$NPM_REGISTRY" && \
