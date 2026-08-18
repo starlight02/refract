@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { fileURLToPath, URL } from 'node:url'
 import { constants as zlibConstants } from 'node:zlib'
 
@@ -6,10 +7,15 @@ import tailwindcss from '@tailwindcss/vite'
 import { compression, defineAlgorithm } from 'vite-plugin-compression2'
 import { configDefaults, defineConfig } from 'vite-plus'
 
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8'))
+
 // Vue 3.6 Vapor Mode：编译期去掉虚拟 DOM，直接生成命令式的 DOM 更新代码。
 // 对这个项目的意义很实在 —— 日志页会渲染上千行、渠道列表会频繁增删，
 // Vapor 让这些列表的更新不用先构造再 diff 一棵虚拟树。
 export default defineConfig({
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
   fmt: {
     semi: false,
     singleQuote: true,

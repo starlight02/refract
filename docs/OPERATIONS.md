@@ -159,6 +159,40 @@ curl --fail http://127.0.0.1:3939/health/ready
 
 Database migrations run when Refract opens the database. To roll back across a schema change, restore the matching pre-upgrade backup together with the previous image; do not run an older binary against a newly migrated database unless that release explicitly documents compatibility.
 
+## Release process and versioning
+
+Refract uses **lockstep semantic versioning** across all 7 workspace crates and the embedded Vue frontend. `[workspace.package].version` in `Cargo.toml` is the single source of truth.
+
+### Bumping versions
+
+To prepare a release, run either the helper script or `cargo-release`:
+
+```sh
+# Using the built-in helper script:
+./scripts/bump-version.sh patch          # 0.1.0 -> 0.1.1
+./scripts/bump-version.sh minor          # 0.1.0 -> 0.2.0
+./scripts/bump-version.sh minor --tag    # Bump, sign commit, and sign tag
+
+# Or using cargo-release (if installed):
+cargo release patch --execute
+```
+
+This automatically syncs `Cargo.toml`, `Cargo.lock`, `package.json`, and `web/package.json`, and rebuilds frontend version definitions.
+
+### Triggering CI builds
+
+Push the signed tag to trigger the GitHub Actions release workflow:
+
+```sh
+git push origin main --tags
+```
+
+The `.github/workflows/release.yml` pipeline will:
+1. Build the production web bundle once;
+2. Compile native release binaries for Linux (x64/arm64 musl), macOS (Intel/Apple Silicon), and Windows;
+3. Publish GitHub Release tarballs and auto-generated release notes;
+4. Build and push multi-arch container images to `ghcr.io`.
+
 ## Reverse proxy
 
 Terminate TLS at a trusted reverse proxy and preserve streaming semantics: disable response buffering, allow long request durations, and do not compress or coalesce server-sent events. Keep the Refract listener private. The built-in non-loopback guard is a last line of defense, not a substitute for network access controls.

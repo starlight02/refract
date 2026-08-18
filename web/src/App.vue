@@ -132,9 +132,8 @@ const mobileNavItems = [
   { name: 'keys', label: 'API 密钥', icon: 'key' },
   { name: 'settings', label: '设置', icon: 'settings' },
 ] as const
-// 版本号写死在这里：vite.config.ts 没有注入 __APP_VERSION__ 之类的构建期全局，
-// 引用不存在的全局会在运行时直接 ReferenceError。
-const version = '0.1.0'
+// 版本号由 vite.config.ts 在构建期从 web/package.json 注入，与后端版本同步演进。
+const version = __APP_VERSION__
 </script>
 
 <template>
