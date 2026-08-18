@@ -136,7 +136,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: binary-${{ matrix.target }}
+          name: binary-${{ matrix.target }}
           path: dist
       - uses: actions/download-artifact@v4
         with:
