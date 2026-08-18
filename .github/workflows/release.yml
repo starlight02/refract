@@ -111,33 +111,82 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
+  # 双平台镜像 = 两台原生 runner 各自组装 + 合并多架构清单，
+  # 全程无 QEMU：binaries 已在原生架构下编好 musl 二进制（前端已内嵌），
+  # 镜像只做 alpine 底座 + COPY。单 job 双平台方案会让 arm64 stage
+  # 在 amd64 runner 上走 QEMU 模拟，既慢又会 OOM。
   image:
-    name: Publish container image
+    name: Container image (${{ matrix.arch }})
     needs: [binaries]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
-      # 复用 binaries job 已编好的 musl 二进制（前端已内嵌）：
-      # Docker 只做 alpine 底座 + COPY，绝不在 QEMU 模拟下编译，
-      # 否则 tsgolint/cargo 会 OOM 且要多花十几分钟。
       - uses: actions/download-artifact@v4
         with:
-          pattern: binary-*
-          merge-multiple: true
+          pattern: binary-${{ matrix.target }}
           path: dist
       - uses: actions/download-artifact@v4
         with:
           name: web-dist
           path: web-dist/web/dist
       - run: |
-          mkdir -p bin/amd64 bin/arm64
-          tar xzf dist/refract-*-x86_64-unknown-linux-musl.tar.gz -C bin/amd64
-          tar xzf dist/refract-*-aarch64-unknown-linux-musl.tar.gz -C bin/arm64
-      - uses: docker/setup-qemu-action@v4
+          mkdir -p bin/${{ matrix.arch }}
+          tar xzf dist/refract-*.tar.gz -C bin/${{ matrix.arch }}
       - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},suffix=-${{ matrix.arch }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.arch }}
+            type=raw,value=latest-${{ matrix.arch }},enable=${{ !contains(github.ref_name, '-') }}
+            type=sha,suffix=-${{ matrix.arch }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            web_src=web-dist
+            bin_src=bin
+            NPM_REGISTRY=https://registry.npmjs.org
+            ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
+          build-contexts: |
+            bin=./bin
+            web-dist=./web-dist
+          cache-from: type=gha,scope=refract-release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=refract-release-${{ matrix.arch }}
+
+  # 把两份单架构镜像合并成多架构清单（纯 manifest 操作，不需要本机执行）。
+  image-manifest:
+    name: Merge multi-arch manifest
+    needs: [image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -152,20 +201,10 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
             type=sha
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            web_src=web-dist
-            bin_src=bin
-            NPM_REGISTRY=https://registry.npmjs.org
-            ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
-          build-contexts: |
-            bin=./bin
-            web-dist=./web-dist
-          cache-from: type=gha,scope=refract-release
-          cache-to: type=gha,mode=max,scope=refract-release
+      - name: Create manifest lists
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
+          done
