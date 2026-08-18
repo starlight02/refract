@@ -7,17 +7,18 @@ use std::time::Duration;
 
 use refract_core::{
     Channel, ChannelEndpoint, ChannelKind, Credential, EmptyResponseRetryOverride,
-    EmptyResponseRetryPolicy, ErrorKind, ModelEntry, Protocol, ProtocolSet, RoutingPolicy,
-    TranscodePolicy, UpstreamAddress,
+    EmptyResponseRetryPolicy, ErrorKind, KeyStrategy, ModelEntry, Protocol, ProtocolSet,
+    RoutingPolicy, TranscodePolicy, UpstreamAddress,
 };
 use refract_protocol::codec::CodecSet;
 use refract_protocol::ir::{Message, Role, UnifiedRequest};
 use refract_router::{
-    InboundPayload, RouteExecutor, RoutePlanner, RoutedResponse, RoutedStream, RouterConfig,
+    AffinityContext, AffinityEngine, InboundPayload, RouteExecutor, RoutePlanner, RoutedResponse,
+    RoutedStream, RouterConfig,
 };
 use refract_store::{BreakerPolicy, Database, HealthRepo};
 use serde_json::json;
-use wiremock::matchers::method;
+use wiremock::matchers::{header, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn upstream_client() -> refract_upstream::UpstreamClient {
@@ -66,6 +67,8 @@ fn channel(id: i64, name: &str, priority: i32, endpoints: Vec<ChannelEndpoint>) 
         priority,
         weight: 1,
         credential: Credential::new("sk-test"),
+        credentials: Vec::new(),
+        key_strategy: Default::default(),
         address: UpstreamAddress::default(),
         endpoints,
         tags: Vec::new(),
@@ -2162,4 +2165,284 @@ async fn forwarded_headers_do_not_leak_into_transcoded_calls() {
         .await
         .unwrap();
     assert!(matches!(outcome.payload, RoutedResponse::Transcoded(_)));
+}
+
+/// 多密钥池：上游逐 key 返回 401，执行器在同一渠道内轮转密钥，最后一把成功，
+/// 全程不滑落备用渠道，且中间的单 key 失败不记渠道健康。
+#[tokio::test]
+async fn multi_key_pool_rotates_through_bad_keys_inside_one_channel() {
+    let server = MockServer::start().await;
+    // 前两把 key 返回 401，第三把成功。
+    Mock::given(method("POST"))
+        .and(header("authorization", "Bearer sk-bad-one"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error": "bad key 1"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("authorization", "Bearer sk-bad-two"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error": "bad key 2"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("authorization", "Bearer sk-good-key-here"))
+        .respond_with(chat_ok("from-good-key"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(chat_ok("from-backup"))
+        .expect(0)
+        .mount(&backup)
+        .await;
+
+    let mut primary = channel(
+        1,
+        "primary",
+        10,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &server.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    );
+    primary.credential = Credential::new("sk-bad-one");
+    primary.credentials = vec![
+        Credential::new("sk-bad-two"),
+        Credential::new("sk-good-key-here"),
+    ];
+    primary.key_strategy = KeyStrategy::RoundRobin;
+
+    let channels = vec![
+        primary,
+        channel(
+            2,
+            "backup",
+            0,
+            vec![endpoint(
+                Protocol::Chat,
+                0,
+                &backup.uri(),
+                ProtocolSet::EMPTY,
+            )],
+        ),
+    ];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health.clone(),
+        RouterConfig::default(),
+    );
+
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let outcome = exec.execute(&route, &ir_request()).await.unwrap();
+
+    assert_eq!(outcome.channel_id, 1, "must win inside the primary channel");
+    assert_eq!(outcome.attempts, 3, "two bad keys then the good one");
+    assert_eq!(
+        outcome.credential_hint.as_deref(),
+        Some(Credential::new("sk-good-key-here").masked().as_str()),
+        "success must report the key that actually worked"
+    );
+
+    // 中间的两把坏 key 不该把整条渠道停职：健康里没有失败记录。
+    let h = health.get(1, Protocol::Chat).await.unwrap();
+    assert!(
+        h.is_none() || h.unwrap().total_failures == 0,
+        "per-key failures must not record channel health"
+    );
+}
+
+/// 密钥池全灭：聚合错误降级为渠道级失败，滑落到备用渠道。
+#[tokio::test]
+async fn exhausted_key_pool_falls_over_to_backup_channel() {
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error": "invalid key"})))
+        .expect(2)
+        .mount(&primary)
+        .await;
+
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(chat_ok("from-backup"))
+        .expect(1)
+        .mount(&backup)
+        .await;
+
+    let mut ch = channel(
+        1,
+        "primary",
+        10,
+        vec![endpoint(
+            Protocol::Chat,
+            0,
+            &primary.uri(),
+            ProtocolSet::EMPTY,
+        )],
+    );
+    ch.credential = Credential::new("sk-dead-one");
+    ch.credentials = vec![Credential::new("sk-dead-two")];
+    ch.key_strategy = KeyStrategy::RoundRobin;
+
+    let channels = vec![
+        ch,
+        channel(
+            2,
+            "backup",
+            0,
+            vec![endpoint(
+                Protocol::Chat,
+                0,
+                &backup.uri(),
+                ProtocolSet::EMPTY,
+            )],
+        ),
+    ];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health.clone(),
+        RouterConfig::default(),
+    );
+
+    let planner = RoutePlanner::default();
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let outcome = exec.execute(&route, &ir_request()).await.unwrap();
+
+    assert_eq!(
+        outcome.channel_id, 2,
+        "exhausted pool must fall over to backup"
+    );
+    assert_eq!(outcome.attempts, 3, "two dead keys then the backup channel");
+
+    // 池耗尽是渠道级失败：必须记进健康度。
+    let h = health.get(1, Protocol::Chat).await.unwrap().unwrap();
+    assert!(
+        h.total_failures >= 1,
+        "exhausted pool must count as channel failure"
+    );
+}
+
+/// 亲和性完整回路：首次 miss → 记录绑定 → 次轮同身份命中，`pin_channel`
+/// 把绑定渠道提为第一候选，即使轮询游标本应轮到另一条渠道。
+#[tokio::test]
+async fn affinity_binding_pins_route_to_previously_successful_channel() {
+    let first_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(chat_ok("from-first"))
+        .mount(&first_server)
+        .await;
+    let second_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(chat_ok("from-second"))
+        .mount(&second_server)
+        .await;
+
+    // 同优先级 + 轮询：不钉住时两次请求会轮流命中两条渠道。
+    let channels = vec![
+        channel(
+            1,
+            "one",
+            0,
+            vec![endpoint(
+                Protocol::Chat,
+                0,
+                &first_server.uri(),
+                ProtocolSet::EMPTY,
+            )],
+        ),
+        channel(
+            2,
+            "two",
+            0,
+            vec![endpoint(
+                Protocol::Chat,
+                0,
+                &second_server.uri(),
+                ProtocolSet::EMPTY,
+            )],
+        ),
+    ];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        RouterConfig::default(),
+    );
+    let planner = RoutePlanner::new(RoutingPolicy {
+        selection: refract_core::SelectionMode::RoundRobin,
+        ..Default::default()
+    });
+
+    let engine = AffinityEngine::new();
+    engine.load(refract_core::AffinitySettings {
+        enabled: true,
+        rules: vec![refract_core::AffinityRule {
+            name: "by-api-key".into(),
+            model_regex: String::new(),
+            path_regex: String::new(),
+            sources: vec![refract_core::AffinityKeySource::ApiKeyId],
+            value_regex: String::new(),
+            ttl_secs: Some(300),
+            include_model: true,
+            skip_retry_on_failure: false,
+        }],
+        ..Default::default()
+    });
+
+    let headers = http::HeaderMap::new();
+    let ctx = AffinityContext {
+        model: "gpt-4o",
+        path: "/v1/chat/completions",
+        api_key_id: Some(42),
+        headers: &headers,
+        body: None,
+    };
+
+    // 首次：无绑定，正常路由；成功后记录绑定。
+    let decision = engine.resolve(&ctx).expect("rule must match");
+    assert_eq!(decision.binding, None, "first request has no binding yet");
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    let first = exec.execute(&route, &ir_request()).await.unwrap();
+    engine.record(&decision, first.channel_id);
+
+    // 次轮：同身份命中绑定；轮询游标本应轮到另一条渠道。
+    let decision = engine.resolve(&ctx).expect("rule must match");
+    assert_eq!(
+        decision.binding,
+        Some(first.channel_id),
+        "same identity must pin"
+    );
+    let mut route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+    assert_ne!(
+        route.attempts[0].channel_id(),
+        first.channel_id,
+        "round-robin would rotate to the other channel without pinning"
+    );
+    assert!(
+        route.pin_channel(decision.binding.unwrap()),
+        "bound channel must exist in the plan"
+    );
+    assert_eq!(
+        route.attempts[0].channel_id(),
+        first.channel_id,
+        "pinned channel must be tried first"
+    );
+    let second = exec.execute(&route, &ir_request()).await.unwrap();
+    assert_eq!(
+        second.channel_id, first.channel_id,
+        "pinned channel must be tried first"
+    );
 }

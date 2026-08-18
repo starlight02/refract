@@ -24,6 +24,9 @@ export interface UpstreamAddress {
 /** 后端 Credential 被序列化为透明字符串。 */
 export type Credential = string
 
+/** 渠道多密钥池的使用策略。 */
+export type KeyStrategy = 'sticky' | 'round_robin' | 'random'
+
 // ── 协议转换策略 ──
 
 export interface TranscodePolicy {
@@ -76,6 +79,10 @@ export interface Channel {
   priority: number
   weight: number
   credential: Credential
+  /** 附加密钥池：每行一把钥匙，与主密钥一起构成轮换池（为空时后端省略该字段）。 */
+  credentials?: Credential[]
+  /** 多密钥池策略。 */
+  key_strategy: KeyStrategy
   address: UpstreamAddress
   endpoints: ChannelEndpoint[]
   tags: string[]
@@ -169,6 +176,10 @@ export interface RequestLog {
   cost: number
   error_kind?: string | null
   error_message?: string | null
+  /** 实际使用的上游钥匙的脱敏提示（如 `sk-a…9f2c`）。 */
+  credential_hint?: string | null
+  /** 命中并已使用的亲和规则名。 */
+  affinity_rule?: string | null
   /** 请求正文快照。仅单条详情接口返回。 */
   request_body?: string | null
   /** 响应正文快照（流式为聚合文本）。仅单条详情接口返回。 */
@@ -329,4 +340,62 @@ export interface ChannelTestResult {
   upstream_status?: number | null
   /** 测试请求耗时（毫秒）。 */
   latency_ms?: number
+}
+
+// ── 渠道亲和性 ──
+
+/** 身份值来源。与后端 `AffinityKeySource` 的内部标记表示一致。 */
+export type AffinityKeySource =
+  | { kind: 'api_key_id' }
+  | { kind: 'header'; name: string }
+  | { kind: 'body'; path: string }
+
+/** 一条亲和规则。 */
+export interface AffinityRule {
+  /** 规则名：缓存键的一部分，保存时要求唯一。 */
+  name: string
+  /** 仅对匹配的模型生效（正则）。空串 = 全部模型。 */
+  model_regex: string
+  /** 仅对匹配的入站路径生效（正则）。空串 = 全部路径。 */
+  path_regex: string
+  /** 身份值来源，按顺序求值，首个能取到非空值者生效。 */
+  sources: AffinityKeySource[]
+  /** 对取到的身份值再做一次正则筛选（空串 = 不过滤）。 */
+  value_regex: string
+  /** 绑定存活秒数；缺省用全局 default_ttl_secs。 */
+  ttl_secs?: number | null
+  /** 缓存键是否包含模型名（默认开）。 */
+  include_model: boolean
+  /** 钉住渠道失败时不再重试其他渠道。 */
+  skip_retry_on_failure: boolean
+}
+
+/** 渠道亲和性总开关与全局参数。 */
+export interface AffinitySettings {
+  enabled: boolean
+  /** 最终由非钉住渠道成功时，把身份重新绑到新渠道。 */
+  switch_on_success: boolean
+  /** 钉住的渠道被停用后保留绑定。 */
+  keep_on_channel_disabled: boolean
+  /** 缓存最大条目数，超出按 LRU 淘汰。 */
+  max_entries: number
+  /** 规则未自带 TTL 时的默认秒数。 */
+  default_ttl_secs: number
+  rules: AffinityRule[]
+}
+
+/** 亲和引擎运行统计。 */
+export interface AffinityStats {
+  hits: number
+  misses: number
+  records: number
+  forgets: number
+  evictions: number
+  entries: number
+}
+
+export interface AffinityStatsResponse {
+  /** 总开关开且规则非空。 */
+  active: boolean
+  stats: AffinityStats
 }

@@ -383,6 +383,16 @@ async fn passthrough_response(
     // 透传没有转码路径：只保留入口协议的原生端点。
     route.attempts.retain(|c| c.protocol() == inbound);
 
+    // 透传端点同样吃模型级亲和：缓存键按 key+model 走，与 chat 请求共享。
+    let affinity = resolve_affinity(&state, &principal, inbound, &headers, &raw, &model);
+    // 黏性密钥策略的锚点与 dispatch 一致。
+    route.identity = principal.key_id().map(|id| id as u64);
+    if let Some(decision) = &affinity
+        && let Some(bound) = decision.binding
+        && !route.pin_channel(bound)
+    {
+        drop_affinity_binding(&state, decision, bound);
+    }
     let capture_bodies = state.capture_bodies();
     let context = DispatchContext {
         state: state.clone(),
@@ -400,6 +410,7 @@ async fn passthrough_response(
                 .as_deref()
                 .is_some_and(|ct| ct.starts_with("multipart/")))
         .then(|| body_snapshot(&raw)),
+        affinity,
     };
 
     if route.is_empty() {
@@ -413,6 +424,16 @@ async fn passthrough_response(
         return Err(context.reject(err));
     }
 
+    // 绑定即承诺时截掉兜底尝试：透传端点同样遵守。
+    let pinned = context.affinity.as_ref().and_then(|d| d.binding);
+    let pinned_only = context
+        .affinity
+        .as_ref()
+        .is_some_and(|d| d.skip_retry_on_failure);
+    let route = match pinned {
+        Some(_) if pinned_only => route.pinned_only(),
+        _ => route,
+    };
     let outcome = match context
         .state
         .executor()
@@ -427,10 +448,20 @@ async fn passthrough_response(
     {
         Ok(outcome) => outcome,
         Err(error) => {
+            if let Some(decision) = &context.affinity {
+                settle_affinity_on_failure(&context.state, decision);
+            }
             log_failure(&context, &error);
             return Err(context.reject(error));
         }
     };
+    // 成功（含兜底换渠道）→ 记录或改写绑定。
+    if let Some(decision) = &context.affinity {
+        context
+            .state
+            .affinity()
+            .record(decision, outcome.channel_id);
+    }
 
     let usage = passthrough_usage(kind, &outcome.payload.body);
     let response_snapshot = (context.capture_bodies && snapshot_worthy(&outcome.payload.headers))
@@ -455,7 +486,11 @@ async fn passthrough_response(
         Some(outcome.latency_ms),
         started.elapsed().as_millis() as u64,
     )
-    .with_snapshots(context.request_snapshot, response_snapshot);
+    .with_snapshots(context.request_snapshot, response_snapshot)
+    .with_routing_context(
+        outcome.credential_hint,
+        context.affinity.as_ref().map(|d| d.rule_name.clone()),
+    );
     entry.input_tokens = usage;
     entry.status = response.status().as_u16();
     entry.retries = u32::from(outcome.attempts.saturating_sub(1));
@@ -765,12 +800,89 @@ struct DispatchContext {
     capture_bodies: bool,
     /// 请求正文快照。multipart 等二进制请求为 `None`。
     request_snapshot: Option<String>,
+    /// 本次请求命中的亲和规则决策；`None` = 无规则匹配或功能关闭。
+    affinity: Option<refract_router::AffinityDecision>,
 }
 
 impl DispatchContext {
     /// 构造带请求标识的协议错误，失败响应也能对上日志。
     fn reject(&self, error: GatewayError) -> Rejection {
         ProtocolRejection::reject_with_id(error, self.inbound, self.request_id.clone())
+    }
+}
+
+/// 按入口协议推导亲和规则匹配用的请求路径。
+///
+/// Gemini 的实际路径随模型与动作变化，这里给出前缀锚点 —— 规则的
+/// path 正则按前缀匹配即可覆盖。
+fn inbound_path(inbound: Protocol) -> &'static str {
+    match inbound {
+        Protocol::Chat => "/v1/chat/completions",
+        Protocol::Responses => "/v1/responses",
+        Protocol::Messages => "/v1/messages",
+        Protocol::Gemini => "/v1beta/models",
+    }
+}
+
+/// 路由前解析渠道亲和性：命中规则返回决策，功能关闭或无匹配返回 `None`。
+fn resolve_affinity(
+    state: &AppState,
+    principal: &Principal,
+    inbound: Protocol,
+    headers: &warp::http::HeaderMap,
+    body: &Bytes,
+    model: &str,
+) -> Option<refract_router::AffinityDecision> {
+    let engine = state.affinity();
+    if !engine.is_active() {
+        return None;
+    }
+    // 懒解析：仅当确有规则需要 Body 来源时才解析请求体 JSON。
+    let parsed_body = engine
+        .needs_body()
+        .then(|| serde_json::from_slice::<Value>(body).ok())
+        .flatten();
+    let ctx = refract_router::AffinityContext {
+        model,
+        path: inbound_path(inbound),
+        api_key_id: principal.key_id().map(|id| id as u64),
+        headers,
+        body: parsed_body.as_ref(),
+    };
+    engine.resolve(&ctx)
+}
+
+/// 绑定的渠道不在本次候选里时，按原因决定是否遗忘绑定。
+///
+/// - 渠道已删除 → 永远遗忘；
+/// - 渠道停用/自动禁用 → 跟随 `keep_on_channel_disabled`；
+/// - 渠道存在且启用（本次因模型/协议/API key 过滤而缺席）→ 保留绑定，
+///   会话换个模型再来时还能回到它。
+fn drop_affinity_binding(
+    state: &AppState,
+    decision: &refract_router::AffinityDecision,
+    bound: refract_core::ChannelId,
+) {
+    let channels = state.channels();
+    match channels.iter().find(|c| c.id == bound) {
+        None => state.affinity().forget(&decision.cache_key),
+        Some(channel) if !channel.enabled || channel.auto_disabled => {
+            if !state.affinity().keep_on_channel_disabled() {
+                state.affinity().forget(&decision.cache_key);
+            }
+        }
+        Some(_) => {}
+    }
+}
+
+/// 亲和绑定存在且钉住渠道失败时的收尾。
+///
+/// `skip_retry_on_failure` = true 表示「绑定即承诺」：保留绑定，错误原样
+/// 返回，不偷偷换渠道（换渠道会让会话漂移，违背规则意图）。否则遗忘
+/// 绑定，让下一次请求重新竞争。
+fn settle_affinity_on_failure(state: &AppState, decision: &refract_router::AffinityDecision) {
+    if !decision.skip_retry_on_failure {
+        state.affinity().forget(&decision.cache_key);
     }
 }
 
@@ -889,12 +1001,23 @@ async fn dispatch(
         .iter()
         .filter(|channel| principal.allows_channel(channel))
         .collect();
-    let route = {
+    // 渠道亲和性：路由前解析身份值，把已绑定的渠道钉到候选最前。
+    let affinity = resolve_affinity(&state, &principal, inbound, &headers, &body.raw, &model);
+    let mut route = {
         let mut rng = rand::rng();
         state
             .planner()
             .plan(allowed_channels.iter().copied(), &model, inbound, &mut rng)
     };
+    // 黏性密钥策略的锚点：同一调用者在同一渠道固定同一把 key。
+    route.identity = principal.key_id().map(|id| id as u64);
+    // 绑定移到最前；绑定的渠道没进候选时区分原因再决定是否遗忘绑定。
+    if let Some(decision) = &affinity
+        && let Some(bound) = decision.binding
+        && !route.pin_channel(bound)
+    {
+        drop_affinity_binding(&state, decision, bound);
+    }
     let capture_bodies = state.capture_bodies();
     let context = DispatchContext {
         state: state.clone(),
@@ -907,6 +1030,7 @@ async fn dispatch(
         forward_headers: forwardable_headers(&headers),
         capture_bodies,
         request_snapshot: capture_bodies.then(|| body_snapshot(&body.raw)),
+        affinity: affinity.clone(),
     };
 
     if route.is_empty() {
@@ -941,11 +1065,12 @@ async fn dispatch(
         return Err(context.reject(err));
     }
 
+    let pinned = affinity.as_ref().and_then(|d| d.binding);
     if stream {
-        stream_response(context, body, route, concurrency_permit).await
+        stream_response(context, body, route, pinned, concurrency_permit).await
     } else {
         // unary 在本函数栈上持有 permit：响应体已完整构造才返回。
-        let response = unary_response(context, body, route).await;
+        let response = unary_response(context, body, route, pinned).await;
         drop(concurrency_permit);
         response
     }
@@ -956,7 +1081,18 @@ async fn unary_response(
     context: DispatchContext,
     raw: JsonBody,
     route: refract_router::Route<'_>,
+    pinned: Option<refract_core::ChannelId>,
 ) -> Result<warp::reply::Response, Rejection> {
+    // 亲和钉住且 skip_retry_on_failure：绑定即承诺，失败不偷偷换渠道
+    // 造成会话漂移 —— 错误原样返回，绑定保留。
+    let pinned_only = context
+        .affinity
+        .as_ref()
+        .is_some_and(|d| d.skip_retry_on_failure);
+    let route = match pinned {
+        Some(_) if pinned_only => route.pinned_only(),
+        _ => route,
+    };
     let outcome = match context
         .state
         .executor()
@@ -969,6 +1105,9 @@ async fn unary_response(
     {
         Ok(o) => o,
         Err(e) => {
+            if let Some(decision) = &context.affinity {
+                settle_affinity_on_failure(&context.state, decision);
+            }
             log_failure(&context, &e);
             return Err(context.reject(e));
         }
@@ -982,10 +1121,16 @@ async fn unary_response(
         model,
         capture_bodies,
         request_snapshot,
+        affinity,
         ..
     } = context;
     let owner_id = principal.owner_id;
     let key_id = principal.key_id();
+    // 成功 → 写入/刷新亲和绑定（switch_on_success 决定失败后兜底是否改绑）。
+    if let Some(decision) = &affinity {
+        state.affinity().record(decision, outcome.channel_id);
+    }
+    let affinity_rule = affinity.map(|d| d.rule_name);
 
     let usage = outcome
         .payload
@@ -1031,7 +1176,8 @@ async fn unary_response(
             Some(outcome.latency_ms),
             started.elapsed().as_millis() as u64,
         )
-        .with_snapshots(request_snapshot, response_snapshot);
+        .with_snapshots(request_snapshot, response_snapshot)
+        .with_routing_context(outcome.credential_hint.clone(), affinity_rule);
     entry.status = response_status;
     entry.retries = u32::from(outcome.attempts.saturating_sub(1));
     record(&state, entry, key_id, usage.total());
@@ -1068,8 +1214,17 @@ async fn stream_response(
     dispatch: DispatchContext,
     raw: JsonBody,
     route: refract_router::Route<'_>,
+    pinned: Option<refract_core::ChannelId>,
     concurrency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<warp::reply::Response, Rejection> {
+    let pinned_only = dispatch
+        .affinity
+        .as_ref()
+        .is_some_and(|d| d.skip_retry_on_failure);
+    let route = match pinned {
+        Some(_) if pinned_only => route.pinned_only(),
+        _ => route,
+    };
     let outcome = match dispatch
         .state
         .executor()
@@ -1082,10 +1237,20 @@ async fn stream_response(
     {
         Ok(o) => o,
         Err(e) => {
+            if let Some(decision) = &dispatch.affinity {
+                settle_affinity_on_failure(&dispatch.state, decision);
+            }
             log_failure(&dispatch, &e);
             return Err(dispatch.reject(e));
         }
     };
+    // 流式「成功」= 钉住渠道已经开始服务（200 + 流已开）：绑定在这里写入。
+    if let Some(decision) = &dispatch.affinity {
+        dispatch
+            .state
+            .affinity()
+            .record(decision, outcome.channel_id);
+    }
     let DispatchContext {
         state,
         principal,
@@ -1095,6 +1260,7 @@ async fn stream_response(
         model,
         capture_bodies,
         request_snapshot,
+        affinity,
         ..
     } = dispatch;
 
@@ -1114,6 +1280,8 @@ async fn stream_response(
         model,
         capture_bodies,
         request_snapshot,
+        credential_hint: outcome.credential_hint,
+        affinity,
         _concurrency_permit: concurrency_permit,
     };
 
@@ -1140,6 +1308,10 @@ struct StreamContext {
     model: String,
     capture_bodies: bool,
     request_snapshot: Option<String>,
+    /// 实际使用的上游密钥脱敏提示。
+    credential_hint: Option<String>,
+    /// 命中的亲和决策：流中途失败时据此决定是否解绑。
+    affinity: Option<refract_router::AffinityDecision>,
     /// 全局并发 permit —— 流式响应要占用额度直到流结束（finalize 时 drop）。
     _concurrency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -1399,11 +1571,27 @@ fn transcoded_stream_response(
             Some(context.ttfb_ms),
             context.started.elapsed().as_millis() as u64,
         )
-        .with_snapshots(context.request_snapshot, response_body);
+        .with_snapshots(context.request_snapshot, response_body)
+        .with_routing_context(
+            context.credential_hint.clone(),
+            context.affinity.as_ref().map(|d| d.rule_name.clone()),
+        );
         entry.status = status;
         entry.retries = u32::from(context.attempts.saturating_sub(1));
         entry.error_kind = error_kind;
         entry.error_message = error_message;
+        // 上游中途出错（非客户端断开）→ 钉住的渠道失约，按策略解绑；
+        // 只解指向本渠道的绑定，避免误伤 switch_on_success=false 下
+        // 仍然指向旧渠道的绑定。
+        if stream_error.is_some()
+            && let Some(decision) = context.affinity.as_ref()
+            && !decision.skip_retry_on_failure
+        {
+            context
+                .state
+                .affinity()
+                .forget_if_bound_to(&decision.cache_key, context.channel_id);
+        }
         record(&context.state, entry, context.key_id, usage.total());
     });
 
@@ -1570,11 +1758,25 @@ async fn relay_native_stream(
         Some(context.ttfb_ms),
         context.started.elapsed().as_millis() as u64,
     )
-    .with_snapshots(context.request_snapshot, response_body);
+    .with_snapshots(context.request_snapshot, response_body)
+    .with_routing_context(
+        context.credential_hint.clone(),
+        context.affinity.as_ref().map(|d| d.rule_name.clone()),
+    );
     entry.status = status;
     entry.retries = u32::from(context.attempts.saturating_sub(1));
     entry.error_kind = error_kind;
     entry.error_message = error_message;
+    // 与转码流一致的亲和收尾：只对仍指向本渠道的绑定生效。
+    if stream_error.is_some()
+        && let Some(decision) = context.affinity.as_ref()
+        && !decision.skip_retry_on_failure
+    {
+        context
+            .state
+            .affinity()
+            .forget_if_bound_to(&decision.cache_key, context.channel_id);
+    }
     record(&context.state, entry, context.key_id, usage.total());
 }
 
@@ -1685,7 +1887,11 @@ fn log_failure(context: &DispatchContext, err: &GatewayError) {
         context.stream,
     )
     .with_timing(None, context.started.elapsed().as_millis() as u64)
-    .with_snapshots(context.request_snapshot.clone(), err.upstream_body.clone());
+    .with_snapshots(context.request_snapshot.clone(), err.upstream_body.clone())
+    .with_routing_context(
+        err.credential_hint.clone(),
+        context.affinity.as_ref().map(|d| d.rule_name.clone()),
+    );
     entry.channel_id = err.channel_id;
     entry.channel_name = err.channel_name.clone();
     entry.upstream_protocol = err.protocol.unwrap_or(context.inbound);
@@ -1854,6 +2060,8 @@ mod tests {
             priority: 0,
             weight: 1,
             credential: Credential::new("test-key"),
+            credentials: Vec::new(),
+            key_strategy: Default::default(),
             address: UpstreamAddress {
                 unofficial: true,
                 full_address: false,
@@ -1906,6 +2114,8 @@ mod tests {
             model: "test-model".to_owned(),
             capture_bodies: false,
             request_snapshot: None,
+            credential_hint: None,
+            affinity: None,
             _concurrency_permit: None,
         };
         let upstream: refract_upstream::ByteStream = Box::pin(futures::stream::iter(items));

@@ -165,7 +165,8 @@ test('通过编辑器创建渠道', async ({ page }) => {
   await page.getByPlaceholder('例如：中转站-主力').fill('E2E 主渠道')
   await page.getByRole('switch', { name: '非官方地址' }).click()
   await page.getByPlaceholder('https://api.example.com').fill(upstreamUrl)
-  await page.getByPlaceholder('sk-...').fill('sk-e2e-main')
+  // 钥匙池输入框也用 sk- 占位符，用 aria 标签区分主密钥。
+  await page.getByRole('textbox', { name: '默认渠道 API 密钥' }).fill('sk-e2e-main')
 
   const modelInput = page.getByRole('textbox', { name: 'Chat 模型输入' })
   await modelInput.fill('gpt-4o')

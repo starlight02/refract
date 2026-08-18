@@ -299,6 +299,8 @@ mod tests {
             error_message: None,
             request_body: None,
             response_body: None,
+            credential_hint: None,
+            affinity_rule: None,
         }
     }
 

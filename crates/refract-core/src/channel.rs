@@ -169,6 +169,112 @@ impl std::fmt::Debug for Credential {
     }
 }
 
+/// 多密钥的使用策略。
+///
+/// 渠道可以配置多把上游密钥（`credentials` 池）。端点级 `credential` 覆盖始终优先；
+/// 没有覆盖时才轮到池子按本策略挑钥匙。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStrategy {
+    /// 黏性：同一调用方（网关 API 密钥）固定使用池中的一把钥匙，
+    /// 直到该钥匙出错或渠道变化。无法识别调用方时退化为轮询。
+    Sticky,
+    /// 轮询：按渠道记忆游标依次取用，摊平速率配额。
+    #[default]
+    RoundRobin,
+    /// 随机：每次请求独立随机抽取。
+    Random,
+}
+
+impl KeyStrategy {
+    /// 数据库与 API 中的字符串形式。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sticky => "sticky",
+            Self::RoundRobin => "round_robin",
+            Self::Random => "random",
+        }
+    }
+
+    /// 从字符串解析；未知值回落到默认策略而不是拒绝整条配置。
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "sticky" => Self::Sticky,
+            "random" => Self::Random,
+            _ => Self::default(),
+        }
+    }
+}
+
+impl std::fmt::Display for KeyStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 端点一次请求的凭据来源：单钥或多钥池。
+///
+/// 由 [`Channel::key_pool`] 按「端点覆盖 > 顶层默认 + 池 > 纯池」解析而来。
+/// 路由执行器对 `Single` 直接取用；对 `Pool` 按 [`KeyStrategy`] 挑钥匙，
+/// 并在单钥报鉴权类错误时轮换下一把。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPool<'a> {
+    /// 单钥：端点级覆盖，或渠道只配了一把钥匙。
+    Single(&'a Credential),
+    /// 多钥池。`first` 是顶层默认钥匙，`rest` 是额外钥匙；逻辑顺序为
+    /// `[first, rest…]`。
+    Pool {
+        /// 顶层默认钥匙。
+        first: &'a Credential,
+        /// 额外的池钥匙。
+        rest: &'a [Credential],
+        /// 使用策略。
+        strategy: KeyStrategy,
+    },
+}
+
+impl<'a> KeyPool<'a> {
+    /// 池内钥匙数量，至少为 1。
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Single(_) => 1,
+            Self::Pool { rest, .. } => rest.len().saturating_add(1),
+        }
+    }
+
+    /// 恒为 `false`：池在构造上至少有一把钥匙，这是与 `len` 配对的不变量。
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// 是否单钥（无需轮换）。
+    pub fn is_single(&self) -> bool {
+        matches!(self, Self::Single(_))
+    }
+
+    /// 池的使用策略；单钥恒为轮询（只有一把，策略无意义）。
+    pub fn strategy(&self) -> KeyStrategy {
+        match self {
+            Self::Single(_) => KeyStrategy::default(),
+            Self::Pool { strategy, .. } => *strategy,
+        }
+    }
+
+    /// 取第 `index` 把钥匙，越界自动取模。
+    pub fn key_at(&self, index: usize) -> &'a Credential {
+        match self {
+            Self::Single(key) => key,
+            Self::Pool { first, rest, .. } => {
+                if rest.is_empty() {
+                    return first;
+                }
+                let index = index % rest.len().saturating_add(1);
+                if index == 0 { first } else { &rest[index - 1] }
+            }
+        }
+    }
+}
+
 /// 一条模型条目。
 ///
 /// `alias` 为空表示对外名与上游名相同；非空则对外暴露 `alias`，打上游时用 `upstream`。
@@ -354,6 +460,14 @@ pub struct Channel {
     /// 渠道默认凭据，端点未单独配置时使用。
     #[serde(default)]
     pub credential: Credential,
+    /// 多密钥池：一行一把的额外上游密钥。空时回落到 `credential` 单钥语义。
+    ///
+    /// 端点级 `credential` 覆盖优先于池子；池子又优先于顶层 `credential`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<Credential>,
+    /// 多密钥池的使用策略。
+    #[serde(default)]
+    pub key_strategy: KeyStrategy,
     /// 渠道默认地址，端点未单独配置时使用。
     #[serde(default)]
     pub address: UpstreamAddress,
@@ -431,6 +545,9 @@ pub enum ChannelError {
     /// 某个端点既没有自己的凭据，渠道默认凭据也为空。
     #[error("endpoint `{0}` has no credential and the channel default is empty")]
     MissingCredential(Protocol),
+    /// 多密钥池里存在空行 —— 一行一把，空行只会制造故障。
+    #[error("multi-key pool contains an empty credential; remove the blank line")]
+    EmptyPoolCredential,
     /// 转换策略把原生协议自身也勾上了 —— 无意义，且暗示配置理解有误。
     #[error("endpoint `{0}` lists its own native protocol as a transcode target")]
     SelfTranscode(Protocol),
@@ -478,6 +595,9 @@ impl Channel {
         if self.endpoints.is_empty() {
             return Err(ChannelError::NoEndpoints);
         }
+        if self.credentials.iter().any(|c| c.is_empty()) {
+            return Err(ChannelError::EmptyPoolCredential);
+        }
 
         if let Some(native) = self.kind.native_protocol() {
             if self.endpoints.len() != 1 {
@@ -506,7 +626,7 @@ impl Channel {
             }
 
             let has_own = ep.credential.as_ref().is_some_and(|c| !c.is_empty());
-            if !has_own && self.credential.is_empty() {
+            if !has_own && self.credential.is_empty() && self.credentials.is_empty() {
                 return Err(ChannelError::MissingCredential(ep.protocol));
             }
 
@@ -585,11 +705,39 @@ impl Channel {
         }
     }
 
-    /// 端点实际生效的凭据：自身未配置或为空则继承渠道默认。
+    /// 端点实际生效的凭据：端点覆盖 > 多密钥池首钥 > 顶层默认。
+    ///
+    /// 探测、余额查询、连通性测试等「只打一发」的场景统一用这个入口，
+    /// 它们不需要也不应该消费轮询游标。
     pub fn effective_credential<'a>(&'a self, ep: &'a ChannelEndpoint) -> &'a Credential {
-        match &ep.credential {
-            Some(c) if !c.is_empty() => c,
-            _ => &self.credential,
+        self.key_pool(ep).key_at(0)
+    }
+
+    /// 端点的凭据来源：单钥或多钥池。
+    ///
+    /// 优先级：端点级覆盖 > 顶层默认 + `credentials` 池 > 纯池子。
+    /// 池内密钥在 `validate()` 与存储加载时都保证非空。
+    pub fn key_pool<'a>(&'a self, ep: &'a ChannelEndpoint) -> KeyPool<'a> {
+        if let Some(own) = ep.credential.as_ref().filter(|c| !c.is_empty()) {
+            return KeyPool::Single(own);
+        }
+        if !self.credential.is_empty() {
+            if self.credentials.is_empty() {
+                return KeyPool::Single(&self.credential);
+            }
+            return KeyPool::Pool {
+                first: &self.credential,
+                rest: &self.credentials,
+                strategy: self.key_strategy,
+            };
+        }
+        match self.credentials.split_first() {
+            Some((first, rest)) => KeyPool::Pool {
+                first,
+                rest,
+                strategy: self.key_strategy,
+            },
+            None => KeyPool::Single(&self.credential),
         }
     }
 
@@ -658,6 +806,8 @@ mod tests {
             priority: 0,
             weight: 1,
             credential: Credential::new("sk-test-key"),
+            credentials: Vec::new(),
+            key_strategy: KeyStrategy::default(),
             address: UpstreamAddress::default(),
             endpoints: vec![ChannelEndpoint {
                 models: vec![ModelEntry::plain("gpt-4o")],

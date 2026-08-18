@@ -3,7 +3,7 @@
 //! 设置以 JSON 形式存在 `settings` 表，读取时反序列化成强类型。
 //! 用一张 KV 表而非固定列，是因为设置项会随功能演进增删，加列要迁移，加键不用。
 
-use refract_core::{EmptyResponseRetryPolicy, RoutingPolicy};
+use refract_core::{AffinitySettings, EmptyResponseRetryPolicy, RoutingPolicy};
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::Row;
 
@@ -36,6 +36,8 @@ pub const DEFAULT_RETEST_MINUTES: u32 = 30;
 pub const KEY_GLOBAL_LIMITS: &str = "limits.global";
 /// HTTP 200 空回复重试策略。
 pub const KEY_EMPTY_RESPONSE_RETRY: &str = "upstream.empty_response_retry";
+/// 渠道亲和性设置。
+pub const KEY_AFFINITY: &str = "affinity.settings";
 
 /// 网关级全局限制。密钥级限速在免鉴权模式下是零防护 ——
 /// 跑飞的本地 agent 迴圈会原样打穿上游账单，这层是最后的保险丝。
@@ -352,6 +354,19 @@ impl SettingsRepo {
             .validate()
             .map_err(|message| StoreError::Invalid(message.into()))?;
         self.set(KEY_EMPTY_RESPONSE_RETRY, &policy).await
+    }
+
+    /// 读取渠道亲和性设置。缺失时为全默认（功能关闭）。
+    pub async fn affinity(&self) -> Result<AffinitySettings, StoreError> {
+        Ok(self.get_or_default(KEY_AFFINITY).await)
+    }
+
+    /// 校验并保存渠道亲和性设置。
+    pub async fn set_affinity(&self, settings: &AffinitySettings) -> Result<(), StoreError> {
+        settings
+            .validate()
+            .map_err(|message| StoreError::Invalid(message.to_string()))?;
+        self.set(KEY_AFFINITY, settings).await
     }
 
     /// 读取日志保留天数；缺失或损坏时使用 30 天。

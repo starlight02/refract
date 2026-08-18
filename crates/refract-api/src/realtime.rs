@@ -407,6 +407,8 @@ async fn log_session(
         error_message: (status >= 400).then(|| "realtime session ended abnormally".to_owned()),
         request_body: None,
         response_body: None,
+        credential_hint: None,
+        affinity_rule: None,
     };
     state.metrics().observe(&entry);
     if let Err(error) = state.log_repo().append(&entry).await {
@@ -469,6 +471,8 @@ mod tests {
             priority: 0,
             weight: 1,
             credential: Credential::new("sk-realtime"),
+            credentials: Vec::new(),
+            key_strategy: Default::default(),
             address: UpstreamAddress {
                 unofficial: true,
                 full_address: false,

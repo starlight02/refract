@@ -4,8 +4,8 @@
 //! 否则会出现「渠道已存在但端点还没写完」的中间态被路由层读到。
 
 use refract_core::{
-    Channel, ChannelEndpoint, ChannelId, ChannelKind, Credential, ModelEntry, Protocol,
-    TranscodePolicy, UpstreamAddress,
+    Channel, ChannelEndpoint, ChannelId, ChannelKind, Credential, KeyStrategy, ModelEntry,
+    Protocol, TranscodePolicy, UpstreamAddress,
 };
 use sqlx::Row;
 
@@ -15,6 +15,14 @@ use crate::db::{Database, StoreError};
 #[derive(Debug, Clone)]
 pub struct ChannelRepo {
     db: Database,
+}
+
+/// 多密钥池的 JSON 形式：空池存 NULL，非空存明文数组。
+///
+/// 与单钥列 `credential` 同级别的机密数据，落库明文、出口脱敏。
+fn pool_json(credentials: &[Credential]) -> Option<String> {
+    (!credentials.is_empty())
+        .then(|| serde_json::to_string(credentials).expect("credentials serialize"))
 }
 
 /// 数据库里的渠道行。
@@ -27,6 +35,8 @@ struct ChannelRow {
     priority: i64,
     weight: i64,
     credential: String,
+    credentials: Option<String>,
+    key_strategy: String,
     address: String,
     tags: String,
     timeout_secs: i64,
@@ -43,9 +53,10 @@ struct ChannelRow {
 
 macro_rules! channel_cols {
     () => {
-        "id, owner_id, name, kind, enabled, priority, weight, credential, address, \
-         tags, timeout_secs, proxy, param_override, note, auto_disabled, balance, \
-         balance_updated_at, extra_headers, test_model, empty_response_retry"
+        "id, owner_id, name, kind, enabled, priority, weight, credential, credentials, \
+         key_strategy, address, tags, timeout_secs, proxy, param_override, note, \
+         auto_disabled, balance, balance_updated_at, extra_headers, test_model, \
+         empty_response_retry"
     };
 }
 
@@ -116,10 +127,10 @@ impl ChannelRepo {
     ) -> Result<i64, StoreError> {
         let id: i64 = sqlx::query(
             "INSERT INTO channels \
-             (owner_id, name, kind, enabled, priority, weight, credential, address, tags, \
-              timeout_secs, proxy, param_override, note, extra_headers, test_model, \
-              empty_response_retry) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+             (owner_id, name, kind, enabled, priority, weight, credential, credentials, \
+              key_strategy, address, tags, timeout_secs, proxy, param_override, note, \
+              extra_headers, test_model, empty_response_retry) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(channel.owner_id)
         .bind(&channel.name)
@@ -128,6 +139,8 @@ impl ChannelRepo {
         .bind(i64::from(channel.priority))
         .bind(i64::from(channel.weight))
         .bind(channel.credential.expose())
+        .bind(pool_json(&channel.credentials))
+        .bind(channel.key_strategy.as_str())
         .bind(serde_json::to_string(&channel.address).expect("address serializes"))
         .bind(serde_json::to_string(&channel.tags).expect("tags serialize"))
         .bind(i64::from(channel.timeout_secs))
@@ -244,9 +257,9 @@ impl ChannelRepo {
         let mut tx = self.db.pool().begin().await?;
         let affected = sqlx::query(
             "UPDATE channels SET name = ?, kind = ?, enabled = ?, priority = ?, weight = ?, \
-             credential = ?, address = ?, tags = ?, timeout_secs = ?, proxy = ?, \
-             param_override = ?, note = ?, extra_headers = ?, test_model = ?, \
-             empty_response_retry = ?, \
+             credential = ?, credentials = ?, key_strategy = ?, address = ?, tags = ?, \
+             timeout_secs = ?, proxy = ?, param_override = ?, note = ?, extra_headers = ?, \
+             test_model = ?, empty_response_retry = ?, \
              updated_at = datetime('now') \
              WHERE id = ? AND owner_id = ?",
         )
@@ -256,6 +269,8 @@ impl ChannelRepo {
         .bind(i64::from(channel.priority))
         .bind(i64::from(channel.weight))
         .bind(channel.credential.expose())
+        .bind(pool_json(&channel.credentials))
+        .bind(channel.key_strategy.as_str())
         .bind(serde_json::to_string(&channel.address).expect("address serializes"))
         .bind(serde_json::to_string(&channel.tags).expect("tags serialize"))
         .bind(i64::from(channel.timeout_secs))
@@ -468,6 +483,8 @@ impl ChannelRepo {
             priority: row.get("priority"),
             weight: row.get("weight"),
             credential: row.get("credential"),
+            credentials: row.get("credentials"),
+            key_strategy: row.get("key_strategy"),
             address: row.get("address"),
             tags: row.get("tags"),
             timeout_secs: row.get("timeout_secs"),
@@ -498,6 +515,16 @@ impl ChannelRepo {
             priority: row.priority.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
             weight: row.weight.clamp(0, i64::from(u32::MAX)) as u32,
             credential: Credential::new(row.credential),
+            credentials: row
+                .credentials
+                .map(|s| serde_json::from_str::<Vec<Credential>>(&s))
+                .transpose()
+                .map_err(StoreError::json("channels.credentials"))?
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| !c.is_empty())
+                .collect(),
+            key_strategy: KeyStrategy::parse(&row.key_strategy),
             address: serde_json::from_str(&row.address)
                 .map_err(StoreError::json("channels.address"))?,
             endpoints,
@@ -553,6 +580,8 @@ mod tests {
             priority: 10,
             weight: 3,
             credential: Credential::new("sk-channel-default"),
+            credentials: Vec::new(),
+            key_strategy: KeyStrategy::default(),
             address: UpstreamAddress::default(),
             endpoints: vec![ChannelEndpoint {
                 models: vec![

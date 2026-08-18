@@ -10,6 +10,8 @@
  */
 
 import type {
+  AffinitySettings,
+  AffinityStatsResponse,
   ApiKey,
   ChannelStat,
   EmptyResponseRetryPolicy,
@@ -345,6 +347,14 @@ export const settings = {
   setNotify: (settings: NotifySettings) =>
     request<NotifySettings>('PUT', '/api/settings/notify', settings),
   testNotify: () => request<{ sent: boolean }>('POST', '/api/settings/notify/test'),
+  /** 渠道亲和性设置；缺失时后端返回全默认（功能关闭）。 */
+  affinity: () => request<AffinitySettings>('GET', '/api/settings/affinity'),
+  setAffinity: (settings: AffinitySettings) =>
+    request<AffinitySettings>('PUT', '/api/settings/affinity', settings),
+  /** 清空已建立的绑定缓存；返回被清除的条目数。 */
+  clearAffinity: () => request<{ cleared: number }>('POST', '/api/settings/affinity/clear'),
+  /** 命中/未命中/记录/遗忘次数与活跃绑定数。 */
+  affinityStats: () => request<AffinityStatsResponse>('GET', '/api/settings/affinity/stats'),
   /** 传 null 关闭管理鉴权。设置后无法读回，只能覆盖或清除。 */
   setAdminToken: (token: string | null) =>
     request<{ configured: boolean }>('PUT', '/api/settings/admin-token', { token }),

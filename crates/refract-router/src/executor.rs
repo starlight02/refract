@@ -15,7 +15,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
 use refract_core::{
-    Action, ChannelId, EmptyResponseRetryPolicy, ErrorKind, GatewayError, Protocol,
+    Action, ChannelId, Credential, EmptyResponseRetryPolicy, ErrorKind, GatewayError, Protocol,
 };
 use refract_protocol::codec::CodecSet;
 use refract_protocol::ir::{ContentPart, UnifiedRequest, UnifiedResponse, Usage};
@@ -28,6 +28,7 @@ use refract_upstream::{
 use serde_json::Value;
 
 use crate::events::RouterEvent;
+use crate::keys::{KeyRotator, KeySelector};
 use crate::plan::{Candidate, Route};
 
 /// 执行器配置。
@@ -65,6 +66,8 @@ pub struct RouteOutcome<T> {
     pub attempts: u8,
     /// 首字节延迟（毫秒）。
     pub latency_ms: u64,
+    /// 最终成功所用 key 的脱敏提示（如 `sk-a…9f2c`）；无凭据执行时为 `None`。
+    pub credential_hint: Option<String>,
     /// 载荷。
     pub payload: T,
 }
@@ -80,6 +83,7 @@ impl<T> RouteOutcome<T> {
             transcoded: self.transcoded,
             attempts: self.attempts,
             latency_ms: self.latency_ms,
+            credential_hint: self.credential_hint,
             payload: f(self.payload),
         }
     }
@@ -171,6 +175,14 @@ pub enum RoutedStream {
     Transcoded(SseStream),
 }
 
+/// 失败后的处置决定。
+enum FailureAction {
+    /// 轮转到下一把 key：重试同一端点（错误不外抛、不记健康）。
+    RotateKey,
+    /// 渠道级失败：带上注解后的错误，尝试下一个候选。
+    MoveOn(GatewayError),
+}
+
 /// 路由执行器。
 #[derive(Clone)]
 pub struct RouteExecutor {
@@ -178,6 +190,8 @@ pub struct RouteExecutor {
     codecs: CodecSet,
     health: HealthRepo,
     config: RouterConfig,
+    /// 多密钥调度器：轮询游标与黏性绑定。
+    keys: KeySelector,
     /// 路由事件的旁路出口。`None` 时静默运行。
     events: Option<crate::events::EventSender>,
 }
@@ -203,13 +217,28 @@ impl RouteExecutor {
             codecs,
             health,
             config,
+            keys: KeySelector::new(),
             events: None,
         }
+    }
+
+    /// 密钥调度器 —— 渠道删除时用它清理游标与黏性绑定。
+    pub fn key_selector(&self) -> &KeySelector {
+        &self.keys
     }
 
     /// 挂上路由事件出口。
     pub fn with_events(mut self, sender: crate::events::EventSender) -> Self {
         self.events = Some(sender);
+        self
+    }
+
+    /// 挂上共享的密钥调度器。
+    ///
+    /// 默认每个执行器自带一份；网关需要让「执行器换 key 的游标」与
+    /// 「渠道删除时的清理」共享同一份状态时，用这个注入共享实例。
+    pub fn with_keys(mut self, keys: KeySelector) -> Self {
+        self.keys = keys;
         self
     }
 
@@ -305,6 +334,36 @@ impl RouteExecutor {
             Ok(annotated)
         }
     }
+
+    /// 带密钥轮转的失败处理。
+    ///
+    /// 鉴权族错误（401/403/429）优先轮转池内下一把 key 重试同一端点 —— 此时
+    /// **不**记渠道健康：一把坏 key 不该把整条渠道停职。池耗尽（或本就单 key、
+    /// 或非鉴权错误）才落到渠道级：记健康、注解「池全灭」语义、判定换渠道。
+    async fn on_failure(
+        &self,
+        candidate: &Candidate<'_>,
+        rotator: &mut KeyRotator<'_>,
+        error: GatewayError,
+        attempts: u8,
+    ) -> Result<FailureAction, GatewayError> {
+        if rotator.rotate(error.kind) {
+            return Ok(FailureAction::RotateKey);
+        }
+        let final_error = rotator.exhausted_error(error);
+        // 失败日志要能定位到坏 key：两条路径都补上脱敏提示。
+        let hint = rotator.hint();
+        match self.handle_failure(candidate, final_error, attempts).await {
+            Ok(mut annotated) => {
+                annotated.credential_hint = Some(hint);
+                Ok(FailureAction::MoveOn(annotated))
+            }
+            Err(mut annotated) => {
+                annotated.credential_hint = Some(hint);
+                Err(annotated)
+            }
+        }
+    }
     /// 仅有归一化 IR 时的非流式执行。
     async fn execute_normalized(
         &self,
@@ -329,13 +388,18 @@ impl RouteExecutor {
             let channel_headers = merged_headers(&[], candidate);
             let retry_policy = self.empty_response_retry_for(candidate);
             let mut empty_retries = 0_u32;
+            let mut rotator = self.keys.start(
+                candidate.channel_id(),
+                candidate.channel.key_pool(candidate.endpoint),
+                route.identity,
+            );
             loop {
                 attempts = attempts.saturating_add(1);
                 let started = std::time::Instant::now();
                 let mut req = UpstreamRequest::post(
                     candidate.protocol(),
                     candidate.address(),
-                    candidate.credential(),
+                    rotator.current(),
                     candidate.upstream_model(),
                     Action::Generate,
                     &body,
@@ -387,11 +451,13 @@ impl RouteExecutor {
                                     continue;
                                 }
                                 self.record_success(candidate, latency_ms).await;
+                                rotator.commit();
                                 return Ok(self.outcome(
                                     candidate,
                                     route,
                                     attempts,
                                     latency_ms,
+                                    Some(rotator.hint()),
                                     RoutedResponse::Transcoded(payload),
                                 ));
                             }
@@ -405,8 +471,14 @@ impl RouteExecutor {
                                 } else {
                                     e
                                 };
-                                last_error = self.handle_failure(candidate, e, attempts).await?;
-                                break;
+                                match self.on_failure(candidate, &mut rotator, e, attempts).await {
+                                    Err(e) => return Err(e),
+                                    Ok(FailureAction::RotateKey) => continue,
+                                    Ok(FailureAction::MoveOn(err)) => {
+                                        last_error = err;
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -416,8 +488,14 @@ impl RouteExecutor {
                             candidate.protocol(),
                             e,
                         );
-                        last_error = self.handle_failure(candidate, e, attempts).await?;
-                        break;
+                        match self.on_failure(candidate, &mut rotator, e, attempts).await {
+                            Err(e) => return Err(e),
+                            Ok(FailureAction::RotateKey) => continue,
+                            Ok(FailureAction::MoveOn(err)) => {
+                                last_error = err;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -476,12 +554,17 @@ impl RouteExecutor {
                         continue;
                     }
                 };
+                let mut rotator = self.keys.start(
+                    candidate.channel_id(),
+                    candidate.channel.key_pool(candidate.endpoint),
+                    route.identity,
+                );
                 loop {
                     let started = std::time::Instant::now();
                     let mut request = UpstreamRequest::post(
                         candidate.protocol(),
                         candidate.address(),
-                        candidate.credential(),
+                        rotator.current(),
                         candidate.upstream_model(),
                         Action::Generate,
                         &body,
@@ -533,11 +616,13 @@ impl RouteExecutor {
                                         continue;
                                     }
                                     self.record_success(candidate, latency_ms).await;
+                                    rotator.commit();
                                     return Ok(self.outcome(
                                         candidate,
                                         route,
                                         attempts,
                                         latency_ms,
+                                        Some(rotator.hint()),
                                         RoutedResponse::Transcoded(payload),
                                     ));
                                 }
@@ -549,9 +634,20 @@ impl RouteExecutor {
                                     } else {
                                         error
                                     };
-                                    last_error =
-                                        self.handle_failure(candidate, error, attempts).await?;
-                                    break;
+                                    match self
+                                        .on_failure(candidate, &mut rotator, error, attempts)
+                                        .await
+                                    {
+                                        Err(e) => return Err(e),
+                                        Ok(FailureAction::RotateKey) => {
+                                            attempts = attempts.saturating_add(1);
+                                            continue;
+                                        }
+                                        Ok(FailureAction::MoveOn(err)) => {
+                                            last_error = err;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -561,8 +657,20 @@ impl RouteExecutor {
                                 candidate.protocol(),
                                 error,
                             );
-                            last_error = self.handle_failure(candidate, error, attempts).await?;
-                            break;
+                            match self
+                                .on_failure(candidate, &mut rotator, error, attempts)
+                                .await
+                            {
+                                Err(e) => return Err(e),
+                                Ok(FailureAction::RotateKey) => {
+                                    attempts = attempts.saturating_add(1);
+                                    continue;
+                                }
+                                Ok(FailureAction::MoveOn(err)) => {
+                                    last_error = err;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -571,9 +679,15 @@ impl RouteExecutor {
 
             let prepared = prepare_native_body(candidate, route, raw_body)?;
             let extra_headers = merged_headers(headers, candidate);
+            let mut rotator = self.keys.start(
+                candidate.channel_id(),
+                candidate.channel.key_pool(candidate.endpoint),
+                route.identity,
+            );
             loop {
                 let started = std::time::Instant::now();
-                let mut request = prepared.to_request(candidate, Action::Generate);
+                let mut request =
+                    prepared.to_request(candidate, rotator.current(), Action::Generate);
                 request.extra_headers = &extra_headers;
                 request.proxy = candidate.proxy();
                 request.timeout = self.timeout_for(candidate);
@@ -591,9 +705,20 @@ impl RouteExecutor {
                         ) {
                             Ok(inspection) => inspection,
                             Err(error) => {
-                                last_error =
-                                    self.handle_failure(candidate, error, attempts).await?;
-                                break;
+                                match self
+                                    .on_failure(candidate, &mut rotator, error, attempts)
+                                    .await
+                                {
+                                    Err(e) => return Err(e),
+                                    Ok(FailureAction::RotateKey) => {
+                                        attempts = attempts.saturating_add(1);
+                                        continue;
+                                    }
+                                    Ok(FailureAction::MoveOn(err)) => {
+                                        last_error = err;
+                                        break;
+                                    }
+                                }
                             }
                         };
                         if inspection.empty
@@ -624,11 +749,13 @@ impl RouteExecutor {
                             return Err(error);
                         }
                         self.record_success(candidate, latency_ms).await;
+                        rotator.commit();
                         return Ok(self.outcome(
                             candidate,
                             route,
                             attempts,
                             latency_ms,
+                            Some(rotator.hint()),
                             RoutedResponse::Native {
                                 response,
                                 usage: inspection.usage,
@@ -636,8 +763,20 @@ impl RouteExecutor {
                         ));
                     }
                     Err(error) => {
-                        last_error = self.handle_failure(candidate, error, attempts).await?;
-                        break;
+                        match self
+                            .on_failure(candidate, &mut rotator, error, attempts)
+                            .await
+                        {
+                            Err(e) => return Err(e),
+                            Ok(FailureAction::RotateKey) => {
+                                attempts = attempts.saturating_add(1);
+                                continue;
+                            }
+                            Ok(FailureAction::MoveOn(err)) => {
+                                last_error = err;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -675,28 +814,56 @@ impl RouteExecutor {
                 continue;
             }
             attempts = attempts.saturating_add(1);
-            let started = std::time::Instant::now();
 
             let prepared = if is_multipart {
                 prepare_multipart_body(candidate, route, raw_body)
             } else {
                 prepare_native_body(candidate, route, raw_body)?
             };
-            let mut request = prepared.to_request(candidate, action);
-            request.raw_content_type = content_type;
             let extra_headers = merged_headers(headers, candidate);
-            request.extra_headers = &extra_headers;
-            request.proxy = candidate.proxy();
-            request.timeout = self.timeout_for(candidate);
+            let mut rotator = self.keys.start(
+                candidate.channel_id(),
+                candidate.channel.key_pool(candidate.endpoint),
+                route.identity,
+            );
+            loop {
+                let started = std::time::Instant::now();
+                let mut request = prepared.to_request(candidate, rotator.current(), action);
+                request.raw_content_type = content_type;
+                request.extra_headers = &extra_headers;
+                request.proxy = candidate.proxy();
+                request.timeout = self.timeout_for(candidate);
 
-            match self.client.send_raw(request).await {
-                Ok(response) => {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    self.record_success(candidate, latency_ms).await;
-                    return Ok(self.outcome(candidate, route, attempts, latency_ms, response));
-                }
-                Err(error) => {
-                    last_error = self.handle_failure(candidate, error, attempts).await?;
+                match self.client.send_raw(request).await {
+                    Ok(response) => {
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        self.record_success(candidate, latency_ms).await;
+                        rotator.commit();
+                        return Ok(self.outcome(
+                            candidate,
+                            route,
+                            attempts,
+                            latency_ms,
+                            Some(rotator.hint()),
+                            response,
+                        ));
+                    }
+                    Err(error) => {
+                        match self
+                            .on_failure(candidate, &mut rotator, error, attempts)
+                            .await
+                        {
+                            Err(e) => return Err(e),
+                            Ok(FailureAction::RotateKey) => {
+                                attempts = attempts.saturating_add(1);
+                                continue;
+                            }
+                            Ok(FailureAction::MoveOn(err)) => {
+                                last_error = err;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -729,13 +896,18 @@ impl RouteExecutor {
             let channel_headers = merged_headers(&[], candidate);
             let retry_policy = self.empty_response_retry_for(candidate);
             let mut empty_retries = 0_u32;
+            let mut rotator = self.keys.start(
+                candidate.channel_id(),
+                candidate.channel.key_pool(candidate.endpoint),
+                route.identity,
+            );
             loop {
                 attempts = attempts.saturating_add(1);
                 let started = std::time::Instant::now();
                 let mut req = UpstreamRequest::post(
                     candidate.protocol(),
                     candidate.address(),
-                    candidate.credential(),
+                    rotator.current(),
                     candidate.upstream_model(),
                     Action::Stream,
                     &body,
@@ -782,23 +954,36 @@ impl RouteExecutor {
                                 candidate.protocol(),
                                 latency_ms,
                             );
+                            rotator.commit();
                             return Ok(self.outcome(
                                 candidate,
                                 route,
                                 attempts,
                                 latency_ms,
+                                Some(rotator.hint()),
                                 RoutedStream::Transcoded(tracked),
                             ));
                         }
-                        Err(error) => {
-                            last_error = self.handle_failure(candidate, error, attempts).await?;
+                        Err(error) => match self
+                            .on_failure(candidate, &mut rotator, error, attempts)
+                            .await
+                        {
+                            Err(e) => return Err(e),
+                            Ok(FailureAction::RotateKey) => continue,
+                            Ok(FailureAction::MoveOn(err)) => {
+                                last_error = err;
+                                break;
+                            }
+                        },
+                    },
+                    Err(e) => match self.on_failure(candidate, &mut rotator, e, attempts).await {
+                        Err(e) => return Err(e),
+                        Ok(FailureAction::RotateKey) => continue,
+                        Ok(FailureAction::MoveOn(err)) => {
+                            last_error = err;
                             break;
                         }
                     },
-                    Err(e) => {
-                        last_error = self.handle_failure(candidate, e, attempts).await?;
-                        break;
-                    }
                 }
             }
         }
@@ -855,12 +1040,17 @@ impl RouteExecutor {
                         continue;
                     }
                 };
+                let mut rotator = self.keys.start(
+                    candidate.channel_id(),
+                    candidate.channel.key_pool(candidate.endpoint),
+                    route.identity,
+                );
                 loop {
                     let started = std::time::Instant::now();
                     let mut request = UpstreamRequest::post(
                         candidate.protocol(),
                         candidate.address(),
-                        candidate.credential(),
+                        rotator.current(),
                         candidate.upstream_model(),
                         Action::Stream,
                         &body,
@@ -893,23 +1083,48 @@ impl RouteExecutor {
                                 }
                                 let latency_ms = started.elapsed().as_millis() as u64;
                                 let stream = prepend_stream(prefix, rest);
+                                rotator.commit();
                                 return Ok(self.outcome(
                                     candidate,
                                     route,
                                     attempts,
                                     latency_ms,
+                                    Some(rotator.hint()),
                                     RoutedStream::Transcoded(stream),
                                 ));
                             }
                             Err(error) => {
-                                last_error =
-                                    self.handle_failure(candidate, error, attempts).await?;
-                                break;
+                                match self
+                                    .on_failure(candidate, &mut rotator, error, attempts)
+                                    .await
+                                {
+                                    Err(e) => return Err(e),
+                                    Ok(FailureAction::RotateKey) => {
+                                        attempts = attempts.saturating_add(1);
+                                        continue;
+                                    }
+                                    Ok(FailureAction::MoveOn(err)) => {
+                                        last_error = err;
+                                        break;
+                                    }
+                                }
                             }
                         },
                         Err(error) => {
-                            last_error = self.handle_failure(candidate, error, attempts).await?;
-                            break;
+                            match self
+                                .on_failure(candidate, &mut rotator, error, attempts)
+                                .await
+                            {
+                                Err(e) => return Err(e),
+                                Ok(FailureAction::RotateKey) => {
+                                    attempts = attempts.saturating_add(1);
+                                    continue;
+                                }
+                                Ok(FailureAction::MoveOn(err)) => {
+                                    last_error = err;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -918,9 +1133,14 @@ impl RouteExecutor {
 
             let prepared = prepare_native_body(candidate, route, raw_body)?;
             let extra_headers = merged_headers(headers, candidate);
+            let mut rotator = self.keys.start(
+                candidate.channel_id(),
+                candidate.channel.key_pool(candidate.endpoint),
+                route.identity,
+            );
             loop {
                 let started = std::time::Instant::now();
-                let mut request = prepared.to_request(candidate, Action::Stream);
+                let mut request = prepared.to_request(candidate, rotator.current(), Action::Stream);
                 request.extra_headers = &extra_headers;
                 request.proxy = candidate.proxy();
 
@@ -952,11 +1172,13 @@ impl RouteExecutor {
                                 }
                                 let latency_ms = started.elapsed().as_millis() as u64;
                                 let stream = prepend_stream(prefix, rest);
+                                rotator.commit();
                                 return Ok(self.outcome(
                                     candidate,
                                     route,
                                     attempts,
                                     latency_ms,
+                                    Some(rotator.hint()),
                                     RoutedStream::Native(UpstreamRawStream {
                                         status,
                                         headers,
@@ -965,15 +1187,38 @@ impl RouteExecutor {
                                 ));
                             }
                             Err(error) => {
-                                last_error =
-                                    self.handle_failure(candidate, error, attempts).await?;
-                                break;
+                                match self
+                                    .on_failure(candidate, &mut rotator, error, attempts)
+                                    .await
+                                {
+                                    Err(e) => return Err(e),
+                                    Ok(FailureAction::RotateKey) => {
+                                        attempts = attempts.saturating_add(1);
+                                        continue;
+                                    }
+                                    Ok(FailureAction::MoveOn(err)) => {
+                                        last_error = err;
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
                     Err(error) => {
-                        last_error = self.handle_failure(candidate, error, attempts).await?;
-                        break;
+                        match self
+                            .on_failure(candidate, &mut rotator, error, attempts)
+                            .await
+                        {
+                            Err(e) => return Err(e),
+                            Ok(FailureAction::RotateKey) => {
+                                attempts = attempts.saturating_add(1);
+                                continue;
+                            }
+                            Ok(FailureAction::MoveOn(err)) => {
+                                last_error = err;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -988,6 +1233,7 @@ impl RouteExecutor {
         route: &Route<'_>,
         attempts: u8,
         latency_ms: u64,
+        credential_hint: Option<String>,
         payload: T,
     ) -> RouteOutcome<T> {
         RouteOutcome {
@@ -998,6 +1244,7 @@ impl RouteExecutor {
             transcoded: candidate.needs_transcode(route.inbound),
             attempts,
             latency_ms,
+            credential_hint,
             payload,
         }
     }
@@ -1066,13 +1313,14 @@ impl<'a> PreparedBody<'a> {
     pub fn to_request(
         &'a self,
         candidate: &'a Candidate<'a>,
+        credential: &'a Credential,
         action: Action,
     ) -> UpstreamRequest<'a> {
         match self {
             PreparedBody::Raw(body) => UpstreamRequest::post_raw(
                 candidate.protocol(),
                 candidate.address(),
-                candidate.credential(),
+                credential,
                 candidate.upstream_model(),
                 action,
                 body,
@@ -1080,7 +1328,7 @@ impl<'a> PreparedBody<'a> {
             PreparedBody::OwnedRaw(body) => UpstreamRequest::post_raw(
                 candidate.protocol(),
                 candidate.address(),
-                candidate.credential(),
+                credential,
                 candidate.upstream_model(),
                 action,
                 body.as_slice(),
@@ -1088,7 +1336,7 @@ impl<'a> PreparedBody<'a> {
             PreparedBody::Json(body) => UpstreamRequest::post(
                 candidate.protocol(),
                 candidate.address(),
-                candidate.credential(),
+                credential,
                 candidate.upstream_model(),
                 action,
                 body,

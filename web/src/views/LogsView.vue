@@ -483,7 +483,25 @@ function fullTime(iso: string): string {
                 </span>
               </td>
 
-              <td class="px-4 py-2.5 whitespace-nowrap text-ink-soft">{{ channelLabel(log) }}</td>
+              <td class="px-4 py-2.5 whitespace-nowrap text-ink-soft">
+                <div class="flex items-center gap-1.5">
+                  {{ channelLabel(log) }}
+                  <span
+                    v-if="log.affinity_rule"
+                    class="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent"
+                    :title="`命中亲和规则：${log.affinity_rule}`"
+                  >
+                    {{ log.affinity_rule }}
+                  </span>
+                </div>
+                <p
+                  v-if="log.credential_hint"
+                  class="mt-0.5 font-mono text-[10px] text-ink-faint"
+                  title="本次请求实际使用的上游密钥（脱敏）"
+                >
+                  {{ log.credential_hint }}
+                </p>
+              </td>
 
               <td
                 class="px-4 py-2.5 text-right tabular whitespace-nowrap"
@@ -563,6 +581,14 @@ function fullTime(iso: string): string {
                   <div>
                     <dt class="text-ink-faint">密钥</dt>
                     <dd class="tabular">{{ log.api_key_id ?? '—' }}</dd>
+                  </div>
+                  <div>
+                    <dt class="text-ink-faint">上游密钥</dt>
+                    <dd class="font-mono">{{ log.credential_hint ?? '—' }}</dd>
+                  </div>
+                  <div>
+                    <dt class="text-ink-faint">亲和规则</dt>
+                    <dd>{{ log.affinity_rule ?? '—' }}</dd>
                   </div>
                 </dl>
 

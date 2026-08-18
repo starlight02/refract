@@ -58,6 +58,12 @@ pub struct RequestLog {
     pub error_kind: Option<String>,
     /// 错误消息。
     pub error_message: Option<String>,
+    /// 实际使用的上游钥匙的脱敏提示（多密钥池排障用）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_hint: Option<String>,
+    /// 命中并已使用的亲和规则名。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity_rule: Option<String>,
     /// 请求正文快照。列表查询不取（`None`），单条详情才有。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body: Option<String>,
@@ -113,6 +119,10 @@ pub struct NewRequestLog {
     pub error_kind: Option<String>,
     /// 错误消息。
     pub error_message: Option<String>,
+    /// 实际使用的上游钥匙的脱敏提示。
+    pub credential_hint: Option<String>,
+    /// 命中并已使用的亲和规则名。
+    pub affinity_rule: Option<String>,
     /// 请求正文快照（已按上限截断）。
     pub request_body: Option<String>,
     /// 响应正文快照（已按上限截断）。
@@ -155,6 +165,8 @@ impl NewRequestLog {
             error_message: None,
             request_body: None,
             response_body: None,
+            credential_hint: None,
+            affinity_rule: None,
         }
     }
 
@@ -208,6 +220,17 @@ impl NewRequestLog {
     pub fn with_error(mut self, kind: String, msg: String) -> Self {
         self.error_kind = Some(kind);
         self.error_message = Some(msg);
+        self
+    }
+
+    /// 注入排障上下文：实际使用的钥匙提示与亲和规则。
+    pub fn with_routing_context(
+        mut self,
+        credential_hint: Option<String>,
+        affinity_rule: Option<String>,
+    ) -> Self {
+        self.credential_hint = credential_hint;
+        self.affinity_rule = affinity_rule;
         self
     }
 
@@ -358,7 +381,8 @@ macro_rules! log_summary_cols {
         "id, request_id, created_at, api_key_id, channel_id, channel_name, \
          inbound_protocol, upstream_protocol, transcoded, model, upstream_model, stream, \
          status, ttfb_ms, duration_ms, input_tokens, output_tokens, cached_tokens, \
-         cache_write_tokens, reasoning_tokens, retries, cost, error_kind, error_message"
+         cache_write_tokens, reasoning_tokens, retries, cost, error_kind, error_message, \
+         credential_hint, affinity_rule"
     };
 }
 
@@ -368,7 +392,7 @@ macro_rules! log_detail_cols {
          inbound_protocol, upstream_protocol, transcoded, model, upstream_model, stream, \
          status, ttfb_ms, duration_ms, input_tokens, output_tokens, cached_tokens, \
          cache_write_tokens, reasoning_tokens, retries, cost, error_kind, error_message, \
-         request_body, response_body"
+         credential_hint, affinity_rule, request_body, response_body"
     };
 }
 
@@ -406,9 +430,9 @@ impl LogRepo {
              (owner_id, request_id, api_key_id, channel_id, channel_name, inbound_protocol, \
               upstream_protocol, transcoded, model, upstream_model, stream, status, ttfb_ms, \
               duration_ms, input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-              reasoning_tokens, retries, cost, error_kind, error_message, request_body, \
-              response_body) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              reasoning_tokens, retries, cost, error_kind, error_message, credential_hint, \
+              affinity_rule, request_body, response_body) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(entry.owner_id)
         .bind(&entry.request_id)
@@ -433,6 +457,8 @@ impl LogRepo {
         .bind(entry.cost)
         .bind(entry.error_kind.as_deref())
         .bind(entry.error_message.as_deref())
+        .bind(entry.credential_hint.as_deref())
+        .bind(entry.affinity_rule.as_deref())
         .bind(entry.request_body.as_deref())
         .bind(entry.response_body.as_deref())
         .fetch_one(self.db.pool())
@@ -734,6 +760,8 @@ impl LogRepo {
             cost: row.get("cost"),
             error_kind: row.get("error_kind"),
             error_message: row.get("error_message"),
+            credential_hint: row.get("credential_hint"),
+            affinity_rule: row.get("affinity_rule"),
             // 列表查询的 SELECT 不含这两列；只有单条详情才取。
             request_body: row.try_get("request_body").unwrap_or(None),
             response_body: row.try_get("response_body").unwrap_or(None),
@@ -774,6 +802,8 @@ mod tests {
             cost: 0.0,
             error_kind: None,
             error_message: None,
+            credential_hint: None,
+            affinity_rule: None,
             request_body: None,
             response_body: None,
         }

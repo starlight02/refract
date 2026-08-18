@@ -58,6 +58,10 @@ struct Inner {
     global_limits: ArcSwap<refract_store::GlobalLimits>,
     /// HTTP 200 空回复重试全局策略快照。
     empty_response_retry: ArcSwap<refract_core::EmptyResponseRetryPolicy>,
+    /// 渠道亲和性引擎：会话级绑定的内存缓存 + 规则编译。
+    affinity: refract_router::AffinityEngine,
+    /// 多密钥调度器：轮询游标与黏性绑定，与执行器共享同一份。
+    keys: refract_router::KeySelector,
     /// 并发上限信号量。`None` = 不限。改上限时整体重建 ——
     /// 旧 permit 归还旧信号量，新请求走新的，无需迁移。
     concurrency: ArcSwap<Option<Arc<tokio::sync::Semaphore>>>,
@@ -108,6 +112,10 @@ impl AppState {
         let concurrency = build_semaphore(&global_limits);
         // 事件通道在这里建立；消费端由 `spawn_event_worker` 拉起。
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let affinity_settings = SettingsRepo::new(db.clone()).affinity().await?;
+        let affinity_engine = refract_router::AffinityEngine::new();
+        affinity_engine.load(affinity_settings);
+        let keys = refract_router::KeySelector::new();
         let state = Self {
             inner: Arc::new(Inner {
                 db,
@@ -126,6 +134,8 @@ impl AppState {
                 webhook_url: ArcSwap::from_pointee(webhook_url),
                 global_limits: ArcSwap::from_pointee(global_limits),
                 empty_response_retry: ArcSwap::from_pointee(empty_response_retry),
+                affinity: affinity_engine,
+                keys,
                 concurrency: ArcSwap::from_pointee(concurrency),
             }),
         };
@@ -311,7 +321,31 @@ impl AppState {
             self.health_repo(),
             config,
         )
+        .with_keys(self.inner.keys.clone())
         .with_events(self.inner.events.clone())
+    }
+
+    /// 渠道亲和性引擎（网关热路径与 admin 统计共用）。
+    pub fn affinity(&self) -> &refract_router::AffinityEngine {
+        &self.inner.affinity
+    }
+
+    /// 多密钥调度器（渠道删除时清理游标与黏性绑定）。
+    pub fn key_selector(&self) -> &refract_router::KeySelector {
+        &self.inner.keys
+    }
+
+    /// 渠道被删除时：清掉亲和性绑定与密钥轮询游标。
+    pub fn forget_channel(&self, channel_id: refract_core::channel::ChannelId) {
+        self.inner.affinity.forget_channel(channel_id);
+        self.inner.keys.forget_channel(channel_id);
+    }
+
+    /// 从库里重读亲和性设置并重编译规则；已有缓存绑定保留。
+    pub async fn reload_affinity(&self) -> Result<(), StoreError> {
+        let settings = self.settings_repo().affinity().await?;
+        self.inner.affinity.load(settings);
+        Ok(())
     }
 
     /// 从数据库重新载入渠道快照。
@@ -374,6 +408,8 @@ mod tests {
             priority: 0,
             weight: 1,
             credential: Credential::new("sk-test"),
+            credentials: Vec::new(),
+            key_strategy: Default::default(),
             address: UpstreamAddress::default(),
             endpoints: vec![ep],
             tags: Vec::new(),

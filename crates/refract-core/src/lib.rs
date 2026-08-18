@@ -6,15 +6,20 @@
 // lint 配置统一在 workspace `Cargo.toml` 的 [workspace.lints] 里维护。
 
 pub mod address;
+pub mod affinity;
 pub mod channel;
 pub mod error;
 pub mod protocol;
 pub mod routing;
-
 pub use address::{Action, AddressError, PassKind, UpstreamAddress};
+pub use affinity::{
+    AffinityError, AffinityKeySource, AffinityRule, AffinitySettings, DEFAULT_AFFINITY_MAX_ENTRIES,
+    DEFAULT_AFFINITY_TTL_SECS, MAX_AFFINITY_TTL_SECS,
+};
 pub use channel::{
     Channel, ChannelEndpoint, ChannelError, ChannelId, ChannelKind, Credential,
-    EmptyResponseRetryOverride, EmptyResponseRetryPolicy, ModelEntry, TranscodePolicy,
+    EmptyResponseRetryOverride, EmptyResponseRetryPolicy, KeyPool, KeyStrategy, ModelEntry,
+    TranscodePolicy,
 };
 pub use error::{ErrorKind, GatewayError};
 pub use protocol::{AuthScheme, ParseProtocolError, Protocol, ProtocolSet};

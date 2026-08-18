@@ -133,6 +133,18 @@ impl ErrorKind {
                 | ErrorKind::PermissionDenied
         )
     }
+
+    /// 该错误是否说明**这把 API key 本身**有问题（过期、无权限、配额耗尽）。
+    ///
+    /// 与 `is_retryable` 的差别：限流/上游错误换渠道可能就好，而鉴权族错误
+    /// 是「key 维度」的失败 —— 同一渠道换一把 key 往往就能解决。执行器只在
+    /// 这些错误上轮转密钥池，其他错误轮转只是徒劳。
+    pub const fn is_key_failure(self) -> bool {
+        matches!(
+            self,
+            ErrorKind::Unauthenticated | ErrorKind::PermissionDenied | ErrorKind::RateLimited
+        )
+    }
 }
 
 /// 网关错误。
@@ -162,6 +174,8 @@ pub struct GatewayError {
     /// 健康度记录用它来悬停端点：上游明确说了「多久之后再来」，固定
     /// 指数退避就不该更早去打扰它。
     pub retry_after: Option<std::time::Duration>,
+    /// 最后一次尝试使用的密钥脱敏形式（失败日志定位坏 key 用）。
+    pub credential_hint: Option<String>,
 }
 
 impl GatewayError {
@@ -178,6 +192,7 @@ impl GatewayError {
             upstream_body: None,
             upstream_status: None,
             retry_after: None,
+            credential_hint: None,
         }
     }
 

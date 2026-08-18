@@ -69,6 +69,12 @@ async fn commit_channels(state: &AppState) -> Result<(), Rejection> {
 /// 若改 `Credential` 的全局 `Serialize`，数据库 JSON 也会被写成掩码。
 fn redact_channel(mut channel: Channel) -> Channel {
     channel.credential = Credential::new(channel.credential.masked());
+    // 池子里的每一把都脱敏；空主密钥的纯池子渠道同样逐把处理。
+    channel.credentials = channel
+        .credentials
+        .iter()
+        .map(|c| Credential::new(c.masked()))
+        .collect();
     for endpoint in &mut channel.endpoints {
         if let Some(credential) = &mut endpoint.credential {
             *credential = Credential::new(credential.masked());
@@ -94,6 +100,8 @@ fn looks_masked(value: &str) -> bool {
 fn reject_masked_credentials(channel: &Channel) -> Result<(), Rejection> {
     let offending = if looks_masked(channel.credential.expose()) {
         Some("渠道默认".to_owned())
+    } else if channel.credentials.iter().any(|c| looks_masked(c.expose())) {
+        Some("密钥池".to_owned())
     } else {
         channel
             .endpoints
@@ -124,6 +132,25 @@ fn restore_unchanged_credentials(existing: &Channel, incoming: &mut Channel) {
         incoming.credential = existing.credential.clone();
     }
 
+    // 池子按行脱敏，前端可能重排/增删行，掩码按「掩码串 → 旧明文」匹配，
+    // 不依赖索引位置；主密钥也参与匹配（它同样可能被挪进池子）。
+    let mut restore_from: Vec<Credential> = Vec::with_capacity(existing.credentials.len() + 1);
+    if !existing.credential.is_empty() {
+        restore_from.push(existing.credential.clone());
+    }
+    restore_from.extend(existing.credentials.iter().cloned());
+    for incoming_credential in &mut incoming.credentials {
+        let exposed = incoming_credential.expose();
+        if !looks_masked(exposed) {
+            continue;
+        }
+        if let Some(found) = restore_from
+            .iter()
+            .find(|candidate| candidate.masked() == exposed)
+        {
+            *incoming_credential = found.clone();
+        }
+    }
     for endpoint in &mut incoming.endpoints {
         let Some(incoming_credential) = &mut endpoint.credential else {
             continue;
@@ -334,6 +361,8 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                 .await
                 .map_err(reject)?;
             commit_channels(&state).await?;
+            // 渠道没了，指向它的亲和绑定与密钥轮转游标也一起清掉。
+            state.forget_channel(id);
             ok(serde_json::json!({ "deleted": id }))
         });
 
@@ -1383,6 +1412,63 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
             },
         );
 
+    // GET /api/settings/affinity —— 渠道亲和性设置（缺失时返回全默认）。
+    let get_affinity = base
+        .and(warp::path("affinity"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let settings = state.settings_repo().affinity().await.map_err(reject)?;
+            ok(settings)
+        });
+
+    // PUT /api/settings/affinity —— 校验并保存，随后热更新规则引擎。
+    let set_affinity = base
+        .and(warp::path("affinity"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(
+            |settings: refract_core::AffinitySettings, state: AppState| async move {
+                state
+                    .settings_repo()
+                    .set_affinity(&settings)
+                    .await
+                    .map_err(reject)?;
+                // 引擎在热路径里：规则改完必须立刻重载，否则保存了不生效。
+                state.reload_affinity().await.map_err(reject)?;
+                ok(settings)
+            },
+        );
+
+    // POST /api/settings/affinity/clear —— 清空全部已建立的绑定缓存。
+    // 规则本身不动；规则改了也无需清，缓存键按规则名区分。
+    let clear_affinity = base
+        .and(warp::path("affinity"))
+        .and(warp::path("clear"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let cleared = state.affinity().clear();
+            ok(serde_json::json!({ "cleared": cleared }))
+        });
+
+    // GET /api/settings/affinity/stats —— 命中/未命中/记录/遗忘次数与活跃绑定数。
+    let stats_affinity = base
+        .and(warp::path("affinity"))
+        .and(warp::path("stats"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let stats = state.affinity().stats();
+            let active = state.affinity().is_active();
+            ok(serde_json::json!({ "active": active, "stats": stats }))
+        });
+
     // 管理令牌只能写、不能读 —— 读接口等于把令牌泄漏给任何已经进来的人，
     // 而设置它的前提恰恰是「还没有令牌」。
     let set_token = base
@@ -1429,6 +1515,10 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         get_notify,
         set_notify,
         test_notify,
+        get_affinity,
+        set_affinity,
+        clear_affinity,
+        stats_affinity,
         set_token,
     ]
 }
@@ -1784,6 +1874,8 @@ mod tests {
             priority: 0,
             weight: 1,
             credential: Credential::new("test-key"),
+            credentials: Vec::new(),
+            key_strategy: Default::default(),
             address: UpstreamAddress::default(),
             endpoints: vec![ChannelEndpoint {
                 models: vec![ModelEntry::plain("gpt-4o")],

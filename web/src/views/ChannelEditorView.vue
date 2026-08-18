@@ -33,6 +33,7 @@ import type {
   Channel,
   ChannelEndpoint,
   ChannelKind,
+  KeyStrategy,
   ModelEntry,
   ModelProbe,
   Protocol,
@@ -104,8 +105,10 @@ function blankChannel(): Channel {
     priority: 0,
     weight: 1,
     credential: '',
-    address: emptyAddress(),
+    credentials: [],
+    key_strategy: 'round_robin',
     endpoints: [newEndpoint('chat')],
+    address: emptyAddress(),
     tags: [],
     timeout_secs: 0,
     proxy: null,
@@ -129,6 +132,22 @@ const showEndpointCredential = ref<Record<string, boolean>>({})
 const tagsText = ref('')
 /** 每个端点的「新增模型」输入框。 */
 const modelDraft = ref<Record<string, string>>({})
+/** 多密钥池：一行一把钥匙的文本编辑（含掩码行），提交时再切分。 */
+const credentialsText = ref('')
+/** 密钥池使用策略选项，与后端 KeyStrategy 的 serde 值一致。 */
+const KEY_STRATEGY_OPTIONS: { value: KeyStrategy; label: string; hint: string }[] = [
+  { value: 'round_robin', label: '轮询', hint: '每次请求依次换用池中的钥匙' },
+  { value: 'sticky', label: '黏性', hint: '同一调用方固定用一把钥匙，出错才换' },
+  { value: 'random', label: '随机', hint: '每次请求随机选一把钥匙' },
+]
+
+/** 钥匙池行数（忽略空行）—— 主密钥单独算一把，不重复计入。 */
+const poolLineCount = computed(
+  () =>
+    credentialsText.value.split('\n').filter((line) => line.trim() !== '').length +
+    (form.value.credential.trim() ? 1 : 0),
+)
+
 /** 探测结果，供一键同步。 */
 const probing = ref<Record<string, boolean>>({})
 const probeError = ref<Record<string, string>>({})
@@ -212,6 +231,7 @@ onMounted(async () => {
     tagsText.value = (ch.tags ?? []).join(', ')
     paramOverrideText.value = ch.param_override ? JSON.stringify(ch.param_override, null, 2) : ''
     headersText.value = (ch.extra_headers ?? []).map(([k, v]) => `${k}: ${v}`).join('\n')
+    credentialsText.value = (ch.credentials ?? []).join('\n')
     if (
       ch.param_override ||
       (ch.extra_headers ?? []).length > 0 ||
@@ -511,8 +531,11 @@ const validation = computed<string[]>(() => {
       errors.push(`端点 ${ep.protocol} 不能把自己的原生协议列为转换目标`)
 
     const hasOwn = !!ep.credential && ep.credential.trim() !== ''
-    if (!hasOwn && !f.credential.trim())
-      errors.push(`端点 ${ep.protocol} 没有密钥，且渠道默认密钥为空`)
+    // 主密钥与钥匙池任一非空即可兜底。
+    const hasDefault =
+      f.credential.trim() !== '' ||
+      credentialsText.value.split('\n').some((line) => line.trim() !== '')
+    if (!hasOwn && !hasDefault) errors.push(`端点 ${ep.protocol} 没有密钥，且渠道默认密钥为空`)
 
     // 地址校验只在非官方且非完整地址时有意义。
     const addr = hasOwnAddress(ep) ? ep.address : f.address
@@ -542,6 +565,11 @@ async function save() {
     tags: tagsText.value
       .split(',')
       .map((t) => t.trim())
+      .filter(Boolean),
+    // 密钥池：一行一把，空行忽略；掩码行由后端按值还原成真实密钥。
+    credentials: credentialsText.value
+      .split('\n')
+      .map((line) => line.trim())
       .filter(Boolean),
     param_override: paramOverrideText.value.trim()
       ? (JSON.parse(paramOverrideText.value) as Record<string, unknown>)
@@ -769,7 +797,9 @@ function previewUrl(ep: ChannelEndpoint): string {
       <!-- 默认凭据 -->
       <section class="glass glass-specular p-5">
         <h2 class="mb-1 text-sm font-semibold text-ink-soft uppercase">默认密钥</h2>
-        <p class="mb-4 text-xs text-ink-faint">端点未单独配置密钥时继承这里。</p>
+        <p class="mb-4 text-xs text-ink-faint">
+          端点未单独配置密钥时继承这里。支持多把钥匙轮换：每行一把，第一把与上面单独填写的主密钥共同构成钥匙池。
+        </p>
 
         <div class="relative">
           <input
@@ -789,6 +819,59 @@ function previewUrl(ep: ChannelEndpoint): string {
           >
             {{ showCredential ? '隐藏' : '显示' }}
           </button>
+        </div>
+
+        <!-- 密钥池：一行一把，保存时原样回传掩码行由后端还原 -->
+        <div class="mt-4">
+          <div class="mb-1 flex items-center justify-between">
+            <label for="credentials-pool" class="text-xs font-medium text-ink-soft"
+              >钥匙池（每行一把）</label
+            >
+            <button
+              type="button"
+              class="rounded px-2 py-1 text-xs text-ink-faint hover:text-ink"
+              :aria-pressed="showCredential"
+              @click="showCredential = !showCredential"
+            >
+              {{ showCredential ? '隐藏' : '显示' }}
+            </button>
+          </div>
+          <textarea
+            id="credentials-pool"
+            v-model="credentialsText"
+            rows="4"
+            spellcheck="false"
+            autocomplete="new-password"
+            placeholder="sk-...&#10;sk-...&#10;sk-..."
+            aria-label="上游钥匙池，每行一把"
+            class="glass-field w-full resize-y px-3 py-2 font-mono text-sm outline-none"
+            :class="showCredential ? undefined : '[webkit-text-security:disc]'"
+          ></textarea>
+          <p class="mt-1 text-xs text-ink-faint">
+            {{ poolLineCount }} 把钥匙参与轮换；留空表示仅使用主密钥。
+          </p>
+        </div>
+
+        <!-- 钥匙池策略 -->
+        <div class="mt-4 flex flex-col gap-1.5">
+          <span class="text-xs font-medium text-ink-soft">钥匙池策略</span>
+          <div class="flex flex-wrap gap-2">
+            <label
+              v-for="option in KEY_STRATEGY_OPTIONS"
+              :key="option.value"
+              class="glass-field flex cursor-pointer items-center gap-2 px-3 py-2 text-sm"
+            >
+              <input
+                v-model="form.key_strategy"
+                type="radio"
+                name="key-strategy"
+                :value="option.value"
+                class="accent-accent"
+              />
+              <span>{{ option.label }}</span>
+              <span class="text-xs text-ink-faint">{{ option.hint }}</span>
+            </label>
+          </div>
         </div>
       </section>
 

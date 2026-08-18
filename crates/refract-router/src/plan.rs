@@ -80,6 +80,11 @@ pub struct Route<'a> {
     pub attempts: Vec<Candidate<'a>>,
     /// 单次请求最多尝试的候选数，由执行器在健康度重排后应用。
     pub attempt_cap: usize,
+    /// 网关侧调用者身份（API key id）。
+    ///
+    /// 黏性密钥策略用它做「同一调用者固定同一把 key」的锚点；`None` 时
+    /// 黏性自动退化为轮询。路由本身不消费它 —— 只有执行器的密钥调度读。
+    pub identity: Option<u64>,
 }
 
 impl<'a> Route<'a> {
@@ -91,6 +96,36 @@ impl<'a> Route<'a> {
     /// 是否无候选。
     pub fn is_empty(&self) -> bool {
         self.attempts.is_empty()
+    }
+
+    /// 把指定渠道的首个候选移到尝试序列首位（亲和性钉住）。
+    ///
+    /// 返回 `false` 表示该渠道不在候选里（停用、无此模型或被协议过滤）——
+    /// 调用方据此决定是保留绑定等它恢复，还是解除绑定。
+    pub fn pin_channel(&mut self, channel_id: ChannelId) -> bool {
+        let Some(pos) = self
+            .attempts
+            .iter()
+            .position(|c| c.channel.id == channel_id)
+        else {
+            return false;
+        };
+        if pos != 0 {
+            let pinned = self.attempts.remove(pos);
+            self.attempts.insert(0, pinned);
+        }
+        true
+    }
+
+    /// 只保留钉住渠道的候选（亲和性 `skip_retry_on_failure` 语义）。
+    ///
+    /// 调用前必须已 `pin_channel`，因此首个候选就是钉住的渠道。执行器只会
+    /// 在 key 池内轮换，不再滑落到其他渠道。
+    pub fn pinned_only(&self) -> Route<'a> {
+        let mut route = self.clone();
+        route.attempts.truncate(1);
+        route.attempt_cap = 1;
+        route
     }
 }
 
@@ -201,8 +236,9 @@ impl RoutePlanner {
             // 「别限制」，而不是「一个都别试」。
             attempt_cap: match self.policy.max_attempts {
                 0 => usize::MAX,
-                n => usize::from(n),
+                n => n as usize,
             },
+            identity: None,
         }
     }
 
@@ -448,6 +484,8 @@ mod tests {
             priority,
             weight: 1,
             credential: Credential::new("sk-test"),
+            credentials: Vec::new(),
+            key_strategy: Default::default(),
             address: UpstreamAddress::default(),
             endpoints,
             tags: Vec::new(),

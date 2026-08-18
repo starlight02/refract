@@ -21,6 +21,10 @@ import {
   type ImportResult,
 } from '@/api/client'
 import type {
+  AffinityKeySource,
+  AffinityRule,
+  AffinitySettings,
+  AffinityStatsResponse,
   BreakerPolicy,
   EmptyResponseRetryPolicy,
   GlobalLimits,
@@ -120,7 +124,8 @@ const isDirty = computed(
     logBodiesDirty.value ||
     notifyDirty.value ||
     limitsDirty.value ||
-    emptyResponseRetryDirty.value,
+    emptyResponseRetryDirty.value ||
+    affinityDirty.value,
 )
 const retentionValid = computed(
   () =>
@@ -181,9 +186,229 @@ function removePriceRow(index: number) {
   pricing.value.splice(index, 1)
 }
 
+// ── 渠道亲和性 ──
+
+/**
+ * 亲和规则编辑用的一行来源。把判别联合摊平成「kind + 一个值」，
+ * 才能直接 v-model；提交时再按 kind 还原成 AffinityKeySource。
+ */
+interface SourceRow {
+  kind: 'api_key_id' | 'header' | 'body'
+  /** header 名或 body JSON Pointer；api_key_id 不使用。 */
+  value: string
+}
+
+/** 一条规则的编辑态：来源用行编辑。 */
+interface AffinityRuleDraft {
+  name: string
+  model_regex: string
+  path_regex: string
+  value_regex: string
+  ttl_secs: number | null
+  include_model: boolean
+  skip_retry_on_failure: boolean
+  sources: SourceRow[]
+}
+
+const affinity = ref<AffinitySettings>({
+  enabled: false,
+  switch_on_success: true,
+  keep_on_channel_disabled: false,
+  max_entries: 100_000,
+  default_ttl_secs: 1800,
+  rules: [],
+})
+const affinityRules = ref<AffinityRuleDraft[]>([])
+const affinityStats = ref<AffinityStatsResponse | null>(null)
+const affinityClearing = ref(false)
+const affinityNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
+
+function sourceToRow(source: AffinityKeySource): SourceRow {
+  if (source.kind === 'header') return { kind: 'header', value: source.name }
+  if (source.kind === 'body') return { kind: 'body', value: source.path }
+  return { kind: 'api_key_id', value: '' }
+}
+
+function rowToSource(row: SourceRow): AffinityKeySource | null {
+  if (row.kind === 'header') {
+    const name = row.value.trim()
+    return name ? { kind: 'header', name } : null
+  }
+  if (row.kind === 'body') return { kind: 'body', path: row.value.trim() }
+  return { kind: 'api_key_id' }
+}
+
+function ruleToDraft(rule: AffinityRule): AffinityRuleDraft {
+  return {
+    name: rule.name,
+    model_regex: rule.model_regex,
+    path_regex: rule.path_regex,
+    value_regex: rule.value_regex,
+    ttl_secs: rule.ttl_secs ?? null,
+    include_model: rule.include_model,
+    skip_retry_on_failure: rule.skip_retry_on_failure,
+    sources: rule.sources.map(sourceToRow),
+  }
+}
+
+function draftToRule(draft: AffinityRuleDraft): AffinityRule {
+  const sources = draft.sources.map(rowToSource).filter((s): s is AffinityKeySource => s !== null)
+  return {
+    name: draft.name.trim(),
+    model_regex: draft.model_regex,
+    path_regex: draft.path_regex,
+    value_regex: draft.value_regex,
+    // 清空/非法输入视为「用全局默认」：归一成 undefined 省略该字段，
+    // 与后端 skip-serialize 一致，避免脏检测因 null 与缺失差异而常亮。
+    ttl_secs:
+      draft.ttl_secs !== null && Number.isInteger(draft.ttl_secs) && draft.ttl_secs >= 1
+        ? draft.ttl_secs
+        : undefined,
+    include_model: draft.include_model,
+    skip_retry_on_failure: draft.skip_retry_on_failure,
+    sources,
+  }
+}
+/** 与后端 AffinitySettings::validate 一致的客户端校验；关闭时不拦截。 */
+const affinityValid = computed(() => {
+  if (!affinity.value.enabled) return true
+  const a = affinity.value
+  if (!Number.isInteger(a.max_entries) || a.max_entries < 1) return false
+  if (!Number.isInteger(a.default_ttl_secs) || a.default_ttl_secs < 1) return false
+  const seen = new Set<string>()
+  for (const draft of affinityRules.value) {
+    const name = draft.name.trim()
+    if (!name || seen.has(name)) return false
+    seen.add(name)
+    const sources = draft.sources.map(rowToSource).filter(Boolean)
+    if (sources.length === 0) return false
+    for (const row of draft.sources) {
+      if (row.kind === 'header' && !row.value.trim()) return false
+      if (row.kind === 'body') {
+        const path = row.value.trim()
+        if (path !== '' && !path.startsWith('/')) return false
+      }
+    }
+    if (draft.ttl_secs !== null && (!Number.isInteger(draft.ttl_secs) || draft.ttl_secs < 1))
+      return false
+  }
+  return true
+})
+
+let affinitySnapshot = ''
+
+/** 当前编辑态序列化成后端形状，供脏检测与保存共用。 */
+function affinityCurrent(): AffinitySettings {
+  return {
+    ...affinity.value,
+    rules: affinityRules.value.map(draftToRule),
+  }
+}
+
+const affinityDirty = computed(() => affinitySnapshot !== JSON.stringify(affinityCurrent()))
+
+function addAffinityRule() {
+  affinityRules.value.push({
+    name: `rule-${affinityRules.value.length + 1}`,
+    model_regex: '',
+    path_regex: '',
+    value_regex: '',
+    ttl_secs: null,
+    include_model: true,
+    skip_retry_on_failure: false,
+    sources: [{ kind: 'api_key_id', value: '' }],
+  })
+}
+
+function removeAffinityRule(index: number) {
+  affinityRules.value.splice(index, 1)
+}
+
+function addSourceRow(draft: AffinityRuleDraft) {
+  draft.sources.push({ kind: 'api_key_id', value: '' })
+}
+
+function removeSourceRow(draft: AffinityRuleDraft, index: number) {
+  draft.sources.splice(index, 1)
+}
+
+/** 预设：一键填入常见的亲和规则，省去手填来源。 */
+const AFFINITY_PRESETS: { label: string; desc: string; make: () => AffinityRuleDraft }[] = [
+  {
+    label: '按网关 API 密钥',
+    desc: '同一调用方（下游应用）固定命中同一渠道。',
+    make: () => ({
+      name: 'by-api-key',
+      model_regex: '',
+      path_regex: '',
+      value_regex: '',
+      ttl_secs: null,
+      include_model: true,
+      skip_retry_on_failure: false,
+      sources: [{ kind: 'api_key_id', value: '' }],
+    }),
+  },
+  {
+    label: '按自定义请求头 X-User-Id',
+    desc: '客户端在请求头带会话/用户 ID 时按它绑定。',
+    make: () => ({
+      name: 'by-header-user',
+      model_regex: '',
+      path_regex: '',
+      value_regex: '',
+      ttl_secs: null,
+      include_model: true,
+      skip_retry_on_failure: false,
+      sources: [{ kind: 'header', value: 'X-User-Id' }],
+    }),
+  },
+  {
+    label: '按请求体 user 字段',
+    desc: '从请求体 JSON 的 user 字段取值绑定。',
+    make: () => ({
+      name: 'by-body-user',
+      model_regex: '',
+      path_regex: '',
+      value_regex: '',
+      ttl_secs: null,
+      include_model: true,
+      skip_retry_on_failure: false,
+      sources: [{ kind: 'body', value: '/user' }],
+    }),
+  },
+]
+
+function applyAffinityPreset(preset: (typeof AFFINITY_PRESETS)[number]) {
+  affinityRules.value.push(preset.make())
+}
+
+/** 清空已建立的绑定缓存；不影响规则本身。 */
+async function clearAffinityBindings() {
+  if (affinityClearing.value) return
+  affinityClearing.value = true
+  affinityNotice.value = null
+  try {
+    const res = await settings.clearAffinity()
+    affinityNotice.value = { tone: 'success', text: `已清除 ${res.cleared} 条绑定。` }
+    await refreshAffinityStats()
+  } catch (e) {
+    affinityNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '清除失败' }
+  } finally {
+    affinityClearing.value = false
+  }
+}
+
+async function refreshAffinityStats() {
+  try {
+    affinityStats.value = await settings.affinityStats()
+  } catch {
+    affinityStats.value = null
+  }
+}
+
 onMounted(async () => {
   try {
-    const [p, retention, b, prices, bodies, notifySettings, globalLimits, emptyRetry] =
+    const [p, retention, b, prices, bodies, notifySettings, globalLimits, emptyRetry, aff] =
       await Promise.all([
         settings.routingPolicy(),
         settings.logRetention(),
@@ -193,6 +418,7 @@ onMounted(async () => {
         settings.notify(),
         settings.globalLimits(),
         settings.emptyResponseRetry(),
+        settings.affinity(),
       ])
     policy.value = p
     policySnapshot = JSON.stringify(p)
@@ -210,6 +436,10 @@ onMounted(async () => {
     limitsSnapshot = JSON.stringify(globalLimits)
     emptyResponseRetry.value = emptyRetry
     emptyResponseRetrySnapshot = JSON.stringify(emptyRetry)
+    affinity.value = aff
+    affinityRules.value = aff.rules.map(ruleToDraft)
+    affinitySnapshot = JSON.stringify(affinityCurrent())
+    refreshAffinityStats().catch(() => {})
     dataApi
       .stats()
       .then((stats) => (dbStats.value = stats))
@@ -244,6 +474,11 @@ async function save() {
   }
   if (!emptyResponseRetryValid.value) {
     saveError.value = '空回复重试不合法：判定窗口需为 0–3600 秒，最大重试需为 0–100 次'
+    return
+  }
+  if (!affinityValid.value) {
+    saveError.value =
+      '亲和规则不合法：名称需非空且唯一、每条规则至少一个来源、header 名不能为空、body 路径需以 / 开头、TTL 需为不小于 1 的整数'
     return
   }
   saving.value = true
@@ -292,6 +527,13 @@ async function save() {
       })
       notify.value = { ...saved_, webhook_url: saved_.webhook_url ?? '' }
       notifySnapshot = JSON.stringify(notify.value)
+    }
+    if (affinityDirty.value) {
+      const saved_ = await settings.setAffinity(affinityCurrent())
+      affinity.value = saved_
+      affinityRules.value = saved_.rules.map(ruleToDraft)
+      affinitySnapshot = JSON.stringify(affinityCurrent())
+      refreshAffinityStats().catch(() => {})
     }
     saved.value = true
   } catch (e) {
@@ -653,6 +895,281 @@ async function runImport(payload: unknown) {
         </div>
       </section>
 
+      <!-- 渠道亲和性 -->
+      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
+        <label class="flex cursor-pointer items-center gap-3">
+          <GlassSwitch v-model="affinity.enabled" label="启用渠道亲和性" />
+          <div>
+            <span class="text-sm font-semibold text-ink-soft uppercase">渠道亲和性</span>
+            <p class="mt-1 text-xs text-ink-faint">
+              按规则（API 密钥 / 请求头 /
+              请求体字段）把调用方绑定到固定渠道，后续请求优先命中同一渠道。
+              仅参与路由选择，不影响密钥池与熔断。改动保存后立即生效。
+            </p>
+          </div>
+        </label>
+
+        <template v-if="affinity.enabled">
+          <!-- 预设 -->
+          <div class="border-t border-ink/8 pt-4">
+            <span class="mb-2 block text-sm font-medium text-ink-soft">常用预设</span>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="preset in AFFINITY_PRESETS"
+                :key="preset.label"
+                type="button"
+                class="glass-button-ghost px-3 py-2 text-sm"
+                :title="preset.desc"
+                @click="applyAffinityPreset(preset)"
+              >
+                <AppIcon name="sparkles" :size="14" />
+                {{ preset.label }}
+              </button>
+            </div>
+          </div>
+
+          <!-- 规则列表 -->
+          <div class="border-t border-ink/8 pt-4">
+            <div class="mb-3 flex items-center justify-between">
+              <span class="text-sm font-medium text-ink-soft">亲和规则</span>
+              <button
+                type="button"
+                class="glass-button-ghost px-3 py-2 text-sm"
+                @click="addAffinityRule"
+              >
+                <AppIcon name="plus" :size="14" />
+                添加规则
+              </button>
+            </div>
+            <p v-if="affinityRules.length === 0" class="text-xs text-ink-faint">
+              尚未配置规则；启用后无规则时不产生任何绑定。
+            </p>
+
+            <div
+              v-for="(draft, ri) in affinityRules"
+              :key="ri"
+              class="mb-4 rounded-xl border border-ink/8 p-4"
+            >
+              <div class="flex items-start gap-3">
+                <label class="flex flex-1 flex-col gap-1.5">
+                  <span class="text-xs font-medium text-ink-soft"
+                    >规则名（缓存键的一部分，需唯一）</span
+                  >
+                  <input
+                    v-model="draft.name"
+                    type="text"
+                    class="glass-field px-3 py-2 text-sm outline-none"
+                    placeholder="例如 by-api-key"
+                  />
+                </label>
+                <button
+                  type="button"
+                  class="glass-button-ghost glass-button-ghost-danger shrink-0 px-2 py-2"
+                  :aria-label="`删除规则 ${draft.name}`"
+                  @click="removeAffinityRule(ri)"
+                >
+                  <AppIcon name="trash" :size="13" />
+                </button>
+              </div>
+
+              <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-xs text-ink-soft">模型正则（空 = 全部模型）</span>
+                  <input
+                    v-model="draft.model_regex"
+                    type="text"
+                    class="glass-field px-3 py-2 font-mono text-sm outline-none"
+                    placeholder="^(gpt|claude)-.*"
+                  />
+                </label>
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-xs text-ink-soft">路径正则（空 = 全部路径）</span>
+                  <input
+                    v-model="draft.path_regex"
+                    type="text"
+                    class="glass-field px-3 py-2 font-mono text-sm outline-none"
+                    placeholder="/v1/chat/completions"
+                  />
+                </label>
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-xs text-ink-soft">取值正则（空 = 原样绑定）</span>
+                  <input
+                    v-model="draft.value_regex"
+                    type="text"
+                    class="glass-field px-3 py-2 font-mono text-sm outline-none"
+                    placeholder="^user-(\d+)"
+                  />
+                </label>
+              </div>
+
+              <!-- 来源列表 -->
+              <div class="mt-3">
+                <div class="mb-2 flex items-center justify-between">
+                  <span class="text-xs font-medium text-ink-soft"
+                    >绑定来源（按顺序取第一个命中值）</span
+                  >
+                  <button
+                    type="button"
+                    class="glass-button-ghost px-2 py-1 text-xs"
+                    @click="addSourceRow(draft)"
+                  >
+                    <AppIcon name="plus" :size="12" />
+                    来源
+                  </button>
+                </div>
+                <div
+                  v-for="(row, si) in draft.sources"
+                  :key="si"
+                  class="mb-2 flex items-center gap-2"
+                >
+                  <select
+                    v-model="row.kind"
+                    class="glass-field w-40 px-2 py-2 text-sm outline-none"
+                    aria-label="来源类型"
+                  >
+                    <option value="api_key_id">调用方 API 密钥</option>
+                    <option value="header">请求头</option>
+                    <option value="body">请求体字段</option>
+                  </select>
+                  <input
+                    v-if="row.kind !== 'api_key_id'"
+                    v-model="row.value"
+                    type="text"
+                    class="glass-field flex-1 px-3 py-2 font-mono text-sm outline-none"
+                    :placeholder="
+                      row.kind === 'header'
+                        ? '请求头名，如 X-User-Id'
+                        : 'JSON 指针，如 /metadata/user_id'
+                    "
+                  />
+                  <button
+                    v-if="draft.sources.length > 1"
+                    type="button"
+                    class="glass-button-ghost shrink-0 px-2 py-2"
+                    :aria-label="`删除来源 ${si + 1}`"
+                    @click="removeSourceRow(draft, si)"
+                  >
+                    <AppIcon name="x" :size="13" />
+                  </button>
+                </div>
+              </div>
+
+              <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-xs text-ink-soft">TTL（秒，空 = 用全局默认）</span>
+                  <input
+                    v-model.number="draft.ttl_secs"
+                    type="number"
+                    min="1"
+                    max="604800"
+                    class="glass-field tabular px-3 py-2 text-sm outline-none"
+                    placeholder="默认"
+                  />
+                </label>
+                <label class="flex cursor-pointer items-center gap-2 self-end pb-2">
+                  <input
+                    v-model="draft.include_model"
+                    type="checkbox"
+                    class="accent-[var(--color-accent)]"
+                  />
+                  <span class="text-xs text-ink-soft">模型参与绑定键（不同模型分开绑定）</span>
+                </label>
+                <label class="flex cursor-pointer items-center gap-2 self-end pb-2">
+                  <input
+                    v-model="draft.skip_retry_on_failure"
+                    type="checkbox"
+                    class="accent-[var(--color-accent)]"
+                  />
+                  <span class="text-xs text-ink-soft">失败后不切换其他渠道（保持绑定）</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- 全局参数 -->
+          <div class="border-t border-ink/8 pt-4">
+            <span class="mb-2 block text-sm font-medium text-ink-soft">全局参数</span>
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label class="flex flex-col gap-1.5">
+                <span class="text-xs text-ink-soft">最大绑定条数（LRU 上限）</span>
+                <input
+                  v-model.number="affinity.max_entries"
+                  type="number"
+                  min="1"
+                  class="glass-field tabular w-40 px-3 py-2 text-sm outline-none"
+                />
+              </label>
+              <label class="flex flex-col gap-1.5">
+                <span class="text-xs text-ink-soft">默认 TTL（秒，1–604800）</span>
+                <input
+                  v-model.number="affinity.default_ttl_secs"
+                  type="number"
+                  min="1"
+                  max="604800"
+                  class="glass-field tabular w-40 px-3 py-2 text-sm outline-none"
+                />
+              </label>
+              <label class="flex cursor-pointer items-center gap-2">
+                <input
+                  v-model="affinity.switch_on_success"
+                  type="checkbox"
+                  class="accent-[var(--color-accent)]"
+                />
+                <span class="text-xs text-ink-soft">绑定渠道成功后更新 TTL（推荐开启）</span>
+              </label>
+              <label class="flex cursor-pointer items-center gap-2">
+                <input
+                  v-model="affinity.keep_on_channel_disabled"
+                  type="checkbox"
+                  class="accent-[var(--color-accent)]"
+                />
+                <span class="text-xs text-ink-soft">渠道被禁用时保留绑定（否则失效回退重选）</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 运行状态 -->
+          <div class="border-t border-ink/8 pt-4">
+            <div class="flex items-center justify-between">
+              <span class="text-sm font-medium text-ink-soft">绑定状态</span>
+              <button
+                type="button"
+                class="glass-button-ghost glass-button-ghost-danger px-3 py-2 text-sm disabled:opacity-50"
+                :disabled="affinityClearing"
+                @click="clearAffinityBindings"
+              >
+                <AppIcon name="trash" :size="13" />
+                {{ affinityClearing ? '清除中…' : '清空绑定' }}
+              </button>
+            </div>
+            <p v-if="affinityStats" class="mt-2 text-xs text-ink-faint">
+              当前绑定
+              <span class="font-mono text-ink-soft">{{ affinityStats.stats.entries }}</span> 条
+              （容量上限 <span class="font-mono text-ink-soft">{{ affinity.max_entries }}</span
+              >），命中
+              <span class="font-mono text-ink-soft">{{ affinityStats.stats.hits }}</span> / 未命中
+              <span class="font-mono text-ink-soft">{{ affinityStats.stats.misses }}</span
+              >，淘汰
+              <span class="font-mono text-ink-soft">{{ affinityStats.stats.evictions }}</span
+              >。
+            </p>
+            <p
+              v-if="affinityNotice"
+              class="mt-2 text-xs"
+              :class="affinityNotice.tone === 'success' ? 'text-ink-soft' : 'text-danger'"
+              role="status"
+            >
+              {{ affinityNotice.text }}
+            </p>
+          </div>
+
+          <p v-if="!affinityValid" class="text-xs text-danger" role="alert">
+            规则不合法：名称需非空且唯一；每条规则至少一个来源；请求头名不能为空；body 路径需以 /
+            开头；TTL 需为 1–604800 的整数。
+          </p>
+        </template>
+      </section>
+
       <!-- 熔断 -->
       <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
         <div>
@@ -997,7 +1514,8 @@ async function runImport(payload: unknown) {
             !breakerValid ||
             !pricingValid ||
             !notifyValid ||
-            !emptyResponseRetryValid
+            !emptyResponseRetryValid ||
+            !affinityValid
           "
           @click="save"
         >
