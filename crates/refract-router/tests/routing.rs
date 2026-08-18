@@ -2446,3 +2446,65 @@ async fn affinity_binding_pins_route_to_previously_successful_channel() {
         "pinned channel must be tried first"
     );
 }
+#[tokio::test]
+async fn max_upstream_calls_bounds_total_invocations_and_returns_budget_exhausted() {
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "a"})))
+        .expect(1)
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "b"})))
+        .expect(1)
+        .mount(&b)
+        .await;
+    let c = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "c"})))
+        .expect(0)
+        .mount(&c)
+        .await;
+
+    let channels = vec![
+        channel(
+            1,
+            "a",
+            10,
+            vec![endpoint(Protocol::Chat, 0, &a.uri(), ProtocolSet::EMPTY)],
+        ),
+        channel(
+            2,
+            "b",
+            9,
+            vec![endpoint(Protocol::Chat, 0, &b.uri(), ProtocolSet::EMPTY)],
+        ),
+        channel(
+            3,
+            "c",
+            8,
+            vec![endpoint(Protocol::Chat, 0, &c.uri(), ProtocolSet::EMPTY)],
+        ),
+    ];
+    let health = seeded_health(&channels).await;
+    let exec = RouteExecutor::new(
+        upstream_client(),
+        CodecSet::builtin(),
+        health,
+        RouterConfig::default(),
+    );
+
+    let planner = RoutePlanner::new(RoutingPolicy {
+        max_attempts: 10,
+        max_upstream_calls: 2,
+        ..Default::default()
+    });
+    let mut rng = rand::rng();
+    let route = planner.plan(&channels, "gpt-4o", Protocol::Chat, &mut rng);
+
+    let err = exec.execute(&route, &ir_request()).await.unwrap_err();
+    assert_eq!(err.kind, refract_core::ErrorKind::NoAvailableChannel);
+    assert_eq!(err.message, "upstream call budget exhausted");
+    assert_eq!(err.kind.status(), 503);
+}

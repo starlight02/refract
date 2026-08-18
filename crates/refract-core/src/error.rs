@@ -216,6 +216,14 @@ impl GatewayError {
         Self::new(ErrorKind::NoAvailableChannel, message)
     }
 
+    /// 单请求允许的上游调用总预算耗尽。
+    pub fn budget_exhausted() -> Self {
+        Self::new(
+            ErrorKind::NoAvailableChannel,
+            "upstream call budget exhausted",
+        )
+    }
+
     /// 协议转换被策略拒绝（需求 4）。
     pub fn transcode_not_permitted(inbound: Protocol, native: Protocol) -> Self {
         Self::new(

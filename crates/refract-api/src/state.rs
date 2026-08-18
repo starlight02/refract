@@ -65,6 +65,12 @@ struct Inner {
     /// 并发上限信号量。`None` = 不限。改上限时整体重建 ——
     /// 旧 permit 归还旧信号量，新请求走新的，无需迁移。
     concurrency: ArcSwap<Option<Arc<tokio::sync::Semaphore>>>,
+    ip_limits: ArcSwap<refract_store::IpLimits>,
+    ip_limiter: crate::rate::IpRateLimiter,
+    webhook_secret: ArcSwap<Option<String>>,
+    backup_settings: ArcSwap<refract_store::BackupSettings>,
+    master_key: ArcSwap<Option<[u8; 32]>>,
+    admin_guard: crate::auth::AdminGuard,
 }
 
 /// 由限制值构造并发信号量。0 = 不限（None）。
@@ -89,7 +95,28 @@ impl AppState {
         client: UpstreamClient,
         require_auth: bool,
     ) -> Result<Self, StoreError> {
+        Self::bootstrap_with_master_key(db, client, require_auth, None).await
+    }
+
+    /// 从数据库装配状态，可选传入显式主密钥（如来自环境变量 `REFRACT_MASTER_KEY`）。
+    pub async fn bootstrap_with_master_key(
+        db: Database,
+        client: UpstreamClient,
+        require_auth: bool,
+        explicit_master_key: Option<[u8; 32]>,
+    ) -> Result<Self, StoreError> {
+        let master_key = match explicit_master_key {
+            Some(key) => Some(key),
+            None => {
+                if let Ok(Some(key_str)) = SettingsRepo::new(db.clone()).master_key().await {
+                    refract_store::parse_master_key(&key_str).ok()
+                } else {
+                    None
+                }
+            }
+        };
         let channels = ChannelRepo::new(db.clone())
+            .with_master_key(master_key)
             .list(refract_core::DEFAULT_OWNER_ID)
             .await?;
         let policy = SettingsRepo::new(db.clone()).routing_policy().await?;
@@ -110,7 +137,9 @@ impl AppState {
         let global_limits = SettingsRepo::new(db.clone()).global_limits().await?;
         let empty_response_retry = SettingsRepo::new(db.clone()).empty_response_retry().await?;
         let concurrency = build_semaphore(&global_limits);
-        // 事件通道在这里建立；消费端由 `spawn_event_worker` 拉起。
+        let ip_limits = SettingsRepo::new(db.clone()).ip_limits().await?;
+        let webhook_secret = SettingsRepo::new(db.clone()).webhook_secret().await?;
+        let backup_settings = SettingsRepo::new(db.clone()).backup_settings().await?;
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
         let affinity_settings = SettingsRepo::new(db.clone()).affinity().await?;
         let affinity_engine = refract_router::AffinityEngine::new();
@@ -137,6 +166,12 @@ impl AppState {
                 affinity: affinity_engine,
                 keys,
                 concurrency: ArcSwap::from_pointee(concurrency),
+                ip_limits: ArcSwap::from_pointee(ip_limits),
+                ip_limiter: crate::rate::IpRateLimiter::new(),
+                webhook_secret: ArcSwap::from_pointee(webhook_secret),
+                backup_settings: ArcSwap::from_pointee(backup_settings),
+                master_key: ArcSwap::from_pointee(master_key),
+                admin_guard: crate::auth::AdminGuard::new(),
             }),
         };
         crate::notify::spawn_event_worker(state.clone(), receiver);
@@ -279,9 +314,72 @@ impl AppState {
         &self.inner.client
     }
 
-    /// 渠道仓储。
+    /// 渠道仓储（自动注入当前主密钥）。
     pub fn channel_repo(&self) -> ChannelRepo {
-        ChannelRepo::new(self.inner.db.clone())
+        ChannelRepo::new(self.inner.db.clone()).with_master_key(self.master_key())
+    }
+
+    /// 当前单 IP 限速快照。
+    pub fn ip_limits(&self) -> refract_store::IpLimits {
+        **self.inner.ip_limits.load()
+    }
+
+    /// 单 IP 限速器。
+    pub fn ip_limiter(&self) -> &crate::rate::IpRateLimiter {
+        &self.inner.ip_limiter
+    }
+
+    /// 从库里重读单 IP 限速。
+    pub async fn reload_ip_limits(&self) -> Result<(), StoreError> {
+        let limits = self.settings_repo().ip_limits().await?;
+        self.inner.ip_limits.store(Arc::new(limits));
+        Ok(())
+    }
+
+    /// 告警 webhook 签名密钥。
+    pub fn webhook_secret(&self) -> Option<String> {
+        self.inner.webhook_secret.load().as_ref().clone()
+    }
+
+    /// 从库里重读 webhook 签名密钥。
+    pub async fn reload_webhook_secret(&self) -> Result<(), StoreError> {
+        let secret = self.settings_repo().webhook_secret().await?;
+        self.inner.webhook_secret.store(Arc::new(secret));
+        Ok(())
+    }
+
+    /// 自动备份设置。
+    pub fn backup_settings(&self) -> refract_store::BackupSettings {
+        (**self.inner.backup_settings.load()).clone()
+    }
+
+    /// 从库里重读自动备份设置。
+    pub async fn reload_backup(&self) -> Result<(), StoreError> {
+        let backup = self.settings_repo().backup_settings().await?;
+        self.inner.backup_settings.store(Arc::new(backup));
+        Ok(())
+    }
+
+    /// 当前主加密密钥（32 字节）。
+    pub fn master_key(&self) -> Option<[u8; 32]> {
+        *self.inner.master_key.load().as_ref()
+    }
+
+    /// 从库里重读主加密密钥。
+    pub async fn reload_master_key(&self) -> Result<(), StoreError> {
+        let key = match self.settings_repo().master_key().await? {
+            Some(s) => refract_store::parse_master_key(&s).ok(),
+            None => None,
+        };
+        self.inner.master_key.store(Arc::new(key));
+        // 密钥变化后刷新渠道快照（重新加解密）
+        self.reload_channels().await?;
+        Ok(())
+    }
+
+    /// 管理面防爆破守卫。
+    pub fn admin_guard(&self) -> &crate::auth::AdminGuard {
+        &self.inner.admin_guard
     }
 
     /// 密钥仓储。

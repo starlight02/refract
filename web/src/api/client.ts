@@ -13,6 +13,10 @@ import type {
   AffinitySettings,
   AffinityStatsResponse,
   ApiKey,
+  BackupFile,
+  BackupSettings,
+  IpLimits,
+  SecretConfigured,
   ChannelStat,
   EmptyResponseRetryPolicy,
   GlobalLimits,
@@ -339,6 +343,8 @@ export const settings = {
   globalLimits: () => request<GlobalLimits>('GET', '/api/settings/limits'),
   setGlobalLimits: (limits: GlobalLimits) =>
     request<GlobalLimits>('PUT', '/api/settings/limits', limits),
+  ipLimits: () => request<IpLimits>('GET', '/api/settings/ip-limits'),
+  setIpLimits: (limits: IpLimits) => request<IpLimits>('PUT', '/api/settings/ip-limits', limits),
   emptyResponseRetry: () =>
     request<EmptyResponseRetryPolicy>('GET', '/api/settings/empty-response-retry'),
   setEmptyResponseRetry: (policy: EmptyResponseRetryPolicy) =>
@@ -347,6 +353,10 @@ export const settings = {
   setNotify: (settings: NotifySettings) =>
     request<NotifySettings>('PUT', '/api/settings/notify', settings),
   testNotify: () => request<{ sent: boolean }>('POST', '/api/settings/notify/test'),
+  /** Webhook 签名密钥；只回是否已配置，不回明文。传 null 清除。 */
+  webhookSecret: () => request<SecretConfigured>('GET', '/api/settings/webhook-secret'),
+  setWebhookSecret: (secret: string | null) =>
+    request<SecretConfigured>('PUT', '/api/settings/webhook-secret', { secret }),
   /** 渠道亲和性设置；缺失时后端返回全默认（功能关闭）。 */
   affinity: () => request<AffinitySettings>('GET', '/api/settings/affinity'),
   setAffinity: (settings: AffinitySettings) =>
@@ -355,9 +365,33 @@ export const settings = {
   clearAffinity: () => request<{ cleared: number }>('POST', '/api/settings/affinity/clear'),
   /** 命中/未命中/记录/遗忘次数与活跃绑定数。 */
   affinityStats: () => request<AffinityStatsResponse>('GET', '/api/settings/affinity/stats'),
+  /** 自动备份设置：目录、间隔（0 关闭）、保留份数。 */
+  backupSettings: () => request<BackupSettings>('GET', '/api/settings/backup'),
+  setBackupSettings: (settings: BackupSettings) =>
+    request<BackupSettings>('PUT', '/api/settings/backup', settings),
+  /** 凭据静态加密的主密钥；只回是否已配置，不回明文。传 null 清除。 */
+  masterKey: () => request<SecretConfigured>('GET', '/api/settings/master-key'),
+  setMasterKey: (key: string | null) =>
+    request<SecretConfigured>('PUT', '/api/settings/master-key', { key }),
   /** 传 null 关闭管理鉴权。设置后无法读回，只能覆盖或清除。 */
   setAdminToken: (token: string | null) =>
     request<{ configured: boolean }>('PUT', '/api/settings/admin-token', { token }),
+}
+
+/**
+ * 备份文件管理（自动备份与手动备份的产物）。
+ *
+ * 与 `data.backup`（在线 VACUUM INTO 热备、直接吐文件）不同：这里管理的是
+ * 已落盘的备份文件列表 —— 可以按需下载或删除某一份。
+ */
+export const backups = {
+  list: () => request<BackupFile[]>('GET', '/api/backups'),
+  /** 立即生成一份备份。 */
+  create: () => request<{ name: string }>('POST', '/api/backups'),
+  /** 带管理令牌的下载；文件名由服务端 content-disposition 给出。 */
+  download: (name: string) => download(`/api/backups/${encodeURIComponent(name)}`, name),
+  remove: (name: string) =>
+    request<{ deleted: boolean }>('DELETE', `/api/backups/${encodeURIComponent(name)}`),
 }
 
 /** 渠道健康度与熔断。 */

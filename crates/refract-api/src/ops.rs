@@ -13,6 +13,7 @@ pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let metrics = warp::path("metrics")
         .and(warp::path::end())
         .and(warp::get())
+        .and(crate::auth::admin_auth(state.clone()))
         .and(with_state(state.clone()))
         .map(|state: AppState| {
             // 与健康探针同样不鉴权：指标不含密钥明文，模型/协议名的暴露面

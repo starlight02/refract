@@ -38,6 +38,14 @@ pub const KEY_GLOBAL_LIMITS: &str = "limits.global";
 pub const KEY_EMPTY_RESPONSE_RETRY: &str = "upstream.empty_response_retry";
 /// 渠道亲和性设置。
 pub const KEY_AFFINITY: &str = "affinity.settings";
+/// 单 IP 限速(网关级,按客户端 IP 计)。
+pub const KEY_IP_LIMITS: &str = "limits.ip";
+/// 告警 webhook 的 HMAC 签名密钥。
+pub const KEY_WEBHOOK_SECRET: &str = "notify.webhook_secret";
+/// 自动备份设置。
+pub const KEY_BACKUP: &str = "backup.settings";
+/// 凭据静态加密主密钥(base64 编码的 32 字节)。
+pub const KEY_MASTER_KEY: &str = "auth.master_key";
 
 /// 网关级全局限制。密钥级限速在免鉴权模式下是零防护 ——
 /// 跑飞的本地 agent 迴圈会原样打穿上游账单，这层是最后的保险丝。
@@ -59,6 +67,67 @@ impl GlobalLimits {
         }
         if self.max_concurrency > 100_000 {
             return Err("global concurrency must be at most 100,000".into());
+        }
+        Ok(())
+    }
+}
+
+/// 单 IP 限速。全局限制挡的是总量,挡不住「单个客户端把配额吃光」——
+/// 一个跑飞的脚本可以在全局 RPM 之内独占所有吞吐,这层按 IP 隔离。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IpLimits {
+    /// 每个客户端 IP 每分钟请求数上限。0 = 不限。
+    #[serde(default)]
+    pub rpm: u32,
+}
+
+impl IpLimits {
+    /// 校验数值范围。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.rpm > 1_000_000 {
+            return Err("per-ip rpm must be at most 1,000,000".into());
+        }
+        Ok(())
+    }
+}
+
+/// 自动备份设置。`interval_hours = 0` 表示关闭自动备份。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BackupSettings {
+    /// 备份目录;`None` 时用数据库文件旁的 `backups/`。
+    #[serde(default)]
+    pub directory: Option<String>,
+    /// 备份间隔(小时)。0 = 关闭。
+    #[serde(default)]
+    pub interval_hours: u32,
+    /// 保留份数,超出删最旧。
+    #[serde(default = "default_backup_keep")]
+    pub keep: u32,
+}
+
+/// 默认保留份数。
+pub fn default_backup_keep() -> u32 {
+    8
+}
+
+impl Default for BackupSettings {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            interval_hours: 0,
+            keep: default_backup_keep(),
+        }
+    }
+}
+
+impl BackupSettings {
+    /// 校验数值范围。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.interval_hours > 8760 {
+            return Err("backup interval must be at most 8760 hours (one year)".into());
+        }
+        if !(1..=100).contains(&self.keep) {
+            return Err("backup keep must be between 1 and 100".into());
         }
         Ok(())
     }
@@ -242,6 +311,7 @@ impl SettingsRepo {
 
     /// 写入路由策略。
     pub async fn set_routing_policy(&self, policy: &RoutingPolicy) -> Result<(), StoreError> {
+        policy.validate().map_err(StoreError::Invalid)?;
         self.set(KEY_ROUTING_POLICY, policy).await
     }
 
@@ -340,6 +410,60 @@ impl SettingsRepo {
         self.set(KEY_GLOBAL_LIMITS, limits).await
     }
 
+    /// 单 IP 限速。缺省 0(不限)。
+    pub async fn ip_limits(&self) -> Result<IpLimits, StoreError> {
+        Ok(self.get_or_default(KEY_IP_LIMITS).await)
+    }
+
+    /// 校验并保存单 IP 限速。
+    pub async fn set_ip_limits(&self, limits: &IpLimits) -> Result<(), StoreError> {
+        limits.validate().map_err(StoreError::Invalid)?;
+        self.set(KEY_IP_LIMITS, limits).await
+    }
+
+    /// 告警 webhook 签名密钥。未配置返回 `None`;读取方永远不应回显明文。
+    pub async fn webhook_secret(&self) -> Result<Option<String>, StoreError> {
+        self.get::<String>(KEY_WEBHOOK_SECRET).await
+    }
+
+    /// 设置或清除 webhook 签名密钥(`None` = 清除)。
+    pub async fn set_webhook_secret(&self, secret: Option<&str>) -> Result<(), StoreError> {
+        match secret {
+            Some(value) if !value.is_empty() => {
+                self.set(KEY_WEBHOOK_SECRET, &value.to_owned()).await
+            }
+            _ => self.remove(KEY_WEBHOOK_SECRET).await,
+        }
+    }
+
+    /// 自动备份设置。缺省关闭(interval_hours = 0)。
+    pub async fn backup_settings(&self) -> Result<BackupSettings, StoreError> {
+        Ok(self.get_or_default(KEY_BACKUP).await)
+    }
+
+    /// 校验并保存自动备份设置。
+    pub async fn set_backup_settings(&self, settings: &BackupSettings) -> Result<(), StoreError> {
+        settings.validate().map_err(StoreError::Invalid)?;
+        self.set(KEY_BACKUP, settings).await
+    }
+
+    /// 凭据静态加密主密钥(base64)。未配置返回 `None`。
+    pub async fn master_key(&self) -> Result<Option<String>, StoreError> {
+        self.get::<String>(KEY_MASTER_KEY).await
+    }
+
+    /// 设置或清除主密钥(`None` = 清除)。值必须是 32 字节的 base64。
+    pub async fn set_master_key(&self, key: Option<&str>) -> Result<(), StoreError> {
+        match key {
+            Some(value) if !value.is_empty() => {
+                crate::crypto::parse_master_key(value)
+                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                self.set(KEY_MASTER_KEY, &value.to_owned()).await
+            }
+            _ => self.remove(KEY_MASTER_KEY).await,
+        }
+    }
+
     /// HTTP 200 响应策略。缺省为空回复 3 秒内最多重试 5 次，严格校验关闭。
     pub async fn empty_response_retry(&self) -> Result<EmptyResponseRetryPolicy, StoreError> {
         Ok(self.get_or_default(KEY_EMPTY_RESPONSE_RETRY).await)
@@ -399,6 +523,7 @@ impl SettingsRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     async fn repo() -> SettingsRepo {
         SettingsRepo::new(Database::open_in_memory().await.unwrap())
@@ -688,5 +813,96 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn ip_limits_defaults_roundtrips_and_validates() {
+        let repo = repo().await;
+        assert_eq!(repo.ip_limits().await.unwrap(), IpLimits::default());
+
+        let limits = IpLimits { rpm: 120 };
+        repo.set_ip_limits(&limits).await.unwrap();
+        assert_eq!(repo.ip_limits().await.unwrap(), limits);
+
+        let too_big = IpLimits { rpm: 1_000_001 };
+        assert!(repo.set_ip_limits(&too_big).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_secret_set_clear_roundtrips() {
+        let repo = repo().await;
+        assert_eq!(repo.webhook_secret().await.unwrap(), None);
+
+        repo.set_webhook_secret(Some("s3cret")).await.unwrap();
+        assert_eq!(repo.webhook_secret().await.unwrap(), Some("s3cret".into()));
+
+        // 空串与 None 都视为清除。
+        repo.set_webhook_secret(Some("")).await.unwrap();
+        assert_eq!(repo.webhook_secret().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn backup_settings_defaults_roundtrips_and_validates() {
+        let repo = repo().await;
+        assert_eq!(
+            repo.backup_settings().await.unwrap(),
+            BackupSettings::default()
+        );
+
+        let settings = BackupSettings {
+            directory: Some("/data/backups".into()),
+            interval_hours: 6,
+            keep: 12,
+        };
+        repo.set_backup_settings(&settings).await.unwrap();
+        assert_eq!(repo.backup_settings().await.unwrap(), settings);
+
+        let bad_keep = BackupSettings {
+            keep: 0,
+            ..BackupSettings::default()
+        };
+        assert!(repo.set_backup_settings(&bad_keep).await.is_err());
+
+        let bad_interval = BackupSettings {
+            interval_hours: 8761,
+            ..BackupSettings::default()
+        };
+        assert!(repo.set_backup_settings(&bad_interval).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn master_key_requires_32_bytes_base64() {
+        let repo = repo().await;
+        assert_eq!(repo.master_key().await.unwrap(), None);
+
+        let key = base64::engine::general_purpose::STANDARD.encode([7_u8; 32]);
+        repo.set_master_key(Some(&key)).await.unwrap();
+        assert_eq!(repo.master_key().await.unwrap(), Some(key.clone()));
+
+        // 长度不对的密钥必须被拒绝。
+        let short = base64::engine::general_purpose::STANDARD.encode([7_u8; 16]);
+        assert!(repo.set_master_key(Some(&short)).await.is_err());
+        assert!(repo.set_master_key(Some("not-base64!!!")).await.is_err());
+
+        repo.set_master_key(None).await.unwrap();
+        assert_eq!(repo.master_key().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn routing_policy_validate_rejects_absurd_max_attempts() {
+        let repo = repo().await;
+        let policy = RoutingPolicy {
+            max_attempts: 33,
+            ..Default::default()
+        };
+        assert!(repo.set_routing_policy(&policy).await.is_err());
+
+        let ok = RoutingPolicy {
+            max_attempts: 5,
+            max_upstream_calls: 12,
+            ..Default::default()
+        };
+        repo.set_routing_policy(&ok).await.unwrap();
+        assert_eq!(repo.routing_policy().await.unwrap(), ok);
     }
 }

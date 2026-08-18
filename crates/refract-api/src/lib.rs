@@ -19,6 +19,7 @@ pub mod router;
 
 pub mod admin;
 pub mod auth;
+pub mod backup;
 pub mod error;
 pub mod gateway;
 pub mod metrics;

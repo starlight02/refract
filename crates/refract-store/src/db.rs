@@ -77,10 +77,21 @@ impl Database {
         if path.as_os_str() == ":memory:" {
             return Self::open_in_memory().await;
         }
+        // 父目录不存在时新建,并把新建的目录收紧到 0700。
+        let mut parent_created = false;
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
+            parent_created = !parent.exists();
             std::fs::create_dir_all(parent).ok();
+        }
+        // 预创建 0600 的库文件:SQLite 新建文件走默认 umask(常见 0644),
+        // 事后再 chmod 会留出一段「同机其他用户可读」的窗口。库里有全部
+        // 上游密钥,必须在创建瞬间就是 owner-only。WAL/SHM 文件由 SQLite
+        // 按主库文件的权限创建,会继承 0600。
+        create_owner_only_file(path);
+        if parent_created {
+            restrict_dir_owner_only(path.parent().expect("checked above"));
         }
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -155,6 +166,8 @@ impl Database {
         sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{path}'")))
             .execute(self.pool())
             .await?;
+        // 备份文件是整库拷贝,含全部凭据 —— 与主库同等待遇。
+        restrict_owner_only(target);
         Ok(())
     }
 
@@ -163,6 +176,50 @@ impl Database {
         self.pool.close().await;
     }
 }
+
+/// 以 0600 预创建文件;已存在则不做任何事。
+#[cfg(unix)]
+fn create_owner_only_file(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .ok();
+}
+
+#[cfg(not(unix))]
+fn create_owner_only_file(_path: &Path) {}
+
+/// 把文件权限收紧到 0600(owner 读写)。失败静默:权限只是纵深防御,
+/// 不应让备份/开库流程因此失败。
+#[cfg(unix)]
+fn restrict_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms).ok();
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_owner_only(_path: &Path) {}
+
+/// 把新建目录权限收紧到 0700。
+#[cfg(unix)]
+fn restrict_dir_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(path, perms).ok();
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_owner_only(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -244,5 +301,41 @@ mod tests {
             dup.is_err(),
             "duplicate protocol per channel must be rejected"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_database_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nested").join("perm.db");
+        let db = Database::open(&db_path).await.unwrap();
+        db.ping().await.unwrap();
+
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "new db file must be 0600, got {mode:o}");
+
+        let dir_mode = std::fs::metadata(db_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "new parent dir must be 0700, got {dir_mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vacuum_into_backup_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("src.db")).await.unwrap();
+        let backup = dir.path().join("backup.db");
+        db.vacuum_into(&backup).await.unwrap();
+
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "backup file must be 0600, got {mode:o}");
     }
 }

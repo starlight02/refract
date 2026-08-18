@@ -80,6 +80,8 @@ pub struct Route<'a> {
     pub attempts: Vec<Candidate<'a>>,
     /// 单次请求最多尝试的候选数，由执行器在健康度重排后应用。
     pub attempt_cap: usize,
+    /// 单请求允许发出的上游调用总预算(0 = 不限)。
+    pub max_upstream_calls: u8,
     /// 网关侧调用者身份（API key id）。
     ///
     /// 黏性密钥策略用它做「同一调用者固定同一把 key」的锚点；`None` 时
@@ -238,6 +240,7 @@ impl RoutePlanner {
                 0 => usize::MAX,
                 n => n as usize,
             },
+            max_upstream_calls: self.policy.max_upstream_calls,
             identity: None,
         }
     }

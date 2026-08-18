@@ -128,9 +128,10 @@ fn chat(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(authenticate(state.authenticator(), Protocol::Chat))
         .and(warp::header::headers_cloned())
         .and(protocol_json_body(Protocol::Chat))
+        .and(warp::filters::addr::remote())
         .and(with_state(state))
-        .and_then(|caller, headers, body, state| {
-            dispatch(state, caller, Protocol::Chat, headers, body, None)
+        .and_then(|caller, headers, body, remote, state| {
+            dispatch(state, caller, Protocol::Chat, headers, body, None, remote)
         })
         .boxed()
 }
@@ -145,9 +146,18 @@ fn messages(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(authenticate(state.authenticator(), Protocol::Messages))
         .and(warp::header::headers_cloned())
         .and(protocol_json_body(Protocol::Messages))
+        .and(warp::filters::addr::remote())
         .and(with_state(state))
-        .and_then(|caller, headers, body, state| {
-            dispatch(state, caller, Protocol::Messages, headers, body, None)
+        .and_then(|caller, headers, body, remote, state| {
+            dispatch(
+                state,
+                caller,
+                Protocol::Messages,
+                headers,
+                body,
+                None,
+                remote,
+            )
         })
         .boxed()
 }
@@ -162,9 +172,18 @@ fn responses(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(authenticate(state.authenticator(), Protocol::Responses))
         .and(warp::header::headers_cloned())
         .and(protocol_json_body(Protocol::Responses))
+        .and(warp::filters::addr::remote())
         .and(with_state(state))
-        .and_then(|caller, headers, body, state| {
-            dispatch(state, caller, Protocol::Responses, headers, body, None)
+        .and_then(|caller, headers, body, remote, state| {
+            dispatch(
+                state,
+                caller,
+                Protocol::Responses,
+                headers,
+                body,
+                None,
+                remote,
+            )
         })
         .boxed()
 }
@@ -179,12 +198,14 @@ fn gemini(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(authenticate(state.authenticator(), Protocol::Gemini))
         .and(warp::header::headers_cloned())
         .and(protocol_json_body(Protocol::Gemini))
+        .and(warp::filters::addr::remote())
         .and(with_state(state))
         .and_then(
             |spec: String,
              principal: Principal,
              headers: warp::http::HeaderMap,
              body: JsonBody,
+             remote: Option<std::net::SocketAddr>,
              state: AppState| async move {
                 // `gemini-2.5-pro:streamGenerateContent` → (模型, 动作)
                 let (model, verb) = spec
@@ -208,6 +229,7 @@ fn gemini(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                         model.to_owned(),
                         body.raw,
                         None,
+                        remote,
                     )
                     .await;
                 }
@@ -233,6 +255,7 @@ fn gemini(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                         model: model.to_owned(),
                         stream,
                     }),
+                    remote,
                 )
                 .await
             },
@@ -260,11 +283,13 @@ fn json_pass_tail(state: AppState, kind: PassKind) -> BoxedFilter<(warp::reply::
         .and(authenticate(state.authenticator(), protocol))
         .and(warp::header::headers_cloned())
         .and(protocol_json_body(protocol))
+        .and(warp::filters::addr::remote())
         .and(with_state(state))
         .and_then(
             move |principal: Principal,
                   headers: warp::http::HeaderMap,
                   body: JsonBody,
+                  remote: Option<std::net::SocketAddr>,
                   state: AppState| async move {
                 let request_id = uuid::Uuid::new_v4().to_string();
                 let model = body
@@ -282,7 +307,7 @@ fn json_pass_tail(state: AppState, kind: PassKind) -> BoxedFilter<(warp::reply::
                     })?
                     .to_owned();
                 passthrough_response(
-                    state, principal, kind, request_id, headers, model, body.raw, None,
+                    state, principal, kind, request_id, headers, model, body.raw, None, remote,
                 )
                 .await
             },
@@ -300,11 +325,13 @@ fn multipart_pass_tail(state: AppState, kind: PassKind) -> BoxedFilter<(warp::re
         .and(authenticate(state.authenticator(), protocol))
         .and(warp::header::headers_cloned())
         .and(warp::body::stream())
+        .and(warp::filters::addr::remote())
         .and(with_state(state))
         .and_then(
             move |principal: Principal,
                   headers: warp::http::HeaderMap,
                   stream,
+                  remote: Option<std::net::SocketAddr>,
                   state: AppState| async move {
                 let request_id = uuid::Uuid::new_v4().to_string();
                 let raw = read_raw_body(stream, protocol, MULTIPART_BODY_LIMIT).await?;
@@ -331,6 +358,7 @@ fn multipart_pass_tail(state: AppState, kind: PassKind) -> BoxedFilter<(warp::re
                     model,
                     raw,
                     content_type,
+                    remote,
                 )
                 .await
             },
@@ -352,10 +380,12 @@ async fn passthrough_response(
     model: String,
     raw: Bytes,
     content_type: Option<String>,
+    remote_addr: Option<std::net::SocketAddr>,
 ) -> Result<warp::reply::Response, Rejection> {
     let inbound = kind.protocol();
     let started = std::time::Instant::now();
 
+    enforce_ip_limit(&state, remote_addr.map(|a| a.ip()), inbound, &request_id)?;
     if !principal.allows_model(&model) {
         return Err(ProtocolRejection::reject_with_id(
             GatewayError::new(
@@ -743,6 +773,7 @@ pub(crate) async fn playground_chat(
         warp::http::HeaderMap::new(),
         body,
         None,
+        None,
     )
     .await
 }
@@ -959,9 +990,12 @@ async fn dispatch(
     headers: warp::http::HeaderMap,
     body: JsonBody,
     gemini_path: Option<GeminiPath>,
+    remote_addr: Option<std::net::SocketAddr>,
 ) -> Result<warp::reply::Response, Rejection> {
     let started = std::time::Instant::now();
     let request_id = uuid::Uuid::new_v4().to_string();
+
+    enforce_ip_limit(&state, remote_addr.map(|a| a.ip()), inbound, &request_id)?;
     // Gemini 从路径取路由字段，另外三种协议只轻量读取顶层 model/stream。
     let (model, stream) = match gemini_path {
         Some(path) => (path.model, path.stream),
@@ -1982,6 +2016,36 @@ pub(crate) fn enforce_rate_limit(
                 key.name,
                 exceeded.dimension.describe(),
                 exceeded.retry_after_secs,
+            ),
+        )
+        .with_retry_after(std::time::Duration::from_secs(exceeded.retry_after_secs));
+        return Err(ProtocolRejection::reject_with_id(
+            error,
+            inbound,
+            request_id.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// 单 IP 限速准入。未配置限制（rpm == 0）时零开销。
+pub(crate) fn enforce_ip_limit(
+    state: &AppState,
+    remote_ip: Option<std::net::IpAddr>,
+    inbound: Protocol,
+    request_id: &str,
+) -> Result<(), Rejection> {
+    let limits = state.ip_limits();
+    if limits.rpm == 0 {
+        return Ok(());
+    }
+    let ip = remote_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    if let Err(exceeded) = state.ip_limiter().admit(ip, limits.rpm) {
+        let error = GatewayError::new(
+            ErrorKind::RateLimited,
+            format!(
+                "per-IP request limit ({} RPM) exceeded; retry in {}s",
+                limits.rpm, exceeded.retry_after_secs,
             ),
         )
         .with_retry_after(std::time::Duration::from_secs(exceeded.retry_after_secs));

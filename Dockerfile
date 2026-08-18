@@ -1,3 +1,4 @@
+# check=skip=SecretsUsedInArgOrEnv
 ARG NPM_REGISTRY=https://registry.npmjs.org
 ARG ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 # 构建源可用 --build-arg + --build-context 切换（CI/release 加速用）：

@@ -20,6 +20,11 @@ require_auth = false
 # 更推荐通过 REFRACT_ADMIN_TOKEN 环境变量注入，避免明文写入配置文件。
 # admin_token = "replace-with-a-long-random-secret"
 
+# 可选：渠道凭据静态加密主密钥（32 字节随机值的 base64 编码，如 `openssl rand -base64 32`）。
+# 配置后新保存的渠道密钥在 SQLite 内以 AES-256-GCM 密文存储；留空则保持明文。
+# 更推荐通过 REFRACT_MASTER_KEY 环境变量注入。
+# master_key = "replace-with-a-base64-encoded-32-byte-secret"
+
 # 上游请求整体超时（秒），只约束非流式请求。LLM 的非流式请求可能很慢，不要设太小。
 upstream_timeout_secs = 300
 

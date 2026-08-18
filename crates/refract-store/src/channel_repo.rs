@@ -12,17 +12,13 @@ use sqlx::Row;
 use crate::db::{Database, StoreError};
 
 /// 渠道仓储。
+///
+/// 可选持有静态加密主密钥:配置后凭据在落库前 AES-256-GCM 加密、读出后
+/// 解密,对上层完全透明 —— 领域对象里永远是明文,库里永远是密文。
 #[derive(Debug, Clone)]
 pub struct ChannelRepo {
     db: Database,
-}
-
-/// 多密钥池的 JSON 形式：空池存 NULL，非空存明文数组。
-///
-/// 与单钥列 `credential` 同级别的机密数据，落库明文、出口脱敏。
-fn pool_json(credentials: &[Credential]) -> Option<String> {
-    (!credentials.is_empty())
-        .then(|| serde_json::to_string(credentials).expect("credentials serialize"))
+    master_key: Option<[u8; 32]>,
 }
 
 /// 数据库里的渠道行。
@@ -74,7 +70,75 @@ const SELECT_CHANNEL_BY_ID: &str = concat!(
 impl ChannelRepo {
     /// 绑定到一个数据库。
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            master_key: None,
+        }
+    }
+
+    /// 注入静态加密主密钥。配置后凭据落库加密、读出解密,对调用方透明。
+    pub fn with_master_key(mut self, key: Option<[u8; 32]>) -> Self {
+        self.master_key = key;
+        self
+    }
+
+    /// 写入前加密:无主密钥或已是密文时原样返回(防二次加密)。
+    fn seal(&self, value: &str) -> String {
+        match self.master_key {
+            Some(key) if !crate::crypto::is_encrypted(value) => {
+                match crate::crypto::encrypt_credential(value, &key) {
+                    Ok(sealed) => sealed,
+                    Err(error) => {
+                        // 加密失败不阻断写入:落明文好过丢配置,且错误会
+                        // 在日志里留痕,运维可以事后补加密。
+                        tracing::error!(%error, "credential encryption failed, storing plaintext");
+                        value.to_owned()
+                    }
+                }
+            }
+            _ => value.to_owned(),
+        }
+    }
+
+    /// 读出后解密:无主密钥、无前缀或解密失败时按明文透传(向后兼容)。
+    fn open(&self, stored: String) -> String {
+        match self.master_key {
+            Some(key) if crate::crypto::is_encrypted(&stored) => {
+                match crate::crypto::decrypt_credential(&stored, &key) {
+                    Ok(plain) => plain,
+                    Err(error) => {
+                        tracing::error!(%error, "credential decryption failed, passing through stored value");
+                        stored
+                    }
+                }
+            }
+            _ => stored,
+        }
+    }
+
+    /// 池写入:逐条加密后序列化;空池仍为 NULL。
+    fn seal_pool(&self, credentials: &[Credential]) -> Option<String> {
+        (!credentials.is_empty()).then(|| {
+            let sealed: Vec<Credential> = credentials
+                .iter()
+                .map(|c| Credential::new(self.seal(c.expose())))
+                .collect();
+            serde_json::to_string(&sealed).expect("credentials serialize")
+        })
+    }
+
+    /// 池读出:反序列化后逐条解密。
+    fn open_pool(&self, json: Option<String>) -> Result<Vec<Credential>, StoreError> {
+        let pool = json
+            .map(|s| serde_json::from_str::<Vec<Credential>>(&s))
+            .transpose()
+            .map_err(StoreError::json("channels.credentials"))?
+            .unwrap_or_default();
+        Ok(pool
+            .into_iter()
+            .map(|c| Credential::new(self.open(c.expose().to_owned())))
+            .filter(|c| !c.is_empty())
+            .collect())
     }
 
     /// 列出某个所有者的全部渠道（含端点）。
@@ -88,7 +152,7 @@ impl ChannelRepo {
         for row in rows {
             let parsed = Self::row_to_parts(&row)?;
             let endpoints = self.load_endpoints(parsed.id).await?;
-            channels.push(Self::assemble(parsed, endpoints)?);
+            channels.push(self.assemble(parsed, endpoints)?);
         }
         Ok(channels)
     }
@@ -104,7 +168,7 @@ impl ChannelRepo {
 
         let parsed = Self::row_to_parts(&row)?;
         let endpoints = self.load_endpoints(id).await?;
-        Self::assemble(parsed, endpoints)
+        self.assemble(parsed, endpoints)
     }
 
     /// 新建渠道，返回带 ID 的完整对象。
@@ -114,14 +178,15 @@ impl ChannelRepo {
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
 
         let mut tx = self.db.pool().begin().await?;
-        let id = Self::insert_channel(&mut tx, channel).await?;
+        let id = self.insert_channel(&mut tx, channel).await?;
         tx.commit().await?;
 
         self.get(channel.owner_id, id).await
     }
 
-    /// 在给定事务里插入一个渠道及其全部端点，返回新 ID。
+    /// 在给定事务里插入一个渠道及其全部端点,返回新 ID。
     async fn insert_channel(
+        &self,
         tx: &mut sqlx::SqliteConnection,
         channel: &Channel,
     ) -> Result<i64, StoreError> {
@@ -138,8 +203,8 @@ impl ChannelRepo {
         .bind(channel.enabled)
         .bind(i64::from(channel.priority))
         .bind(i64::from(channel.weight))
-        .bind(channel.credential.expose())
-        .bind(pool_json(&channel.credentials))
+        .bind(self.seal(channel.credential.expose()))
+        .bind(self.seal_pool(&channel.credentials))
         .bind(channel.key_strategy.as_str())
         .bind(serde_json::to_string(&channel.address).expect("address serializes"))
         .bind(serde_json::to_string(&channel.tags).expect("tags serialize"))
@@ -166,7 +231,7 @@ impl ChannelRepo {
         .get(0);
 
         for ep in &channel.endpoints {
-            Self::insert_endpoint(&mut *tx, id, ep).await?;
+            self.insert_endpoint(&mut *tx, id, ep).await?;
         }
         Ok(id)
     }
@@ -194,7 +259,7 @@ impl ChannelRepo {
             .await?;
         let mut imported = 0_u32;
         for channel in channels {
-            Self::insert_channel(&mut tx, channel).await?;
+            self.insert_channel(&mut tx, channel).await?;
             imported += 1;
         }
         tx.commit().await?;
@@ -268,8 +333,8 @@ impl ChannelRepo {
         .bind(channel.enabled)
         .bind(i64::from(channel.priority))
         .bind(i64::from(channel.weight))
-        .bind(channel.credential.expose())
-        .bind(pool_json(&channel.credentials))
+        .bind(self.seal(channel.credential.expose()))
+        .bind(self.seal_pool(&channel.credentials))
         .bind(channel.key_strategy.as_str())
         .bind(serde_json::to_string(&channel.address).expect("address serializes"))
         .bind(serde_json::to_string(&channel.tags).expect("tags serialize"))
@@ -304,7 +369,7 @@ impl ChannelRepo {
             .execute(&mut *tx)
             .await?;
         for ep in &channel.endpoints {
-            Self::insert_endpoint(&mut tx, channel.id, ep).await?;
+            self.insert_endpoint(&mut tx, channel.id, ep).await?;
         }
         tx.commit().await?;
 
@@ -440,7 +505,7 @@ impl ChannelRepo {
                 enabled: row.get("enabled"),
                 address: serde_json::from_str::<UpstreamAddress>(&address)
                     .map_err(StoreError::json("channel_endpoints.address"))?,
-                credential: credential.map(Credential::new),
+                credential: credential.map(|c| Credential::new(self.open(c))),
                 models: serde_json::from_str::<Vec<ModelEntry>>(&models)
                     .map_err(StoreError::json("channel_endpoints.models"))?,
                 transcode: serde_json::from_str::<TranscodePolicy>(&transcode)
@@ -451,6 +516,7 @@ impl ChannelRepo {
     }
 
     async fn insert_endpoint(
+        &self,
         tx: &mut sqlx::SqliteConnection,
         channel_id: i64,
         ep: &ChannelEndpoint,
@@ -465,7 +531,7 @@ impl ChannelRepo {
         .bind(i64::from(ep.order))
         .bind(ep.enabled)
         .bind(serde_json::to_string(&ep.address).expect("address serializes"))
-        .bind(ep.credential.as_ref().map(|c| c.expose().to_owned()))
+        .bind(ep.credential.as_ref().map(|c| self.seal(c.expose())))
         .bind(serde_json::to_string(&ep.models).expect("models serialize"))
         .bind(serde_json::to_string(&ep.transcode).expect("transcode serializes"))
         .execute(&mut *tx)
@@ -500,7 +566,11 @@ impl ChannelRepo {
         })
     }
 
-    fn assemble(row: ChannelRow, endpoints: Vec<ChannelEndpoint>) -> Result<Channel, StoreError> {
+    fn assemble(
+        &self,
+        row: ChannelRow,
+        endpoints: Vec<ChannelEndpoint>,
+    ) -> Result<Channel, StoreError> {
         let kind: ChannelKind = row
             .kind
             .parse()
@@ -514,16 +584,8 @@ impl ChannelRepo {
             enabled: row.enabled,
             priority: row.priority.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
             weight: row.weight.clamp(0, i64::from(u32::MAX)) as u32,
-            credential: Credential::new(row.credential),
-            credentials: row
-                .credentials
-                .map(|s| serde_json::from_str::<Vec<Credential>>(&s))
-                .transpose()
-                .map_err(StoreError::json("channels.credentials"))?
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|c| !c.is_empty())
-                .collect(),
+            credential: Credential::new(self.open(row.credential)),
+            credentials: self.open_pool(row.credentials)?,
             key_strategy: KeyStrategy::parse(&row.key_strategy),
             address: serde_json::from_str(&row.address)
                 .map_err(StoreError::json("channels.address"))?,
@@ -937,5 +999,98 @@ mod tests {
             fetched.param_override.unwrap()["temperature"],
             serde_json::json!(0.2)
         );
+    }
+
+    /// 直接查库里的原始凭据列,绕过仓储的解密层。
+    async fn raw_channel_credentials(repo: &ChannelRepo, id: i64) -> (String, Option<String>) {
+        let row = sqlx::query("SELECT credential, credentials FROM channels WHERE id = ?")
+            .bind(id)
+            .fetch_one(repo.db.pool())
+            .await
+            .unwrap();
+        (row.get("credential"), row.get("credentials"))
+    }
+
+    #[tokio::test]
+    async fn without_master_key_credentials_remain_plaintext() {
+        let repo = repo().await;
+        let mut sample = sample_single();
+        sample.credential = Credential::new("sk-plain-secret");
+        sample.credentials = vec![Credential::new("sk-pool-1"), Credential::new("sk-pool-2")];
+        let created = repo.create(&sample).await.unwrap();
+
+        let (raw_single, raw_pool) = raw_channel_credentials(&repo, created.id).await;
+        assert_eq!(raw_single, "sk-plain-secret");
+        assert!(!crate::crypto::is_encrypted(&raw_single));
+        let raw_pool_str = raw_pool.unwrap();
+        assert!(raw_pool_str.contains("sk-pool-1"));
+
+        let fetched = repo.get(DEFAULT_OWNER_ID, created.id).await.unwrap();
+        assert_eq!(fetched.credential.expose(), "sk-plain-secret");
+        assert_eq!(fetched.credentials.len(), 2);
+        assert_eq!(fetched.credentials[0].expose(), "sk-pool-1");
+    }
+
+    #[tokio::test]
+    async fn with_master_key_credentials_are_encrypted_in_db_and_decrypted_on_read() {
+        let key = [42_u8; 32];
+        let db = Database::open_in_memory().await.unwrap();
+        let repo = ChannelRepo::new(db.clone()).with_master_key(Some(key));
+
+        let mut sample = sample_single();
+        sample.credential = Credential::new("sk-super-secret");
+        sample.credentials = vec![Credential::new("sk-pool-a"), Credential::new("sk-pool-b")];
+        let created = repo.create(&sample).await.unwrap();
+
+        // 数据库底层必须是 refract.v1. 密文,绝不能出现明文。
+        let (raw_single, raw_pool) = raw_channel_credentials(&repo, created.id).await;
+        assert!(crate::crypto::is_encrypted(&raw_single));
+        assert!(!raw_single.contains("sk-super-secret"));
+        let raw_pool_str = raw_pool.unwrap();
+        assert!(crate::crypto::is_encrypted(&raw_pool_str) || raw_pool_str.contains("refract.v1."));
+        assert!(!raw_pool_str.contains("sk-pool-a"));
+
+        // 读回时对上层透明解密为明文。
+        let fetched = repo.get(DEFAULT_OWNER_ID, created.id).await.unwrap();
+        assert_eq!(fetched.credential.expose(), "sk-super-secret");
+        assert_eq!(fetched.credentials.len(), 2);
+        assert_eq!(fetched.credentials[0].expose(), "sk-pool-a");
+        assert_eq!(fetched.credentials[1].expose(), "sk-pool-b");
+
+        // 更新同一渠道,密文不被二次加密(防 double-seal)。
+        let mut updated = fetched;
+        updated.name = "renamed".into();
+        let saved = repo.update(&updated).await.unwrap();
+        assert_eq!(saved.credential.expose(), "sk-super-secret");
+        let (raw_single_after, _) = raw_channel_credentials(&repo, saved.id).await;
+        assert!(crate::crypto::is_encrypted(&raw_single_after));
+        // 解密仍正常。
+        let refetched = repo.get(DEFAULT_OWNER_ID, saved.id).await.unwrap();
+        assert_eq!(refetched.credential.expose(), "sk-super-secret");
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_row_is_decrypted_transparently_when_key_added_later() {
+        let db = Database::open_in_memory().await.unwrap();
+        let plain_repo = ChannelRepo::new(db.clone());
+
+        let mut sample = sample_single();
+        sample.credential = Credential::new("sk-legacy-plain");
+        let created = plain_repo.create(&sample).await.unwrap();
+
+        // 之后部署配置了主密钥,读取旧明文数据必须透传不崩。
+        let key = [99_u8; 32];
+        let encrypted_repo = ChannelRepo::new(db.clone()).with_master_key(Some(key));
+        let fetched = encrypted_repo
+            .get(DEFAULT_OWNER_ID, created.id)
+            .await
+            .unwrap();
+        assert_eq!(fetched.credential.expose(), "sk-legacy-plain");
+
+        // 下次保存时自动被升级为密文。
+        let saved = encrypted_repo.update(&fetched).await.unwrap();
+        assert_eq!(saved.credential.expose(), "sk-legacy-plain");
+        let (raw_single, _) = raw_channel_credentials(&encrypted_repo, saved.id).await;
+        assert!(crate::crypto::is_encrypted(&raw_single));
     }
 }

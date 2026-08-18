@@ -17,7 +17,7 @@ jobs:
     name: Rust quality gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.0
         with:
           components: rustfmt, clippy
@@ -30,7 +30,7 @@ jobs:
     name: Web quality gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
         with:
           version: 11.21.0
@@ -48,7 +48,7 @@ jobs:
       - working-directory: web
         run: pnpm run build
       # 前端产物给 container / e2e job 复用，避免各自重新 pnpm build。
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [rust, web]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
       - uses: pnpm/action-setup@v6
@@ -73,7 +73,7 @@ jobs:
       - working-directory: web
         run: pnpm install --frozen-lockfile
       # 复用 web job 构建的前端产物（serve.sh 检测到 dist 存在就跳过构建）。
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web-dist-art
@@ -89,7 +89,7 @@ jobs:
     needs: [rust, web]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Rust 在宿主机用 musl 静态链接编译（ci profile：thin LTO + 16 代码单元），
       # rust-cache 保证稳态 1-2 分钟；镜像只做 alpine 底座 + COPY，几秒完成。
       - uses: dtolnay/rust-toolchain@1.94.0
@@ -99,7 +99,7 @@ jobs:
         with:
           key: ci-musl-x86_64
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist

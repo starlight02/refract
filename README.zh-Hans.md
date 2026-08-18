@@ -35,7 +35,7 @@ Refract 的模型是：**渠道类型 = 协议**。只有五种：
 - **无人值守自愈**：连续终态鉴权失败可自动禁用渠道，定时重测在恢复后重新启用；Webhook 对熔断、恢复与自动禁用事件去重告警。
 - **异常 200 恢复**：空回复在 3 秒内结束时默认最多重试 5 次，渠道可单独覆盖；还可将纯文本、HTML、未知 JSON/SSE 等非协议标准的 200 转换为明确的 500 错误。
 - **渠道账本**：刷新中转站余额，在仪表盘按渠道比较请求量、延迟与费用，并查看小时/天粒度时序。
-- **运维探针与指标**：公开的 `/health/live`、`/health/ready` 与 Prometheus 文本格式的 `/metrics`。
+- **运维探针与指标**：公开的 `/health/live`、`/health/ready`；Prometheus 文本格式的 `/metrics` 在配置管理令牌后需凭证访问。
 - **配置与数据库备份**：一个 JSON 文件导出/导入全部渠道、网关密钥与设置，跨实例迁移后原密钥继续可用；支持合并与替换。设置页还能查看数据库体积并在线生成 SQLite 备份。
 - **单二进制部署**：前端编译产物内嵌进二进制，部署只需拷贝一个文件。
 - **为单用户设计，不为单用户焊死**：所有业务表预留 `owner_id`，鉴权是 trait，将来加多用户不需要动业务逻辑。
@@ -99,7 +99,7 @@ Compose 默认仅把端口映射到宿主机回环地址，容器内以非 root�
 | `POST /v1beta/models/{model}:countTokens` | Gemini token 计数（透传到 gemini 端点） |
 | `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` | OpenAI 与 Gemini 模型发现（由启用渠道派生） |
 | `GET /v1/realtime?model=...`（WebSocket） | OpenAI Realtime 原生 WebSocket 桥接 |
-| `GET /metrics` | Prometheus 指标（与健康探针一样不鉴权） |
+| `GET /metrics` | Prometheus 指标（配置管理令牌后需凭证；健康探针保持公开） |
 
 流式与非流式都支持。网关端点带宽松的 CORS 头，浏览器里运行的客户端可以直接跨源调用。管理界面走 `/api/...`，与网关端点使用不同的鉴权体系，并且**不发** CORS 头 —— 管理面只允许同源访问。
 
@@ -121,6 +121,7 @@ Realtime 同样只走原生 Chat 端点：先按健康度选路由并应用模�
 | `stream_idle_timeout_secs` | `120` | 流式：等待响应头的上限，以及两帧之间的最大间隔 |
 | `shutdown_grace_secs` | `30` | 优雅关闭窗口，超时后强制断开存量连接 |
 | `proxy` | 无 | 出站代理（http/socks5） |
+| `master_key` | 无 | 渠道凭据静态加密主密钥（32 字节 base64）；推荐通过 `REFRACT_MASTER_KEY` 注入 |
 
 **安全提示**：网关持有全部上游密钥。服务会拒绝在非回环地址启动，除非管理令牌已经配置且 `require_auth=true`。`REFRACT_ADMIN_TOKEN` 每次启动都会声明式地设置该令牌；不要把明文提交进仓库。
 

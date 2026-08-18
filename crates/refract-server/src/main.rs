@@ -48,6 +48,8 @@ struct Config {
     shutdown_grace_secs: u64,
     /// 出站代理，形如 `http://host:port`。
     proxy: Option<String>,
+    /// 静态加密主密钥（32 字节 base64）。未设置时使用数据库 settings 表记录，或保持明文。
+    master_key: Option<String>,
 }
 
 impl Default for Config {
@@ -61,6 +63,7 @@ impl Default for Config {
             stream_idle_timeout_secs: 120,
             shutdown_grace_secs: 30,
             proxy: None,
+            master_key: None,
         }
     }
 }
@@ -103,18 +106,40 @@ async fn main() -> Result<()> {
     let client = UpstreamClient::new(config.upstream())
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to build the upstream HTTP client")?;
+    let explicit_master_key = config
+        .master_key
+        .as_deref()
+        .and_then(|s| refract_store::parse_master_key(s).ok());
+    if explicit_master_key.is_some() {
+        tracing::info!("channel credential encryption enabled (master key from environment)");
+    }
 
-    let state = AppState::bootstrap(db.clone(), client, config.require_auth)
-        .await
-        .context("failed to load configuration from the database")?;
+    let state = AppState::bootstrap_with_master_key(
+        db.clone(),
+        client,
+        config.require_auth,
+        explicit_master_key,
+    )
+    .await
+    .context("failed to load configuration from the database")?;
 
+    if explicit_master_key.is_none() {
+        if state.master_key().is_some() {
+            tracing::info!(
+                "channel credential encryption enabled (master key from database settings)"
+            );
+        } else {
+            tracing::info!("channel credentials stored in plaintext (no master key configured)");
+        }
+    }
     apply_bootstrap_admin_token(&config, &state).await?;
     enforce_exposure_policy(&config, &state).await?;
     warn_on_empty_config(&state);
     let maintenance = tokio::spawn(log_retention_loop(state.clone()));
     // 自动禁用渠道的定时重测自愈（间隔从设置读取，0 = 关闭）。
     let retest = tokio::spawn(refract_api::notify::auto_retest_loop(state.clone()));
-
+    // 数据库自动备份循环（间隔从设置读取，0 = 关闭）。
+    let backup = tokio::spawn(refract_api::backup::auto_backup_loop(state.clone()));
     // 显式配置套接字（允许地址/端口重用），支持开发与重启时瞬时接管监听
     let socket = match config.listen {
         SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
@@ -161,7 +186,8 @@ async fn main() -> Result<()> {
     let _ = maintenance.await;
     retest.abort();
     let _ = retest.await;
-    // 日志落库是 fire-and-forget 的后台任务，给它们一小段时间收尾再关池。
+    backup.abort();
+    let _ = backup.await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     db.close().await;
     tracing::info!("shutdown complete");

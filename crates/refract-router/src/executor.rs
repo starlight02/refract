@@ -373,6 +373,7 @@ impl RouteExecutor {
         let order = self.prioritize(route);
         let mut last_error = no_candidates(route);
         let mut attempts = 0_u8;
+        let mut upstream_calls = 0_u32;
 
         for idx in order {
             let candidate = &route.attempts[idx];
@@ -409,6 +410,7 @@ impl RouteExecutor {
                 req.proxy = candidate.proxy();
                 req.timeout = self.timeout_for(candidate);
 
+                check_budget(route, &mut upstream_calls)?;
                 match self.client.send(req).await {
                     Ok(response) => {
                         let latency_ms = started.elapsed().as_millis() as u64;
@@ -528,6 +530,7 @@ impl RouteExecutor {
         let order = self.prioritize(route);
         let mut last_error = no_candidates(route);
         let mut attempts = 0_u8;
+        let mut upstream_calls = 0_u32;
 
         for idx in order {
             let candidate = &route.attempts[idx];
@@ -572,6 +575,7 @@ impl RouteExecutor {
                     request.proxy = candidate.proxy();
                     request.timeout = self.timeout_for(candidate);
 
+                    check_budget(route, &mut upstream_calls)?;
                     match self.client.send(request).await {
                         Ok(response) => {
                             let latency_ms = started.elapsed().as_millis() as u64;
@@ -692,6 +696,7 @@ impl RouteExecutor {
                 request.proxy = candidate.proxy();
                 request.timeout = self.timeout_for(candidate);
 
+                check_budget(route, &mut upstream_calls)?;
                 match self.client.send_raw(request).await {
                     Ok(response) => {
                         let latency_ms = started.elapsed().as_millis() as u64;
@@ -806,6 +811,7 @@ impl RouteExecutor {
         let order = self.prioritize(route);
         let mut last_error = no_candidates(route);
         let mut attempts = 0_u8;
+        let mut upstream_calls = 0_u32;
         let is_multipart = content_type.is_some_and(|ct| ct.starts_with("multipart/"));
 
         for idx in order {
@@ -834,6 +840,7 @@ impl RouteExecutor {
                 request.proxy = candidate.proxy();
                 request.timeout = self.timeout_for(candidate);
 
+                check_budget(route, &mut upstream_calls)?;
                 match self.client.send_raw(request).await {
                     Ok(response) => {
                         let latency_ms = started.elapsed().as_millis() as u64;
@@ -883,6 +890,7 @@ impl RouteExecutor {
         let order = self.prioritize(route);
         let mut last_error = no_candidates(route);
         let mut attempts = 0_u8;
+        let mut upstream_calls = 0_u32;
 
         for idx in order {
             let candidate = &route.attempts[idx];
@@ -916,7 +924,9 @@ impl RouteExecutor {
                 req.proxy = candidate.proxy();
                 // 流式请求不设整体超时：上游客户端只按 stream_idle_timeout 保护，
                 // 整体 deadline 会误杀持续产出 token 的长回答。
+                req.proxy = candidate.proxy();
 
+                check_budget(route, &mut upstream_calls)?;
                 match self.client.stream(req).await {
                     Ok(UpstreamSseStream {
                         status,
@@ -1015,6 +1025,7 @@ impl RouteExecutor {
         let order = self.prioritize(route);
         let mut last_error = no_candidates(route);
         let mut attempts = 0_u8;
+        let mut upstream_calls = 0_u32;
 
         for idx in order {
             let candidate = &route.attempts[idx];
@@ -1057,6 +1068,7 @@ impl RouteExecutor {
                     );
                     request.proxy = candidate.proxy();
 
+                    check_budget(route, &mut upstream_calls)?;
                     match self.client.stream(request).await {
                         Ok(UpstreamSseStream {
                             status,
@@ -1144,6 +1156,7 @@ impl RouteExecutor {
                 request.extra_headers = &extra_headers;
                 request.proxy = candidate.proxy();
 
+                check_budget(route, &mut upstream_calls)?;
                 match self.client.stream_raw(request).await {
                     Ok(response) => {
                         let UpstreamRawStream {
@@ -2061,6 +2074,16 @@ where
         },
     );
     Box::pin(tracked)
+}
+
+/// 检查并递增单请求上游调用总次数。超出预算时直接拒绝请求(503),封住无界扇出。
+#[inline]
+fn check_budget(route: &Route<'_>, count: &mut u32) -> Result<(), GatewayError> {
+    if route.max_upstream_calls > 0 && *count >= route.max_upstream_calls as u32 {
+        return Err(GatewayError::budget_exhausted());
+    }
+    *count = count.saturating_add(1);
+    Ok(())
 }
 
 /// 无候选时的错误。

@@ -287,6 +287,15 @@ refract-server    二进制：配置加载、装配、嵌入前端、优雅关�
 
 这样加多用户 = 加一张 users 表 + 换一个 Authenticator 实现 + 放开 owner_id 来源，不动业务逻辑。
 
+## 6.1 安全与凭据治理
+
+- **凭据静态加密**：渠道密钥支持在持久化层以 AES-256-GCM 加密落库（格式为 `refract.v1.` 前缀 + base64(随机 12 字节 nonce || 密文+tag)）。主密钥可通过 `REFRACT_MASTER_KEY` 环境变量或设置表配置；历史明文与无密钥模式完全兼容透传。
+- **管理面防爆破**：内存维护客户端 IP 连续失败计数，连续 5 次失败自动锁定 60 秒（返回 403 与 `Retry-After`），成功即清零。
+- **网关单 IP 速率限制**：在各协议入口前按客户端 IP 维持自然分钟窗口，支持独立的 RPM 上限约束。
+- **单请求上游调用总预算**：`RoutingPolicy` 配置 `max_upstream_calls`，由执行器在所有重试、密钥轮换与空回复重发点统一计数，防止请求产生无界扇出。
+- **数据库与备份权限收紧**：新创建的 SQLite 库文件与目录强制设为 `0600`/`0700` 权限；定时自动备份与手动备份产物统一受此约束。
+- **Webhook HMAC 签名**：配置 `notify.webhook_secret` 时，所有告警推送请求附带 `X-Refract-Signature: sha256=<hex>` 标头。
+
 ## 7. 前端
 
 - Vue 3.6 RC + **Vapor Mode**（`@vitejs/plugin-vue` 全局启用）

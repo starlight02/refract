@@ -6,6 +6,7 @@
 // lint 配置统一在 workspace `Cargo.toml` 的 [workspace.lints] 里维护。
 
 pub mod channel_repo;
+pub mod crypto;
 pub mod db;
 pub mod health_repo;
 pub mod key_repo;
@@ -13,13 +14,19 @@ pub mod log_repo;
 pub mod settings_repo;
 
 pub use channel_repo::ChannelRepo;
+pub use crypto::{
+    CryptoError, decrypt_credential, encrypt_credential, is_encrypted, parse_master_key,
+};
 pub use db::{Database, StoreError};
 pub use health_repo::{BreakerPolicy, EndpointHealth, HealthRepo};
 pub use key_repo::{ApiKey, ApiKeyRepo, ExportedApiKey, NewApiKey};
 pub use log_repo::{
     KeyUsageStat, LogFilter, LogRepo, ModelStat, NewRequestLog, RequestLog, StatsSummary,
 };
-pub use settings_repo::{GlobalLimits, ModelPrice, SettingsRepo, price_for};
+pub use settings_repo::{
+    BackupSettings, GlobalLimits, IpLimits, ModelPrice, SettingsRepo, default_backup_keep,
+    price_for,
+};
 
 /// 确保影响行数大于 0，否则返回 EntityNotFound 错误。
 #[inline]

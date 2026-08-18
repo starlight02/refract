@@ -14,6 +14,7 @@ import GlassSwitch from '@/components/GlassSwitch.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import {
   backup,
+  backups as backupsApi,
   data as dataApi,
   getAdminToken,
   setAdminToken as storeLocalToken,
@@ -25,9 +26,12 @@ import type {
   AffinityRule,
   AffinitySettings,
   AffinityStatsResponse,
+  BackupFile,
+  BackupSettings,
   BreakerPolicy,
   EmptyResponseRetryPolicy,
   GlobalLimits,
+  IpLimits,
   ModelPrice,
   NotifySettings,
   RoutingPolicy,
@@ -45,6 +49,7 @@ const policy = ref<RoutingPolicy>({
   selection: 'weighted_random',
   max_attempts: 3,
   retry_same_channel: true,
+  max_upstream_calls: 8,
 })
 const retentionDays = ref(30)
 const breaker = ref<BreakerPolicy>({
@@ -56,6 +61,9 @@ const pricing = ref<ModelPrice[]>([])
 const logBodies = ref(true)
 const notify = ref<NotifySettings>({ webhook_url: '', retest_minutes: 30 })
 const limits = ref<GlobalLimits>({ rpm: 0, max_concurrency: 0 })
+const ipLimits = ref<IpLimits>({ rpm: 0 })
+/** 自动备份配置；directory 为 null 时后端用内置默认目录。 */
+const backupCfg = ref<BackupSettings>({ directory: null, interval_hours: 0, keep: 5 })
 const emptyResponseRetry = ref<EmptyResponseRetryPolicy>({
   window_secs: 3,
   max_retries: 5,
@@ -79,6 +87,8 @@ let pricingSnapshot = '[]'
 let logBodiesSnapshot = true
 let notifySnapshot = ''
 let limitsSnapshot = ''
+let ipLimitsSnapshot = ''
+let backupSnapshot = ''
 let emptyResponseRetrySnapshot = ''
 
 const policyDirty = computed(() => policySnapshot !== JSON.stringify(policy.value))
@@ -88,6 +98,8 @@ const pricingDirty = computed(() => pricingSnapshot !== JSON.stringify(pricing.v
 const logBodiesDirty = computed(() => logBodiesSnapshot !== logBodies.value)
 const notifyDirty = computed(() => notifySnapshot !== JSON.stringify(notify.value))
 const limitsDirty = computed(() => limitsSnapshot !== JSON.stringify(limits.value))
+const ipLimitsDirty = computed(() => ipLimitsSnapshot !== JSON.stringify(ipLimits.value))
+const backupDirty = computed(() => backupSnapshot !== JSON.stringify(backupCfg.value))
 const emptyResponseRetryDirty = computed(
   () => emptyResponseRetrySnapshot !== JSON.stringify(emptyResponseRetry.value),
 )
@@ -99,6 +111,32 @@ const limitsValid = computed(
     Number.isInteger(limits.value.max_concurrency) &&
     limits.value.max_concurrency >= 0 &&
     limits.value.max_concurrency <= 100_000,
+)
+const ipLimitsValid = computed(
+  () =>
+    Number.isInteger(ipLimits.value.rpm) &&
+    ipLimits.value.rpm >= 0 &&
+    ipLimits.value.rpm <= 1_000_000,
+)
+/** 与后端 BackupSettings::validate 一致：间隔 ≤ 8760 小时，保留 1–100 份。 */
+const backupValid = computed(
+  () =>
+    Number.isInteger(backupCfg.value.interval_hours) &&
+    backupCfg.value.interval_hours >= 0 &&
+    backupCfg.value.interval_hours <= 8760 &&
+    Number.isInteger(backupCfg.value.keep) &&
+    backupCfg.value.keep >= 1 &&
+    backupCfg.value.keep <= 100,
+)
+/** 路由策略数值校验：重试 1–32，上游调用上限 0–255（u8）。 */
+const policyValid = computed(
+  () =>
+    Number.isInteger(policy.value.max_attempts) &&
+    policy.value.max_attempts >= 1 &&
+    policy.value.max_attempts <= 32 &&
+    Number.isInteger(policy.value.max_upstream_calls) &&
+    policy.value.max_upstream_calls >= 0 &&
+    policy.value.max_upstream_calls <= 255,
 )
 const notifyValid = computed(() => {
   const url = notify.value.webhook_url?.trim() ?? ''
@@ -124,6 +162,8 @@ const isDirty = computed(
     logBodiesDirty.value ||
     notifyDirty.value ||
     limitsDirty.value ||
+    ipLimitsDirty.value ||
+    backupDirty.value ||
     emptyResponseRetryDirty.value ||
     affinityDirty.value,
 )
@@ -408,18 +448,35 @@ async function refreshAffinityStats() {
 
 onMounted(async () => {
   try {
-    const [p, retention, b, prices, bodies, notifySettings, globalLimits, emptyRetry, aff] =
-      await Promise.all([
-        settings.routingPolicy(),
-        settings.logRetention(),
-        settings.breakerPolicy(),
-        settings.pricing(),
-        settings.logBodies(),
-        settings.notify(),
-        settings.globalLimits(),
-        settings.emptyResponseRetry(),
-        settings.affinity(),
-      ])
+    const [
+      p,
+      retention,
+      b,
+      prices,
+      bodies,
+      notifySettings,
+      globalLimits,
+      emptyRetry,
+      aff,
+      ipLimitsLoaded,
+      backupLoaded,
+      webhookSecretLoaded,
+      masterKeyLoaded,
+    ] = await Promise.all([
+      settings.routingPolicy(),
+      settings.logRetention(),
+      settings.breakerPolicy(),
+      settings.pricing(),
+      settings.logBodies(),
+      settings.notify(),
+      settings.globalLimits(),
+      settings.emptyResponseRetry(),
+      settings.affinity(),
+      settings.ipLimits(),
+      settings.backupSettings(),
+      settings.webhookSecret(),
+      settings.masterKey(),
+    ])
     policy.value = p
     policySnapshot = JSON.stringify(p)
     retentionDays.value = retention.days
@@ -434,6 +491,12 @@ onMounted(async () => {
     notifySnapshot = JSON.stringify(notify.value)
     limits.value = globalLimits
     limitsSnapshot = JSON.stringify(globalLimits)
+    ipLimits.value = ipLimitsLoaded
+    ipLimitsSnapshot = JSON.stringify(ipLimitsLoaded)
+    backupCfg.value = backupLoaded
+    backupSnapshot = JSON.stringify(backupLoaded)
+    webhookSecretConfigured.value = webhookSecretLoaded.configured
+    masterKeyConfigured.value = masterKeyLoaded.configured
     emptyResponseRetry.value = emptyRetry
     emptyResponseRetrySnapshot = JSON.stringify(emptyRetry)
     affinity.value = aff
@@ -452,6 +515,10 @@ onMounted(async () => {
 })
 
 async function save() {
+  if (!policyValid.value) {
+    saveError.value = '路由策略不合法：最大重试 1–32 次，单请求上游调用上限 0–255'
+    return
+  }
   if (!retentionValid.value) {
     saveError.value = '日志保留天数必须是 1–3650 的整数'
     return
@@ -470,6 +537,14 @@ async function save() {
   }
   if (!limitsValid.value) {
     saveError.value = '全局限制不合法：RPM ≤ 1,000,000，并发 ≤ 100,000'
+    return
+  }
+  if (!ipLimitsValid.value) {
+    saveError.value = '单 IP 限制不合法：RPM ≤ 1,000,000'
+    return
+  }
+  if (!backupValid.value) {
+    saveError.value = '自动备份不合法：间隔 ≤ 8760 小时，保留 1–100 份'
     return
   }
   if (!emptyResponseRetryValid.value) {
@@ -515,6 +590,20 @@ async function save() {
       limits.value = saved_
       limitsSnapshot = JSON.stringify(saved_)
     }
+    if (ipLimitsDirty.value) {
+      const saved_ = await settings.setIpLimits(ipLimits.value)
+      ipLimits.value = saved_
+      ipLimitsSnapshot = JSON.stringify(saved_)
+    }
+    if (backupDirty.value) {
+      // 目录留空归一成 null：后端语义「用内置默认目录」，且与 GET 回显形状一致。
+      const saved_ = await settings.setBackupSettings({
+        ...backupCfg.value,
+        directory: backupCfg.value.directory?.trim() || null,
+      })
+      backupCfg.value = saved_
+      backupSnapshot = JSON.stringify(saved_)
+    }
     if (emptyResponseRetryDirty.value) {
       const saved_ = await settings.setEmptyResponseRetry(emptyResponseRetry.value)
       emptyResponseRetry.value = saved_
@@ -558,6 +647,134 @@ async function sendTestNotification() {
     notifyTesting.value = false
   }
 }
+
+// ── Webhook 签名密钥 ──
+
+/** 服务端只回 configured 标志，不回明文；草稿为空时 PUT null 清除。 */
+const webhookSecretConfigured = ref(false)
+const webhookSecretDraft = ref('')
+const showWebhookSecret = ref(false)
+const webhookSecretBusy = ref(false)
+const webhookSecretNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
+
+async function applyWebhookSecret() {
+  if (webhookSecretBusy.value) return
+  webhookSecretBusy.value = true
+  webhookSecretNotice.value = null
+  try {
+    const secret = webhookSecretDraft.value.trim()
+    const res = await settings.setWebhookSecret(secret || null)
+    webhookSecretConfigured.value = res.configured
+    webhookSecretDraft.value = ''
+    webhookSecretNotice.value = {
+      tone: 'success',
+      text: secret ? '签名密钥已保存，webhook 请求将携带签名头。' : '签名密钥已清除。',
+    }
+  } catch (e) {
+    webhookSecretNotice.value = {
+      tone: 'danger',
+      text: e instanceof Error ? e.message : '保存失败',
+    }
+  } finally {
+    webhookSecretBusy.value = false
+  }
+}
+
+// ── 凭据静态加密 ──
+
+const masterKeyConfigured = ref(false)
+const masterKeyDraft = ref('')
+const showMasterKey = ref(false)
+const masterKeyBusy = ref(false)
+const masterKeyNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
+
+/** 启用或更换主密钥；留空保存即清除（之后新凭据回到明文存储）。 */
+async function applyMasterKey() {
+  if (masterKeyBusy.value) return
+  masterKeyBusy.value = true
+  masterKeyNotice.value = null
+  try {
+    const key = masterKeyDraft.value.trim()
+    const res = await settings.setMasterKey(key || null)
+    masterKeyConfigured.value = res.configured
+    masterKeyDraft.value = ''
+    masterKeyNotice.value = {
+      tone: 'success',
+      text: key ? '主密钥已保存。' : '主密钥已清除，新凭据将明文存储。',
+    }
+  } catch (e) {
+    masterKeyNotice.value = {
+      tone: 'danger',
+      text: e instanceof Error ? e.message : '保存失败',
+    }
+  } finally {
+    masterKeyBusy.value = false
+  }
+}
+
+// ── 备份文件管理 ──
+
+const backupFiles = ref<BackupFile[]>([])
+const backupListLoading = ref(false)
+const backupFileBusy = ref(false)
+/** 待确认删除的备份文件名 —— 删除不可恢复，沿用渠道列表的二次确认模式。 */
+const pendingBackupDelete = ref<string | null>(null)
+const backupFileNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
+
+async function refreshBackupFiles() {
+  backupListLoading.value = true
+  try {
+    backupFiles.value = await backupsApi.list()
+  } catch {
+    // 列表失败不阻塞整页：备份目录可能尚未创建。
+    backupFiles.value = []
+  } finally {
+    backupListLoading.value = false
+  }
+}
+
+/** 立即生成一份备份，成功后刷新列表。 */
+async function createBackupFile() {
+  if (backupFileBusy.value) return
+  backupFileBusy.value = true
+  backupFileNotice.value = null
+  try {
+    const res = await backupsApi.create()
+    backupFileNotice.value = { tone: 'success', text: `备份已创建：${res.name}` }
+    await refreshBackupFiles()
+  } catch (e) {
+    backupFileNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '备份失败' }
+  } finally {
+    backupFileBusy.value = false
+  }
+}
+
+/** 带管理令牌下载指定备份（裸 <a href> 不带令牌会 401）。 */
+async function downloadBackupFile(name: string) {
+  backupFileNotice.value = null
+  try {
+    await backupsApi.download(name)
+    backupFileNotice.value = { tone: 'success', text: `已下载：${name}` }
+  } catch (e) {
+    backupFileNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '下载失败' }
+  }
+}
+
+async function deleteBackupFile(name: string) {
+  backupFileNotice.value = null
+  try {
+    await backupsApi.remove(name)
+    pendingBackupDelete.value = null
+    backupFileNotice.value = { tone: 'success', text: `已删除：${name}` }
+    await refreshBackupFiles()
+  } catch (e) {
+    backupFileNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '删除失败' }
+  }
+}
+
+onMounted(() => {
+  refreshBackupFiles().catch(() => {})
+})
 
 const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[] = [
   {
@@ -826,6 +1043,29 @@ async function runImport(payload: unknown) {
             class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
           />
         </label>
+
+        <!-- 单请求上游调用上限 -->
+        <label class="flex flex-col gap-1.5">
+          <span class="text-sm font-medium text-ink-soft">
+            单请求上游调用上限
+            <span class="ml-2 font-normal text-ink-faint">
+              含重试在内的上游调用总次数，0 = 不限，默认 8。
+            </span>
+          </span>
+          <input
+            v-model.number="policy.max_upstream_calls"
+            type="number"
+            min="0"
+            max="255"
+            step="1"
+            inputmode="numeric"
+            aria-label="单请求上游调用次数上限"
+            class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
+          />
+        </label>
+        <p v-if="!policyValid" class="text-xs text-danger" role="alert">
+          最大重试 1–32；上游调用上限 0–255。
+        </p>
 
         <!-- 重试同一渠道 -->
         <label class="flex cursor-pointer items-center gap-3">
@@ -1306,10 +1546,28 @@ async function runImport(payload: unknown) {
             />
             <span class="text-xs text-ink-faint">同时在途请求数（流式占用直到结束）</span>
           </label>
+
+          <label class="flex flex-col gap-1.5">
+            <span class="text-sm font-medium text-ink-soft">单 IP RPM</span>
+            <input
+              v-model.number="ipLimits.rpm"
+              type="number"
+              min="0"
+              max="1000000"
+              step="1"
+              inputmode="numeric"
+              aria-label="单 IP 每分钟请求数上限"
+              class="glass-field tabular px-3 py-2 text-sm outline-none"
+            />
+            <span class="text-xs text-ink-faint">单 IP 每分钟请求上限，0 = 不限</span>
+          </label>
         </div>
 
         <p v-if="!limitsValid" class="text-xs text-danger" role="alert">
           RPM ≤ 1,000,000；并发 ≤ 100,000。
+        </p>
+        <p v-if="!ipLimitsValid" class="text-xs text-danger" role="alert">
+          单 IP RPM ≤ 1,000,000。
         </p>
       </section>
 
@@ -1347,6 +1605,61 @@ async function runImport(payload: unknown) {
             {{ notifyTestResult }}
           </span>
         </label>
+
+        <!-- Webhook 签名密钥 -->
+        <div class="flex max-w-xl flex-col gap-1.5">
+          <span class="text-sm font-medium text-ink-soft">
+            Webhook 签名密钥
+            <span v-if="webhookSecretConfigured" class="ml-2 font-normal text-success">
+              已配置（留空保存则清除）
+            </span>
+            <span v-else class="ml-2 font-normal text-ink-faint">未配置</span>
+          </span>
+          <div class="relative">
+            <input
+              v-model="webhookSecretDraft"
+              :type="showWebhookSecret ? 'text' : 'password'"
+              :placeholder="
+                webhookSecretConfigured ? '新签名密钥；留空保存即清除' : '签名密钥（留空不签名）'
+              "
+              autocomplete="new-password"
+              aria-label="Webhook 签名密钥"
+              class="glass-field w-full px-3 py-2 pr-16 font-mono text-sm outline-none"
+            />
+            <button
+              type="button"
+              class="absolute top-1/2 right-2 -translate-y-1/2 rounded-md px-2 py-1 text-xs text-ink-faint hover:text-ink"
+              :aria-label="showWebhookSecret ? '隐藏签名密钥' : '显示签名密钥'"
+              :aria-pressed="showWebhookSecret"
+              @click="showWebhookSecret = !showWebhookSecret"
+            >
+              {{ showWebhookSecret ? '隐藏' : '显示' }}
+            </button>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              class="glass-button-ghost px-3 py-1.5 text-xs disabled:opacity-50"
+              :disabled="
+                webhookSecretBusy || (!webhookSecretConfigured && !webhookSecretDraft.trim())
+              "
+              @click="applyWebhookSecret"
+            >
+              {{ webhookSecretBusy ? '保存中…' : '保存签名密钥' }}
+            </button>
+            <p
+              v-if="webhookSecretNotice"
+              class="text-xs"
+              :class="webhookSecretNotice.tone === 'success' ? 'text-success' : 'text-danger'"
+              role="status"
+            >
+              {{ webhookSecretNotice.text }}
+            </p>
+          </div>
+          <p class="text-xs text-ink-faint">
+            配置后 webhook 请求携带 X-Refract-Signature 头（HMAC-SHA256 签名），接收端可验证来源。
+          </p>
+        </div>
 
         <label class="flex max-w-sm flex-col gap-1.5">
           <span class="text-sm font-medium text-ink-soft">自动禁用渠道的重测间隔</span>

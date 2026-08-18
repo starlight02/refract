@@ -37,6 +37,19 @@ pub struct RoutingPolicy {
     pub max_attempts: u8,
     /// 是否允许在重试时复用同一渠道的其他端点。
     pub retry_same_channel: bool,
+    /// 单次网关请求允许发出的上游调用总预算。
+    ///
+    /// 覆盖重试、密钥轮换、空回复重发的累计次数 —— `max_attempts` 只约束
+    /// 「换端点重试」，挡不住「同一端点反复重试 + 密钥池轮换」叠加出的扇出。
+    /// 0 = 不限制（保留旧行为）；耗尽预算后请求以 503 中止，防止单个病态
+    /// 客户端把上游账单打出无界流量。
+    #[serde(default = "default_max_upstream_calls")]
+    pub max_upstream_calls: u8,
+}
+
+/// 上游调用预算的默认值：够覆盖正常重试路径，又能封住扇出。
+pub fn default_max_upstream_calls() -> u8 {
+    8
 }
 
 impl Default for RoutingPolicy {
@@ -46,7 +59,24 @@ impl Default for RoutingPolicy {
             selection: SelectionMode::WeightedRandom,
             max_attempts: 3,
             retry_same_channel: false,
+            max_upstream_calls: default_max_upstream_calls(),
         }
+    }
+}
+
+impl RoutingPolicy {
+    /// 配置合法性校验。在写入设置前调用，拦住会破坏路由语义的值。
+    ///
+    /// `max_attempts` 允许 0（=不限），但 32 以上没有实际意义只会放大扇出；
+    /// `max_upstream_calls` 是安全阀，0=不限，不设上限校验。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_attempts > 32 {
+            return Err(format!(
+                "max_attempts must be 0 (unlimited) or 1..=32, got {}",
+                self.max_attempts
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -183,6 +183,7 @@ pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
             settings(state.clone()),
             health(state.clone()),
             backup(state.clone()),
+            backups(state.clone()),
             playground(state.clone()),
             data(state.clone()),
             models(state),
@@ -1342,12 +1343,14 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                     "webhook url is not configured — save it first".into(),
                 )));
             };
+            let secret = state.webhook_secret();
             crate::notify::send_webhook(
                 &url,
                 "notify.test",
                 "refract",
                 None,
                 "这是一条测试通知；收到即表示 webhook 配置正确",
+                secret.as_deref(),
             )
             .await;
             ok(serde_json::json!({ "sent": true }))
@@ -1476,7 +1479,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path::end())
         .and(warp::put())
         .and(json_body())
-        .and(with_state(state))
+        .and(with_state(state.clone()))
         .and_then(|body: AdminTokenBody, state: AppState| async move {
             let repo = state.settings_repo();
             match body.token.filter(|t| !t.trim().is_empty()) {
@@ -1492,6 +1495,139 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                     repo.remove(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
                         .await
                         .map_err(reject)?;
+                    ok(serde_json::json!({ "configured": false }))
+                }
+            }
+        });
+
+    let get_ip_limits = base
+        .and(warp::path("ip-limits"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let limits = state.settings_repo().ip_limits().await.map_err(reject)?;
+            ok(limits)
+        });
+
+    let set_ip_limits = base
+        .and(warp::path("ip-limits"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(
+            |limits: refract_store::IpLimits, state: AppState| async move {
+                state
+                    .settings_repo()
+                    .set_ip_limits(&limits)
+                    .await
+                    .map_err(reject)?;
+                state.reload_ip_limits().await.map_err(reject)?;
+                ok(limits)
+            },
+        );
+
+    let get_webhook_secret = base
+        .and(warp::path("webhook-secret"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let secret = state
+                .settings_repo()
+                .webhook_secret()
+                .await
+                .map_err(reject)?;
+            ok(serde_json::json!({ "configured": secret.is_some_and(|s| !s.is_empty()) }))
+        });
+
+    let set_webhook_secret = base
+        .and(warp::path("webhook-secret"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(|body: WebhookSecretBody, state: AppState| async move {
+            state
+                .settings_repo()
+                .set_webhook_secret(body.secret.as_deref())
+                .await
+                .map_err(reject)?;
+            state.reload_webhook_secret().await.map_err(reject)?;
+            let configured = body.secret.is_some_and(|s| !s.is_empty());
+            ok(serde_json::json!({ "configured": configured }))
+        });
+
+    let get_backup_settings = base
+        .and(warp::path("backup"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let settings = state
+                .settings_repo()
+                .backup_settings()
+                .await
+                .map_err(reject)?;
+            ok(settings)
+        });
+
+    let set_backup_settings = base
+        .and(warp::path("backup"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state.clone()))
+        .and_then(
+            |settings: refract_store::BackupSettings, state: AppState| async move {
+                state
+                    .settings_repo()
+                    .set_backup_settings(&settings)
+                    .await
+                    .map_err(reject)?;
+                state.reload_backup().await.map_err(reject)?;
+                ok(settings)
+            },
+        );
+
+    let get_master_key = base
+        .and(warp::path("master-key"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let configured = state.master_key().is_some();
+            ok(serde_json::json!({ "configured": configured }))
+        });
+
+    let set_master_key = base
+        .and(warp::path("master-key"))
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(json_body())
+        .and(with_state(state))
+        .and_then(|body: MasterKeyBody, state: AppState| async move {
+            match body.key.filter(|k| !k.trim().is_empty()) {
+                Some(k) => {
+                    refract_store::parse_master_key(&k).map_err(|e| {
+                        warp::reject::custom(ApiError(GatewayError::invalid_request(e.to_string())))
+                    })?;
+                    state
+                        .settings_repo()
+                        .set_master_key(Some(&k))
+                        .await
+                        .map_err(reject)?;
+                    state.reload_master_key().await.map_err(reject)?;
+                    ok(serde_json::json!({ "configured": true }))
+                }
+                None => {
+                    state
+                        .settings_repo()
+                        .set_master_key(None)
+                        .await
+                        .map_err(reject)?;
+                    state.reload_master_key().await.map_err(reject)?;
                     ok(serde_json::json!({ "configured": false }))
                 }
             }
@@ -1520,9 +1656,16 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         clear_affinity,
         stats_affinity,
         set_token,
+        get_ip_limits,
+        set_ip_limits,
+        get_webhook_secret,
+        set_webhook_secret,
+        get_backup_settings,
+        set_backup_settings,
+        get_master_key,
+        set_master_key,
     ]
 }
-
 /// 设置管理令牌的请求体。
 #[derive(Debug, Deserialize)]
 struct AdminTokenBody {
@@ -1545,6 +1688,116 @@ struct NotifyBody {
     /// 自动禁用渠道的重测间隔（分钟）；0 关闭自愈。
     #[serde(default = "default_retest_minutes")]
     retest_minutes: u32,
+}
+
+/// 设置 Webhook 密钥的请求体。
+#[derive(Debug, Deserialize)]
+struct WebhookSecretBody {
+    #[serde(default)]
+    secret: Option<String>,
+}
+
+/// 设置主加密密钥的请求体。
+#[derive(Debug, Deserialize)]
+struct MasterKeyBody {
+    #[serde(default)]
+    key: Option<String>,
+}
+
+/// 备份文件管理端点。
+fn backups(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
+    let base = warp::path("backups");
+
+    // GET /api/backups
+    let list = base
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let dir = crate::backup::resolve_backup_dir(&state);
+            let items = crate::backup::list_backups(&dir);
+            ok(items)
+        });
+
+    // POST /api/backups -> 手动触发单次备份
+    let run = base
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_state(state.clone()))
+        .and_then(|state: AppState| async move {
+            let filename = crate::backup::run_backup_once(&state)
+                .await
+                .map_err(reject)?;
+            ok(serde_json::json!({ "name": filename }))
+        });
+
+    // GET /api/backups/{name} -> 下载
+    let download = base
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(|name: String, state: AppState| async move {
+            if !crate::backup::is_valid_backup_name(&name) {
+                return Err(warp::reject::custom(ApiError(
+                    GatewayError::invalid_request("invalid backup filename"),
+                )));
+            }
+            let dir = crate::backup::resolve_backup_dir(&state);
+            let target = dir.join(&name);
+            if !target.is_file() {
+                return Err(warp::reject::custom(ApiError(GatewayError::not_found(
+                    format!("backup file `{name}` not found"),
+                ))));
+            }
+            let bytes = tokio::fs::read(&target).await.map_err(|e| {
+                warp::reject::custom(ApiError(GatewayError::internal(format!(
+                    "failed to read backup file: {e}"
+                ))))
+            })?;
+            let mut response = warp::reply::Response::new(bytes.into());
+            response.headers_mut().insert(
+                "content-type",
+                warp::http::HeaderValue::from_static("application/vnd.sqlite3"),
+            );
+            if let Ok(disposition) =
+                warp::http::HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+            {
+                response
+                    .headers_mut()
+                    .insert("content-disposition", disposition);
+            }
+            Ok(response)
+        });
+
+    // DELETE /api/backups/{name}
+    let delete = base
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::delete())
+        .and(with_state(state))
+        .and_then(|name: String, state: AppState| async move {
+            if !crate::backup::is_valid_backup_name(&name) {
+                return Err(warp::reject::custom(ApiError(
+                    GatewayError::invalid_request("invalid backup filename"),
+                )));
+            }
+            let dir = crate::backup::resolve_backup_dir(&state);
+            let target = dir.join(&name);
+            if !target.is_file() {
+                return Err(warp::reject::custom(ApiError(GatewayError::not_found(
+                    format!("backup file `{name}` not found"),
+                ))));
+            }
+            tokio::fs::remove_file(&target).await.map_err(|e| {
+                warp::reject::custom(ApiError(GatewayError::internal(format!(
+                    "failed to remove backup file: {e}"
+                ))))
+            })?;
+            ok(serde_json::json!({ "deleted": true }))
+        });
+
+    routes![list, run, download, delete]
 }
 
 fn default_retest_minutes() -> u32 {

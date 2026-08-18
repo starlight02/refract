@@ -7,7 +7,7 @@ vp install
 vp dev
 ```
 
-The development server proxies `/api`, `/v1`, and `/v1beta` to `127.0.0.1:3939`, so run `cargo run -p refract-server` from the repository root when exercising real data.
+The development server proxies `/api`, `/v1`, `/v1beta`, `/health`, and `/metrics` to `127.0.0.1:3939`, so run `cargo run -p refract-server` from the repository root when exercising real data.
 
 Quality gates:
 

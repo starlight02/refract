@@ -11,6 +11,8 @@ For a container or remote listener, Refract requires both controls before bindin
 
 `REFRACT_ADMIN_TOKEN` is hashed before persistence and is never logged. When it remains present, every restart resets the management token to that value. This makes container configuration deterministic and also means an in-UI token change will not survive the next restart until the environment is updated.
 
+Failed management logins are throttled per client IP: five consecutive failures lock that IP out for 60 seconds (HTTP 403 with `Retry-After`), even with the correct token — a guard against brute-force attempts on the admin surface.
+
 ## Docker Compose
 
 ```sh
@@ -39,7 +41,7 @@ Create at least one gateway API key in the UI before configuring clients. The ma
 
 Application logs go to stdout/stderr. Configure verbosity with `REFRACT_LOG`, for example `info,refract_router=debug`. Request records are stored in SQLite and default to 30 days of retention; the UI can set 1–3650 days. Cleanup runs once at startup and then every 24 hours, reading the latest setting each time.
 
-`GET /metrics` serves Prometheus text-format counters (requests, failures, transcodes, tokens, retries, uptime) collected in-process. Like the health probes it is unauthenticated; restrict it at the reverse proxy if your network requires that. Counters reset on restart, which Prometheus `rate()`/`increase()` handle natively.
+`GET /metrics` serves Prometheus text-format counters (requests, failures, transcodes, tokens, retries, uptime) collected in-process. When a management token is configured, `/metrics` requires the same `Bearer` credential as the admin API; without a token it remains unauthenticated like the health probes. Counters reset on restart, which Prometheus `rate()`/`increase()` handle natively. Point your Prometheus scrape config's `authorization.credentials` at the management token.
 
 ### Request tracing
 
@@ -74,9 +76,13 @@ For a personal gateway this is the right trade — hard mid-stream cutoffs would
 
 Each gateway key can additionally carry per-minute limits: requests per minute and tokens per minute (0 = unlimited). Windows are fixed calendar minutes kept in gateway memory — a restart clears them, which is acceptable because limits are protective, not billing. TPM is "post-paid, pre-checked": token usage is booked after a request completes, and a new request is rejected once the current window is already at or over the cap, so one large request may overshoot before the next one is blocked. Rejections return 429 with a `Retry-After` header pointing at the next window.
 
+Independent of key limits, **Settings → 全局限制** accepts a per-IP requests-per-minute cap (0 = unlimited) applied to all gateway traffic before routing, with each client IP keeping its own per-minute window. Enforcement uses the direct TCP peer address; behind a reverse proxy every client collapses to the proxy IP unless the proxy is the only hop you mean to limit.
+
 HTTP 200 generation responses with no text, reasoning, refusal, or tool call can be retried on the same channel. The default policy retries responses that finish within 3 seconds of the first upstream body byte, up to 5 additional attempts. Configure the global values under **Settings → Routing**, or leave either channel override blank to inherit its global value. Setting either effective value to 0 disables this retry. Streaming responses are buffered only until real model output appears or the configured window expires, so a fast empty stream can be retried before any frame reaches the client.
 
 The same settings section also has a strict-response switch. When enabled, an HTTP 200 generation response that cannot be recognized as the configured protocol (for example plain text, HTML, unknown JSON, or a non-SSE stream) is returned as an explicit, non-retryable HTTP 500 error. The switch is off by default, so existing behavior does not change until it is enabled.
+
+The routing policy also caps how many upstream calls one gateway request may consume (`max_upstream_calls`, default 8, 0 = unlimited) — counting every retry, key rotation, and empty-response re-attempt together. Exhausting the budget aborts the request with 503 instead of letting one pathological client fan out unbounded upstream traffic.
 
 Realtime WebSocket handshakes count toward key and gateway RPM, and each open session holds one global concurrency slot until it closes. Realtime token events are not decoded, so they do not accrue TPM or token cost; the session log still records channel, model, status, and duration.
 
@@ -84,13 +90,15 @@ Realtime WebSocket handshakes count toward key and gateway RPM, and each open se
 
 Configure a webhook URL and retest interval in Settings to close the unattended-operation loop. Endpoint suspension/recovery and terminal authentication failures emit deduplicated JSON webhook events. Repeated terminal failures mark a channel as automatically disabled; periodic retesting only touches automatically disabled channels and re-enables them after a successful probe. Manually disabled channels stay disabled.
 
+When a webhook signing secret is configured (Settings → 通知与自愈), every webhook request carries `X-Refract-Signature: sha256=<hex>` — the HMAC-SHA256 of the raw request body keyed with the secret. Verify it on the receiving side to authenticate Refract as the sender; without a secret no signature header is sent.
+
 ## Relay balances and database backup
 
 Balance refresh uses the common one-api/new-api billing endpoints where a relay exposes them; unsupported relays fail without changing the last cached balance. The dashboard derives channel and time-series accounting from immutable request logs. Settings also reports SQLite size/log age and creates an online `VACUUM INTO` backup without stopping request traffic.
 
 ## Request body capture
 
-By default every log row stores a snapshot of the request body and the response body (streaming responses store the aggregated text; binary payloads such as audio and multipart uploads are skipped). Snapshots are truncated at 64 KB with an explicit marker. The list API never returns bodies — only `GET /api/logs/{id}` does, which backs the "查看完整请求" dialog in the logs page. If conversation content must not touch disk, disable the switch under **Settings → 日志保留**; metadata logging is unaffected.
+Request and response bodies are **not** stored by default. Enabling the switch under **Settings → 日志保留** stores a snapshot of the request body and the response body per log row (streaming responses store the aggregated text; binary payloads such as audio and multipart uploads are skipped). Snapshots are truncated at 64 KB with an explicit marker. The list API never returns bodies — only `GET /api/logs/{id}` does, which backs the "查看完整请求" dialog in the logs page. Keep the switch off if conversation content must not touch disk; metadata logging is unaffected.
 
 ## Pricing and spend
 
@@ -101,6 +109,8 @@ Settings → 模型价表 maintains per-million-token prices keyed by exact mode
 On SIGTERM/Ctrl-C Refract stops accepting new connections and waits up to `shutdown_grace_secs` (default 30) for in-flight requests — including long streams — to finish, then aborts whatever remains. Raise the window if your workload routinely streams for minutes and you prefer clean completion over fast restarts; container orchestrators must allow at least this long before SIGKILL (Compose `stop_grace_period`, Kubernetes `terminationGracePeriodSeconds`).
 
 ## Backup and restore
+
+Refract can schedule backups itself: **Settings → 自动备份** sets an interval (0 = off), a target directory, and a retention count. Each run executes an online `VACUUM INTO` into `<directory>/refract-<timestamp>.db` (mode 0600) and prunes to the newest N files. The same files appear under **Settings → 备份文件** with download and delete actions, and `POST /api/backups` triggers a manual run on demand. Backup files contain the full database — upstream credentials included — so treat them as secrets.
 
 SQLite may use WAL files, so do not copy only `refract.db` while the service is writing. The simplest consistent Compose backup is a brief stop followed by an archive of the volume:
 
@@ -127,9 +137,13 @@ docker compose up -d
 
 Keep backups encrypted: the database contains upstream credentials. Refract masks credentials at the HTTP boundary, but the service must retain usable credentials in its database.
 
+### Credential encryption at rest
+
+Set `REFRACT_MASTER_KEY` — the base64 encoding of 32 random bytes, e.g. `openssl rand -base64 32` — to encrypt upstream channel credentials with AES-256-GCM inside SQLite. The key can also be set from the UI (Settings → 凭据静态加密), which persists it in the settings table; the environment variable takes precedence on every start. Existing plaintext credentials are encrypted the next time they are saved. Without a master key, behavior is unchanged for backward compatibility. The master key is never part of configuration exports. Losing it makes encrypted credentials unrecoverable — keep an offline copy.
+
 ### Configuration export/import
 
-For migrating configuration (not logs) between instances, prefer the built-in backup: **Settings → 数据备份** in the UI, or `GET /api/export` / `POST /api/import` with the admin token. The export is a single JSON document containing channels (with plaintext upstream credentials — guard the file like a key), gateway API keys (hash only; original plaintext keys keep working after restore), the routing policy, log retention, and the circuit-breaker policy. Import supports `merge` (skip channels with an existing name, skip known key hashes) and `replace` (wipe channels and keys first; the UI asks for confirmation). The import response lists the names of skipped channels and keys, not just counts. Request logs and live circuit-breaker state are not part of the export; use the volume backup above for full-state recovery.
+For migrating configuration (not logs) between instances, prefer the built-in backup: **Settings → 数据备份** in the UI, or `GET /api/export` / `POST /api/import` with the admin token. The export is a single JSON document containing channels (with plaintext upstream credentials — guard the file like a key), gateway API keys (hash only; original plaintext keys keep working after restore), the routing policy, log retention, and the circuit-breaker policy. The webhook signing secret, master encryption key, and backup settings are deliberately excluded from exports. Import supports `merge` (skip channels with an existing name, skip known key hashes) and `replace` (wipe channels and keys first; the UI asks for confirmation). The import response lists the names of skipped channels and keys, not just counts. Request logs and live circuit-breaker state are not part of the export; importing into a running instance leaves its logs and breaker state untouched.
 
 Feeding a redacted admin `GET /api/channels` response back as a backup is rejected before any data is touched — masked credentials (`sk-a…9f2c`) are not usable configuration.
 

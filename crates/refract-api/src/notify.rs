@@ -180,8 +180,9 @@ impl EventWorker {
         let event = event.to_owned();
         let channel = channel.to_owned();
         let detail = detail.to_owned();
+        let secret = state.webhook_secret();
         tokio::spawn(async move {
-            send_webhook(&url, &event, &channel, protocol, &detail).await;
+            send_webhook(&url, &event, &channel, protocol, &detail, secret.as_deref()).await;
         });
     }
 }
@@ -194,6 +195,7 @@ pub async fn send_webhook(
     channel: &str,
     protocol: Option<Protocol>,
     detail: &str,
+    secret: Option<&str>,
 ) {
     let payload = serde_json::json!({
         "source": "refract",
@@ -210,7 +212,24 @@ pub async fn send_webhook(
             return;
         }
     };
-    match client.post(url).json(&payload).send().await {
+    let body_bytes = match serde_json::to_vec(&payload) {
+        Ok(b) => b,
+        Err(error) => {
+            tracing::warn!(%error, "failed to serialize webhook payload");
+            return;
+        }
+    };
+    let mut req = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body_bytes.clone());
+    if let Some(s) = secret.filter(|s| !s.is_empty()) {
+        let sig_bytes = hmac_sha256(s.as_bytes(), &body_bytes);
+        let signature = hex::encode(sig_bytes);
+        req = req.header("x-refract-signature", format!("sha256={signature}"));
+    }
+
+    match req.send().await {
         Ok(response) if !response.status().is_success() => {
             tracing::warn!(status = %response.status(), event, "webhook endpoint returned non-2xx");
         }
@@ -219,6 +238,33 @@ pub async fn send_webhook(
             tracing::warn!(%error, event, "failed to deliver webhook");
         }
     }
+}
+
+/// HMAC-SHA256 实现（基于 `sha2` crate，避免跨版本 digest 冲突）。
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut k = [0_u8; 64];
+    if key.len() > 64 {
+        let hash = Sha256::digest(key);
+        k[..32].copy_from_slice(&hash);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36_u8; 64];
+    let mut opad = [0x5c_u8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    outer.finalize().into()
 }
 
 /// 自动禁用渠道的定时重测循环。间隔从设置读取（0 = 关闭），改动无需重启。
@@ -265,12 +311,14 @@ pub async fn auto_retest_loop(state: AppState) {
                     }
                     tracing::info!(channel = %channel.name, "auto-retest: channel recovered");
                     if let Some(url) = state.webhook_url() {
+                        let secret = state.webhook_secret();
                         send_webhook(
                             &url,
                             "channel.auto_recovered",
                             &channel.name,
                             None,
-                            "自动禁用的渠道重测通过，已恢复启用",
+                            "自动重测成功，渠道已恢复启用",
+                            secret.as_deref(),
                         )
                         .await;
                     }

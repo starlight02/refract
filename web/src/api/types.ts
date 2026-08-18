@@ -251,6 +251,12 @@ export interface GlobalLimits {
   max_concurrency: number
 }
 
+/** 按来源 IP 的限制。 */
+export interface IpLimits {
+  /** 单 IP 每分钟请求数上限；0 = 不限。 */
+  rpm: number
+}
+
 export interface EmptyResponseRetryPolicy {
   window_secs: number
   max_retries: number
@@ -276,6 +282,8 @@ export interface RoutingPolicy {
   selection: SelectionMode
   max_attempts: number
   retry_same_channel: boolean
+  /** 单请求允许的上游调用总次数（含重试）；0 = 不限，后端缺省 8。 */
+  max_upstream_calls: number
 }
 
 /** 自动清理请求日志的保留周期。 */
@@ -398,4 +406,32 @@ export interface AffinityStatsResponse {
   /** 总开关开且规则非空。 */
   active: boolean
   stats: AffinityStats
+}
+
+// ── 备份与凭据加密 ──
+
+/** 自动备份设置。 */
+export interface BackupSettings {
+  /** 备份目录；null 使用内置默认目录。 */
+  directory?: string | null
+  /** 备份间隔小时数；0 = 关闭自动备份。 */
+  interval_hours: number
+  /** 保留的备份份数。 */
+  keep: number
+}
+
+/** 备份文件列表条目。 */
+export interface BackupFile {
+  name: string
+  size_bytes: number
+  created_at: string
+}
+
+/**
+ * 密钥类设置的只写状态。
+ *
+ * 服务端只保存哈希或密文，GET 永远不回明文；PUT 传 null 清除。
+ */
+export interface SecretConfigured {
+  configured: boolean
 }

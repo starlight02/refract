@@ -13,6 +13,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use refract_core::{Channel, ErrorKind, GatewayError, Protocol};
 use refract_store::{ApiKey, ApiKeyRepo, SettingsRepo};
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::Instant;
 use warp::Filter;
 
 use crate::error::{ApiError, ProtocolRejection};
@@ -232,47 +236,122 @@ pub fn authenticate(
         })
 }
 
+/// 管理面防爆破守卫：按客户端 IP 记录连续失败次数与封禁截止时间。
+/// 5 次失败锁定 60 秒（期间直接 403）；成功清零。
+#[derive(Debug, Default)]
+pub struct AdminGuard {
+    failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+impl AdminGuard {
+    /// 创建空的管理面防爆破守卫。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 检查该 IP 是否处于封禁状态。封禁中返回剩余秒数。
+    pub fn check_locked(&self, ip: IpAddr) -> Option<u64> {
+        let now = Instant::now();
+        let mut guard = self.failures.lock().expect("admin guard lock");
+        if let Some((failures, until)) = guard.get(&ip) {
+            if *failures >= 5 && *until > now {
+                return Some((*until - now).as_secs().max(1));
+            }
+            if *until <= now {
+                guard.remove(&ip);
+            }
+        }
+        None
+    }
+
+    /// 记录一次鉴权失败，返回是否触发封禁。
+    pub fn record_failure(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut guard = self.failures.lock().expect("admin guard lock");
+        let entry = guard.entry(ip).or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        if entry.0 >= 5 {
+            entry.1 = now + std::time::Duration::from_secs(60);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 成功鉴权后清零该 IP 的失败记录。
+    pub fn record_success(&self, ip: IpAddr) {
+        let mut guard = self.failures.lock().expect("admin guard lock");
+        guard.remove(&ip);
+    }
+}
+
 /// 管理接口鉴权。
 ///
 /// 未设置管理令牌时放行 —— 首次启动必须能进去设置它，否则用户被自己锁在外面。
 pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("authorization")
         .and(warp::header::optional::<String>("x-admin-token"))
-        .and_then(move |auth: Option<String>, x_admin: Option<String>| {
-            let state = state.clone();
-            async move {
-                let repo = SettingsRepo::new(state.db().clone());
-                let expected: Option<String> = repo
-                    .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
-                    .await
-                    .map_err(|e| {
-                        warp::reject::custom(ApiError(crate::error::store_to_gateway(e)))
-                    })?;
+        .and(warp::filters::addr::remote())
+        .and_then(
+            move |auth: Option<String>,
+                  x_admin: Option<String>,
+                  remote_addr: Option<std::net::SocketAddr>| {
+                let state = state.clone();
+                async move {
+                    let client_ip = remote_addr
+                        .map(|a| a.ip())
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
-                let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
-                    // 尚未设置管理令牌：放行，让用户能完成初始配置。
-                    return Ok(());
-                };
+                    // 先查防爆破封禁。
+                    if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
+                        let err = GatewayError::new(
+                            ErrorKind::PermissionDenied,
+                            format!("too many failed login attempts, locked for {wait_secs}s"),
+                        )
+                        .with_retry_after(std::time::Duration::from_secs(wait_secs));
+                        return Err(warp::reject::custom(ApiError(err)));
+                    }
 
-                let token = extract_token(auth, x_admin, None, None, None).ok_or_else(|| {
-                    warp::reject::custom(ApiError(GatewayError::unauthenticated(
-                        "missing admin token",
-                    )))
-                })?;
+                    let repo = SettingsRepo::new(state.db().clone());
+                    let expected: Option<String> = repo
+                        .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
+                        .await
+                        .map_err(|e| {
+                            warp::reject::custom(ApiError(crate::error::store_to_gateway(e)))
+                        })?;
 
-                if constant_time_eq(
-                    refract_store::ApiKeyRepo::hash(&token).as_bytes(),
-                    expected_hash.as_bytes(),
-                ) {
-                    Ok(())
-                } else {
-                    Err(warp::reject::custom(ApiError(GatewayError::new(
-                        ErrorKind::PermissionDenied,
-                        "invalid admin token",
-                    ))))
+                    let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
+                        // 尚未设置管理令牌：放行，让用户能完成初始配置。
+                        return Ok(());
+                    };
+
+                    let token = match extract_token(auth, x_admin, None, None, None) {
+                        Some(t) => t,
+                        None => {
+                            // 缺失 token 也计一次失败，防针对无头请求的探测。
+                            state.admin_guard().record_failure(client_ip);
+                            return Err(warp::reject::custom(ApiError(
+                                GatewayError::unauthenticated("missing admin token"),
+                            )));
+                        }
+                    };
+
+                    if constant_time_eq(
+                        refract_store::ApiKeyRepo::hash(&token).as_bytes(),
+                        expected_hash.as_bytes(),
+                    ) {
+                        state.admin_guard().record_success(client_ip);
+                        Ok(())
+                    } else {
+                        state.admin_guard().record_failure(client_ip);
+                        Err(warp::reject::custom(ApiError(GatewayError::new(
+                            ErrorKind::PermissionDenied,
+                            "invalid admin token",
+                        ))))
+                    }
                 }
-            }
-        })
+            },
+        )
         .untuple_one()
 }
 

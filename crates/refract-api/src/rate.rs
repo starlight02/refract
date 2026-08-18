@@ -131,6 +131,57 @@ impl RateLimiter {
     }
 }
 
+/// 按客户端 IP 的速率限制器（RPM）。
+#[derive(Debug, Default)]
+pub struct IpRateLimiter {
+    windows: Mutex<HashMap<std::net::IpAddr, IpWindow>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IpWindow {
+    minute: u64,
+    requests: u64,
+}
+
+impl IpRateLimiter {
+    /// 创建空 IP 限流器。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// IP 请求准入检查；通过则计入窗口。`rpm == 0` 表示不限。
+    pub fn admit(&self, ip: std::net::IpAddr, rpm: u32) -> Result<(), RateExceeded> {
+        if rpm == 0 {
+            return Ok(());
+        }
+        let now = now_secs();
+        let minute = now / 60;
+        let retry_after_secs = 60 - (now % 60);
+        let mut windows = self.windows.lock().expect("ip rate windows lock");
+        if windows.len() > 10_000 {
+            windows.retain(|_, w| w.minute == minute);
+        }
+        let window = windows.entry(ip).or_insert(IpWindow {
+            minute,
+            requests: 0,
+        });
+        if window.minute != minute {
+            *window = IpWindow {
+                minute,
+                requests: 0,
+            };
+        }
+        if window.requests >= rpm as u64 {
+            return Err(RateExceeded {
+                dimension: RateDimension::Requests,
+                retry_after_secs,
+            });
+        }
+        window.requests += 1;
+        Ok(())
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

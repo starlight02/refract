@@ -35,7 +35,7 @@ Aggregate channels can express things new-api cannot: *"My relay offers both Ope
 - **Unattended recovery**: terminal authentication failures can auto-disable a channel, periodic retests bring it back after recovery, and deduplicated webhook events report suspension, recovery, and auto-disable transitions.
 - **Abnormal-200 handling**: retry fast HTTP 200 responses that contain no model output (default: within 3 seconds, up to 5 retries), with per-channel overrides; optionally turn plain text, HTML, unknown JSON/SSE, and other protocol-invalid 200 responses into explicit HTTP 500 errors.
 - **Channel ledger**: refresh relay balances, compare request volume / latency / spend by channel, and inspect hourly or daily time series from the dashboard.
-- **Operational probes & metrics**: public `/health/live`, `/health/ready` and Prometheus text-format `/metrics`.
+- **Operational probes & metrics**: public `/health/live`, `/health/ready`; Prometheus text-format `/metrics` requires the management token when one is configured.
 - **Configuration and database backup**: export/import channels, gateway keys and settings as one JSON document; restored keys keep working across instances. Merge and replace import modes. Settings also exposes database size statistics and an online SQLite backup.
 - **Single-binary deployment**: the built frontend is embedded into the binary; deploying is copying one file.
 - **Designed for one user, not hard-wired to one user**: every business table carries `owner_id`, authentication is a trait — adding multi-user later doesn't touch business logic.
@@ -99,7 +99,7 @@ Compose binds the host port to loopback only, runs as a non-root user with a rea
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting (passthrough to gemini endpoints) |
 | `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` | OpenAI and Gemini model discovery (derived from enabled channels) |
 | `GET /v1/realtime?model=...` (WebSocket) | OpenAI Realtime native WebSocket bridge |
-| `GET /metrics` | Prometheus metrics (no auth, like the health probes) |
+| `GET /metrics` | Prometheus metrics (management-token protected when configured; health probes stay public) |
 
 Both streaming and non-streaming are supported. Gateway endpoints send permissive CORS headers so browser-based clients can call them directly. The admin UI lives under `/api/...`, uses a separate credential system from the gateway endpoints, and deliberately sends **no** CORS headers — the management surface is same-origin only.
 
@@ -121,6 +121,7 @@ Realtime is likewise native-only: it selects a healthy Chat endpoint, applies mo
 | `stream_idle_timeout_secs` | `120` | Streaming: max wait for response headers, then max gap between frames |
 | `shutdown_grace_secs` | `30` | Graceful shutdown window before in-flight connections are aborted |
 | `proxy` | none | Outbound proxy (http/socks5) |
+| `master_key` | none | Master encryption key for credentials at rest (32-byte base64); inject via `REFRACT_MASTER_KEY` |
 
 **Security note**: the service refuses a non-loopback listener unless an admin token is configured and `require_auth=true`. `REFRACT_ADMIN_TOKEN` declaratively sets that token on every start; never commit its plaintext value.
 
