@@ -1,5 +1,12 @@
 ARG NPM_REGISTRY=https://registry.npmjs.org
 ARG ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
+# 构建源可用 --build-arg + --build-context 切换（CI 加速用）：
+#   web_src: web-builder（镜像内构建前端，默认）/ web-dist（预构建产物）
+#   bin_src: rust-builder（镜像内编译，默认）/ bin（预构建二进制）
+# 不传参数时行为与从前完全一致：前端与后端都在镜像内现场构建。
+ARG web_src=web-builder
+ARG bin_src=rust-builder
+
 FROM node:26-alpine AS web-builder
 ARG NPM_REGISTRY
 WORKDIR /build/web
@@ -10,6 +17,9 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile --registry="$NPM_REGISTRY"
 COPY web/ ./
 RUN pnpm run build
+# 统一输出位置：无论选哪个 web 源，dist 都取 /web/dist。
+RUN mkdir -p /web && cp -r /build/web/dist /web/dist
+FROM $web_src AS web-final
 
 FROM rust:1.97-alpine AS rust-builder
 ARG ALPINE_MIRROR
@@ -20,12 +30,14 @@ RUN sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${ALPINE_MIRROR}|g" /etc/apk
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
-COPY --from=web-builder /build/web/dist ./web/dist
+COPY --from=web-final /web/dist ./web/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     cargo build --locked --release -p refract-server && \
-    cp /build/target/release/refract-server /build/refract-server
+    cp /build/target/release/refract-server /refract-server
+
+FROM $bin_src AS bin-final
 
 FROM alpine:3.24 AS runtime
 ARG ALPINE_MIRROR
@@ -37,7 +49,8 @@ RUN sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${ALPINE_MIRROR}|g" /etc/apk
     && adduser -u 10001 -G refract -s /sbin/nologin -D refract \
     && install -d -o refract -g refract /data
 
-COPY --from=rust-builder /build/refract-server /usr/local/bin/refract-server
+# 预构建二进制（--build-context bin=...）或 rust-builder 编译产物，统一在 /refract-server。
+COPY --from=bin-final /refract-server /usr/local/bin/refract-server
 
 USER refract
 WORKDIR /data

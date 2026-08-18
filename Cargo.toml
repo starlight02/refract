@@ -101,6 +101,15 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# CI 冒烟镜像用的构建：继承 release 的优化级别，但换成 thin LTO、
+# 16 个代码生成单元且不 strip，增量重编译只需 1-2 分钟。
+# 正式发布的镜像/二进制仍走下方 release profile（fat LTO + 单代码生成单元）。
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+
 # proc-macro 与构建脚本只在编译期运行，优化和 strip 它们对产物毫无意义；
 # 且 macOS 26+ 的 dyld 会以 "mis-aligned LINKEDIT string pool" 拒绝加载
 # 被 strip 过的 proc-macro dylib，导致 release 构建直接失败。
