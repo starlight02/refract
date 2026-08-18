@@ -106,10 +106,10 @@ jobs:
       - run: cargo build --locked --profile ci -p refract-server --target x86_64-unknown-linux-musl
       # build-contexts 供 Dockerfile 的 ARG 选择源使用：
       #   web-dist/ → /web/dist（web_src=web-dist 时跳过镜像内前端构建）
-      #   bin/     → /refract-server（bin_src=bin 时跳过镜像内 Rust 编译）
+      #   bin/<arch>/refract-server（bin_src=bin 时按 $TARGETARCH 选取，跳过镜像内编译）
       - run: |
-          mkdir -p bin web-dist/web
-          cp target/x86_64-unknown-linux-musl/ci/refract-server bin/refract-server
+          mkdir -p bin/amd64 web-dist/web
+          cp target/x86_64-unknown-linux-musl/ci/refract-server bin/amd64/refract-server
           cp -r web/dist web-dist/web/dist
       - uses: docker/setup-buildx-action@v4
       - uses: docker/build-push-action@v7
