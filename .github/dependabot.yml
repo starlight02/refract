@@ -1,22 +1,54 @@
 version: 2
 updates:
+  # Rust 依赖：聚合为单个 PR，忽略破坏性 major 大版本，只接收平滑的 minor（中间版本）与 patch（补丁修复）。
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 50
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # 前端依赖：聚合为单个 PR，忽略破坏性 major（如 typescript 7 等），只接收平滑的 minor 与 patch。
   - package-ecosystem: npm
     directory: /web
     schedule:
       interval: weekly
     open-pull-requests-limit: 50
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions：聚合为单个 PR。Actions 生态以 major 标签为主，保留 major 升级。
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 50
+    groups:
+      actions-dependencies:
+        patterns:
+          - "*"
+
+  # Docker 底座镜像：聚合为单个 PR，忽略 node/rust/alpine 跨大版本颠覆性升级。
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 50
+    groups:
+      docker-dependencies:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

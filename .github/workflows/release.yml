@@ -43,6 +43,7 @@ jobs:
     name: ${{ matrix.target }}
     needs: [web]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +69,9 @@ jobs:
           key: ${{ matrix.target }}
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=15
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends musl-tools
       - uses: actions/download-artifact@v8
         with:
           name: web-dist
