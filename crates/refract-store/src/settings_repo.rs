@@ -32,7 +32,7 @@ pub const KEY_WEBHOOK_URL: &str = "notify.webhook_url";
 pub const KEY_RETEST_MINUTES: &str = "channels.auto_retest_minutes";
 /// 默认重测间隔。
 pub const DEFAULT_RETEST_MINUTES: u32 = 30;
-/// 全局限制（网关级 RPM 与并发上限）。
+/// 全局限制（网关级 RPM、TPM 与并发上限）。
 pub const KEY_GLOBAL_LIMITS: &str = "limits.global";
 /// HTTP 200 空回复重试策略。
 pub const KEY_EMPTY_RESPONSE_RETRY: &str = "upstream.empty_response_retry";
@@ -54,6 +54,12 @@ pub struct GlobalLimits {
     /// 每分钟请求数上限。0 = 不限。
     #[serde(default)]
     pub rpm: u32,
+    /// 每分钟 token 数上限。0 = 不限。
+    ///
+    /// 与 RPM 互补：RPM 挡不住「少量请求 × 巨大上下文」。跑飞的 agent 每次
+    /// 带 200k 上下文重发时，RPM=60 之内一分钟仍可烧掉 1200 万 token。
+    #[serde(default)]
+    pub tpm: u32,
     /// 同时在途请求上限。0 = 不限。
     #[serde(default)]
     pub max_concurrency: u32,
@@ -64,6 +70,9 @@ impl GlobalLimits {
     pub fn validate(&self) -> Result<(), String> {
         if self.rpm > 1_000_000 {
             return Err("global rpm must be at most 1,000,000".into());
+        }
+        if self.tpm > 1_000_000_000 {
+            return Err("global tpm must be at most 1,000,000,000".into());
         }
         if self.max_concurrency > 100_000 {
             return Err("global concurrency must be at most 100,000".into());
@@ -826,6 +835,59 @@ mod tests {
 
         let too_big = IpLimits { rpm: 1_000_001 };
         assert!(repo.set_ip_limits(&too_big).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn global_limits_defaults_roundtrips_and_validates() {
+        let repo = repo().await;
+        assert_eq!(repo.global_limits().await.unwrap(), GlobalLimits::default());
+
+        let limits = GlobalLimits {
+            rpm: 600,
+            tpm: 2_000_000,
+            max_concurrency: 32,
+        };
+        repo.set_global_limits(&limits).await.unwrap();
+        assert_eq!(repo.global_limits().await.unwrap(), limits);
+
+        for bad in [
+            GlobalLimits {
+                rpm: 1_000_001,
+                ..Default::default()
+            },
+            GlobalLimits {
+                tpm: 1_000_000_001,
+                ..Default::default()
+            },
+            GlobalLimits {
+                max_concurrency: 100_001,
+                ..Default::default()
+            },
+        ] {
+            assert!(repo.set_global_limits(&bad).await.is_err(), "{bad:?}");
+        }
+        // 越界写入被拒后，库里仍是上一次的合法值。
+        assert_eq!(repo.global_limits().await.unwrap(), limits);
+    }
+
+    /// 旧库里只存了 rpm/max_concurrency 的 JSON 必须能反序列化，tpm 缺省为 0（不限）。
+    #[tokio::test]
+    async fn global_limits_deserializes_legacy_json_without_tpm() {
+        let repo = repo().await;
+        repo.set(
+            KEY_GLOBAL_LIMITS,
+            &serde_json::json!({ "rpm": 60, "max_concurrency": 8 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.global_limits().await.unwrap(),
+            GlobalLimits {
+                rpm: 60,
+                tpm: 0,
+                max_concurrency: 8,
+            }
+        );
     }
 
     #[tokio::test]

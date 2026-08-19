@@ -76,7 +76,14 @@ For a personal gateway this is the right trade — hard mid-stream cutoffs would
 
 Each gateway key can additionally carry per-minute limits: requests per minute and tokens per minute (0 = unlimited). Windows are fixed calendar minutes kept in gateway memory — a restart clears them, which is acceptable because limits are protective, not billing. TPM is "post-paid, pre-checked": token usage is booked after a request completes, and a new request is rejected once the current window is already at or over the cap, so one large request may overshoot before the next one is blocked. Rejections return 429 with a `Retry-After` header pointing at the next window.
 
-Independent of key limits, **Settings → 全局限制** accepts a per-IP requests-per-minute cap (0 = unlimited) applied to all gateway traffic before routing, with each client IP keeping its own per-minute window. Enforcement uses the direct TCP peer address; behind a reverse proxy every client collapses to the proxy IP unless the proxy is the only hop you mean to limit.
+Independent of key limits, **Settings → 全局限制** carries gateway-wide fuses that apply to *all* traffic, including unauthenticated local mode where per-key limits provide no protection at all (0 = unlimited for every field):
+
+- **全局 RPM** — requests per minute across the whole gateway.
+- **全局 TPM** — tokens per minute across the whole gateway. RPM alone cannot stop "few requests × huge context": a runaway agent resending a 200k-token context stays within RPM 60 while burning 12M input tokens a minute. Global TPM is the only fuse that catches that, and unlike per-key TPM it books usage even when no gateway key is in play.
+- **并发上限** — simultaneous in-flight requests; a streaming response holds its slot until the stream ends.
+- **单 IP RPM** — per-client-IP requests per minute, each IP keeping its own window. Enforcement uses the direct TCP peer address; behind a reverse proxy every client collapses to the proxy IP unless the proxy is the only hop you mean to limit.
+
+Global RPM and TPM share one window entry, so a rejection names the dimension that actually tripped (`requests per minute (RPM)` or `tokens per minute (TPM)`) together with that dimension's cap. Global TPM uses the same "post-paid, pre-checked" accounting as the per-key limit: one request may overshoot the cap before the next one is blocked.
 
 HTTP 200 generation responses with no text, reasoning, refusal, or tool call can be retried on the same channel. The default policy retries responses that finish within 3 seconds of the first upstream body byte, up to 5 additional attempts. Configure the global values under **Settings → Routing**, or leave either channel override blank to inherit its global value. Setting either effective value to 0 disables this retry. Streaming responses are buffered only until real model output appears or the configured window expires, so a fast empty stream can be retried before any frame reaches the client.
 

@@ -245,9 +245,13 @@ export interface TimeBucket {
   cost: number
 }
 
-/** 网关级全局限制。 */
+/** 网关级全局限制。所有字段 0 = 不限。 */
 export interface GlobalLimits {
+  /** 每分钟请求数上限。 */
   rpm: number
+  /** 每分钟 token 数上限；挡 RPM 挡不住的「少量请求 × 巨大上下文」。 */
+  tpm: number
+  /** 同时在途请求上限。 */
   max_concurrency: number
 }
 

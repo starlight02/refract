@@ -1937,31 +1937,37 @@ fn log_failure(context: &DispatchContext, err: &GatewayError) {
     record(&context.state, entry, key_id, 0);
 }
 
-/// 落一条日志并累计密钥用量。
-///
-/// 日志写失败**不能**影响响应 —— 请求已经成功了，因为记账问题给客户端报错
-/// 是本末倒置。落库在后台任务里完成，不占用响应路径：SQLite 写入通常在
-/// 亚毫秒级，但 checkpoint 或磁盘抖动时会到几十毫秒，没理由让客户端等它。
-/// 网关级全局准入：RPM 窗口 + 并发 permit。
+/// 网关级全局准入：RPM / TPM 窗口 + 并发 permit。
 ///
 /// 密钥级限速在免鉴权模式下是零防护 —— 这层是跑飞的本地 agent 迴圈
 /// 与上游账单之间最后的保险丝。返回的 permit 活多久，并发额度就占多久：
 /// unary 在响应构造完释放，流式一直持有到流结束。
+///
+/// RPM 与 TPM 在同一次 `admit` 里检查：两者共用一个窗口条目，分开调用会把
+/// 本次请求重复计入 requests 计数。
 pub(crate) fn enforce_global_limits(
     state: &AppState,
     inbound: Protocol,
     request_id: &str,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Rejection> {
     let limits = state.global_limits();
-    // 保留 key 0 承载全局窗口：真实密钥 ID 从 1 开始。
-    if limits.rpm > 0
-        && let Err(exceeded) = state.rate_limiter().admit(0, i64::from(limits.rpm), 0)
-    {
+    if let Err(exceeded) = state.rate_limiter().admit(
+        crate::rate::GLOBAL_WINDOW_KEY,
+        i64::from(limits.rpm),
+        i64::from(limits.tpm),
+    ) {
+        // 触发维度决定文案里报哪个上限：RPM 与 TPM 的处置动作不同（降频 vs 缩上下文）。
+        let cap = match exceeded.dimension {
+            crate::rate::RateDimension::Requests => limits.rpm,
+            crate::rate::RateDimension::Tokens => limits.tpm,
+        };
         let error = GatewayError::new(
             ErrorKind::RateLimited,
             format!(
-                "gateway-wide request limit ({} RPM) exceeded; retry in {}s",
-                limits.rpm, exceeded.retry_after_secs,
+                "gateway-wide {} limit ({}) exceeded; retry in {}s",
+                exceeded.dimension.describe(),
+                cap,
+                exceeded.retry_after_secs,
             ),
         )
         .with_retry_after(std::time::Duration::from_secs(exceeded.retry_after_secs));
@@ -2058,6 +2064,11 @@ pub(crate) fn enforce_ip_limit(
     Ok(())
 }
 
+/// 落一条日志并累计密钥用量。
+///
+/// 日志写失败**不能**影响响应 —— 请求已经成功了，因为记账问题给客户端报错
+/// 是本末倒置。落库在后台任务里完成，不占用响应路径：SQLite 写入通常在
+/// 亚毫秒级，但 checkpoint 或磁盘抖动时会到几十毫秒，没理由让客户端等它。
 fn record(state: &AppState, mut entry: NewRequestLog, key_id: Option<i64>, tokens: u64) {
     // 成本按落库当时的价表固化进日志：单价会变，历史账单不应跟着变。
     entry.cost = state.cost_for(
@@ -2071,10 +2082,15 @@ fn record(state: &AppState, mut entry: NewRequestLog, key_id: Option<i64>, token
     // observe 是纯内存操作，留在请求路径里保证响应返回时指标已可见。
     state.metrics().observe(&entry);
     // TPM 记账在内存里同步完成 —— 下一个请求的准入检查要立刻看到本次用量。
-    if let Some(id) = key_id
-        && tokens > 0
-    {
-        state.rate_limiter().add_tokens(id, tokens);
+    if tokens > 0 {
+        // 全局窗口无条件收账：免鉴权模式下 key_id 为 None，只挂密钥的话
+        // 全局 TPM 永远读到 0，保险丝等于没接。
+        state
+            .rate_limiter()
+            .add_tokens(crate::rate::GLOBAL_WINDOW_KEY, tokens);
+        if let Some(id) = key_id {
+            state.rate_limiter().add_tokens(id, tokens);
+        }
     }
     let state = state.clone();
     tokio::spawn(async move {
@@ -3132,6 +3148,129 @@ mod tests {
         assert!((1..=60).contains(&retry_after));
         let body: Value = serde_json::from_slice(second.body()).unwrap();
         assert!(body["error"]["message"].as_str().unwrap().contains("RPM"));
+    }
+
+    /// 全局 TPM 在免鉴权模式下也必须生效：这是 `record()` 无条件给全局窗口
+    /// 记账的唯一验收点 —— 只挂密钥的旧实现在这里会放行第二个请求。
+    #[tokio::test]
+    async fn global_tpm_blocks_the_next_request_without_any_api_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-1",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100 }
+            })))
+            .mount(&server)
+            .await;
+
+        // require_auth = false：没有任何网关密钥，key_id 恒为 None。
+        let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
+        state
+            .settings_repo()
+            .set_global_limits(&refract_store::GlobalLimits {
+                tpm: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state.reload_global_limits().await.unwrap();
+        let api = crate::routes(state);
+
+        let request = || {
+            warp::test::request()
+                .method("POST")
+                .path("/v1/chat/completions")
+                .json(&serde_json::json!({
+                    "model": "gpt-4o",
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }))
+        };
+
+        // 第一个请求放行（窗口初始为空），并把 100 token 计入全局窗口。
+        assert_eq!(request().reply(&api).await.status(), 200);
+
+        // 窗口已达 tpm=100 上限，下一个请求被挡。
+        let blocked = request().reply(&api).await;
+        assert_eq!(blocked.status(), 429);
+        let retry_after: u64 = blocked
+            .headers()
+            .get("retry-after")
+            .expect("retry-after header")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after));
+        let body: Value = serde_json::from_slice(blocked.body()).unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        // 报的是 TPM 维度与 TPM 上限，而不是 RPM。
+        assert!(message.contains("TPM"), "{message}");
+        assert!(message.contains("100"), "{message}");
+        assert!(!message.contains("RPM"), "{message}");
+    }
+
+    /// 全局 RPM 与 TPM 同时配置时，RPM 先触发；且请求只计一次 —— 两个维度
+    /// 共用一个窗口条目，分开 admit 会让 requests 计数翻倍。
+    #[tokio::test]
+    async fn global_rpm_and_tpm_share_one_window_and_report_the_rpm_dimension() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-1",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })))
+            .mount(&server)
+            .await;
+
+        let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
+        state
+            .settings_repo()
+            .set_global_limits(&refract_store::GlobalLimits {
+                rpm: 2,
+                tpm: 1_000_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state.reload_global_limits().await.unwrap();
+        let api = crate::routes(state);
+
+        let request = || {
+            warp::test::request()
+                .method("POST")
+                .path("/v1/chat/completions")
+                .json(&serde_json::json!({
+                    "model": "gpt-4o",
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }))
+        };
+
+        // rpm=2 意味着恰好放行两个请求：若两个维度各计一次 requests，第二个就会被挡。
+        assert_eq!(request().reply(&api).await.status(), 200);
+        assert_eq!(request().reply(&api).await.status(), 200);
+
+        let blocked = request().reply(&api).await;
+        assert_eq!(blocked.status(), 429);
+        let message = serde_json::from_slice::<Value>(blocked.body()).unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(message.contains("RPM"), "{message}");
+        assert!(!message.contains("TPM"), "{message}");
     }
 
     #[tokio::test]

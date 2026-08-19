@@ -60,7 +60,7 @@ const breaker = ref<BreakerPolicy>({
 const pricing = ref<ModelPrice[]>([])
 const logBodies = ref(true)
 const notify = ref<NotifySettings>({ webhook_url: '', retest_minutes: 30 })
-const limits = ref<GlobalLimits>({ rpm: 0, max_concurrency: 0 })
+const limits = ref<GlobalLimits>({ rpm: 0, tpm: 0, max_concurrency: 0 })
 const ipLimits = ref<IpLimits>({ rpm: 0 })
 /** 自动备份配置；directory 为 null 时后端用内置默认目录。 */
 const backupCfg = ref<BackupSettings>({ directory: null, interval_hours: 0, keep: 5 })
@@ -103,11 +103,15 @@ const backupDirty = computed(() => backupSnapshot !== JSON.stringify(backupCfg.v
 const emptyResponseRetryDirty = computed(
   () => emptyResponseRetrySnapshot !== JSON.stringify(emptyResponseRetry.value),
 )
+/** 与后端 GlobalLimits::validate 一致：RPM ≤ 1e6，TPM ≤ 1e9，并发 ≤ 1e5。 */
 const limitsValid = computed(
   () =>
     Number.isInteger(limits.value.rpm) &&
     limits.value.rpm >= 0 &&
     limits.value.rpm <= 1_000_000 &&
+    Number.isInteger(limits.value.tpm) &&
+    limits.value.tpm >= 0 &&
+    limits.value.tpm <= 1_000_000_000 &&
     Number.isInteger(limits.value.max_concurrency) &&
     limits.value.max_concurrency >= 0 &&
     limits.value.max_concurrency <= 100_000,
@@ -1533,6 +1537,23 @@ async function runImport(payload: unknown) {
           </label>
 
           <label class="flex flex-col gap-1.5">
+            <span class="text-sm font-medium text-ink-soft">全局 TPM</span>
+            <input
+              v-model.number="limits.tpm"
+              type="number"
+              min="0"
+              max="1000000000"
+              step="1000"
+              inputmode="numeric"
+              aria-label="全局每分钟 token 数上限"
+              class="glass-field tabular px-3 py-2 text-sm outline-none"
+            />
+            <span class="text-xs text-ink-faint">
+              每分钟 token 数上限。RPM 挡不住「少量请求 × 巨大上下文」
+            </span>
+          </label>
+
+          <label class="flex flex-col gap-1.5">
             <span class="text-sm font-medium text-ink-soft">并发上限</span>
             <input
               v-model.number="limits.max_concurrency"
@@ -1564,7 +1585,7 @@ async function runImport(payload: unknown) {
         </div>
 
         <p v-if="!limitsValid" class="text-xs text-danger" role="alert">
-          RPM ≤ 1,000,000；并发 ≤ 100,000。
+          RPM ≤ 1,000,000；TPM ≤ 1,000,000,000；并发 ≤ 100,000。
         </p>
         <p v-if="!ipLimitsValid" class="text-xs text-danger" role="alert">
           单 IP RPM ≤ 1,000,000。
@@ -1828,7 +1849,11 @@ async function runImport(payload: unknown) {
             !pricingValid ||
             !notifyValid ||
             !emptyResponseRetryValid ||
-            !affinityValid
+            !affinityValid ||
+            !limitsValid ||
+            !ipLimitsValid ||
+            !backupValid ||
+            !policyValid
           "
           @click="save"
         >

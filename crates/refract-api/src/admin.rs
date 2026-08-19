@@ -3085,6 +3085,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_limits_roundtrip_hot_updates_and_rejects_bad_values() {
+        let state = test_state().await;
+
+        // 默认全 0（不限）。
+        let initial = warp::test::request()
+            .method("GET")
+            .path("/api/settings/limits")
+            .reply(&crate::routes(state.clone()))
+            .await;
+        assert_eq!(initial.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(initial.body()).unwrap();
+        assert_eq!(body["data"]["rpm"], 0);
+        assert_eq!(body["data"]["tpm"], 0);
+        assert_eq!(body["data"]["max_concurrency"], 0);
+
+        // 更新后：持久化 + AppState 快照热更新（不用重启）。
+        let updated = warp::test::request()
+            .method("PUT")
+            .path("/api/settings/limits")
+            .json(&serde_json::json!({
+                "rpm": 600,
+                "tpm": 2_000_000,
+                "max_concurrency": 16,
+            }))
+            .reply(&crate::routes(state.clone()))
+            .await;
+        assert_eq!(updated.status(), 200);
+        assert_eq!(state.global_limits().rpm, 600);
+        assert_eq!(state.global_limits().tpm, 2_000_000);
+        assert_eq!(state.global_limits().max_concurrency, 16);
+
+        // 省略 tpm 的旧前端请求体仍可接受，缺省为 0（不限）。
+        let legacy = warp::test::request()
+            .method("PUT")
+            .path("/api/settings/limits")
+            .json(&serde_json::json!({ "rpm": 60, "max_concurrency": 8 }))
+            .reply(&crate::routes(state.clone()))
+            .await;
+        assert_eq!(legacy.status(), 200);
+        assert_eq!(state.global_limits().tpm, 0);
+
+        // 越界值被拒，且不影响已生效的限制。
+        for bad in [
+            serde_json::json!({ "rpm": 1_000_001 }),
+            serde_json::json!({ "tpm": 1_000_000_001u64 }),
+            serde_json::json!({ "max_concurrency": 100_001 }),
+        ] {
+            let rejected = warp::test::request()
+                .method("PUT")
+                .path("/api/settings/limits")
+                .json(&bad)
+                .reply(&crate::routes(state.clone()))
+                .await;
+            assert_eq!(rejected.status(), 400, "{bad}");
+        }
+        assert_eq!(state.global_limits().rpm, 60);
+        assert_eq!(state.global_limits().max_concurrency, 8);
+    }
+
+    #[tokio::test]
     async fn admin_token_can_be_set_and_cleared_but_never_read() {
         let state = test_state().await;
 
