@@ -92,7 +92,7 @@ regex = "1.12"
 base64 = "0.23"
 sha2 = "0.11"
 # HMAC-SHA256：告警 webhook 请求体签名（配合 sha2）。
-hmac = "0.12"
+hmac = "0.13"
 # 渠道凭据静态加密：AES-256-GCM，随机 nonce，带 AAD 防篡改。
 aes-gcm = "0.10"
 hex = "0.4"
