@@ -35,7 +35,7 @@
     "vite": "catalog:",
     "vite-plugin-compression2": "^2.5.3",
     "vite-plus": "catalog:",
-    "vue-tsc": "^3.3.9"
+    "vue-tsc": "^3.3.10"
   },
   "devEngines": {
     "packageManager": {
