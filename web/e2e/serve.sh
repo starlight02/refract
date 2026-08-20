@@ -25,7 +25,10 @@ RUNTIME_DIR="$(mktemp -d /tmp/refract-e2e.XXXXXX)"
 export REFRACT_LISTEN=127.0.0.1:4539
 export REFRACT_DATABASE="$RUNTIME_DIR/e2e.db"
 export REFRACT_REQUIRE_AUTH=false
-
+# 显式清除可能从宿主继承的管理令牌与加密密钥，保证全新库处于无令牌的开放初始态。
+unset REFRACT_ADMIN_TOKEN
+unset REFRACT_MASTER_KEY
+unset REFRACT_PROXY
 "$ROOT/target/debug/refract-server" &
 SERVER_PID=$!
 

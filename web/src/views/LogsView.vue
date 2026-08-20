@@ -13,6 +13,7 @@ import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { useLogsStore } from '@/stores/logs'
 import { useChannelsStore } from '@/stores/channels'
+import { numOr } from '@/utils/num'
 import { logs as logsApi } from '@/api/client'
 import {
   DialogContent,
@@ -195,7 +196,7 @@ async function prune() {
   pruning.value = true
   pruneNotice.value = null
   try {
-    const removed = await store.prune(pruneDays.value)
+    const removed = await store.prune(numOr(pruneDays.value, 30))
     pruneNotice.value = `已清理 ${removed} 条`
   } catch {
     pruneNotice.value = '清理失败'

@@ -545,14 +545,21 @@ test('管理令牌保护整个管理界面', async ({ page }) => {
   const dialog = page.getByRole('dialog')
   await expect(dialog).toContainText('需要管理令牌')
 
-  // 错误令牌不能放行。
+  // 错误令牌不能放行：填错令牌点击重载，等待新页面加载并再次弹出令牌弹窗。
   await dialog.getByPlaceholder('管理令牌').fill('wrong-token')
-  await dialog.getByRole('button', { name: '保存并重新加载' }).click()
-  await expect(page.getByRole('dialog')).toContainText('需要管理令牌', { timeout: 15_000 })
+  await Promise.all([
+    page.waitForEvent('load'),
+    dialog.getByRole('button', { name: '保存并重新加载' }).click(),
+  ])
+  const dialogAfterWrong = page.getByRole('dialog')
+  await expect(dialogAfterWrong).toContainText('需要管理令牌', { timeout: 15_000 })
 
-  // 正确令牌恢复界面。重载后停留在触发 401 的页面（设置页）。
-  await page.getByRole('dialog').getByPlaceholder('管理令牌').fill('e2e-admin-secret')
-  await page.getByRole('dialog').getByRole('button', { name: '保存并重新加载' }).click()
+  // 正确令牌恢复界面：填入正确令牌点击重载，等待页面加载完成并确认弹窗消失。
+  await dialogAfterWrong.getByPlaceholder('管理令牌').fill('e2e-admin-secret')
+  await Promise.all([
+    page.waitForEvent('load'),
+    dialogAfterWrong.getByRole('button', { name: '保存并重新加载' }).click(),
+  ])
   await expect(page.getByRole('heading', { name: '设置' })).toBeVisible()
   await expect(page.getByRole('dialog')).toBeHidden()
 

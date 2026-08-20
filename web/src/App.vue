@@ -57,8 +57,10 @@ const tokenDraft = ref('')
 const showToken = ref(false)
 
 function onAuthRequired() {
-  tokenDraft.value = ''
-  tokenDialogOpen.value = true
+  if (!tokenDialogOpen.value) {
+    tokenDraft.value = ''
+    tokenDialogOpen.value = true
+  }
 }
 
 function saveTokenAndReload() {

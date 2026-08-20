@@ -301,17 +301,6 @@ pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Re
                     let client_ip = remote_addr
                         .map(|a| a.ip())
                         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-
-                    // 先查防爆破封禁。
-                    if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
-                        let err = GatewayError::new(
-                            ErrorKind::PermissionDenied,
-                            format!("too many failed login attempts, locked for {wait_secs}s"),
-                        )
-                        .with_retry_after(std::time::Duration::from_secs(wait_secs));
-                        return Err(warp::reject::custom(ApiError(err)));
-                    }
-
                     let repo = SettingsRepo::new(state.db().clone());
                     let expected: Option<String> = repo
                         .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
@@ -328,14 +317,16 @@ pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Re
                     let token = match extract_token(auth, x_admin, None, None, None) {
                         Some(t) => t,
                         None => {
-                            // 缺失 token 也计一次失败，防针对无头请求的探测。
-                            state.admin_guard().record_failure(client_ip);
+                            // 未携带令牌属于未鉴权访问，返回 401 触发前端输入弹窗；
+                            // 不计入爆破失败计数，避免无令牌页面刷新时的并发请求熔断自身。
                             return Err(warp::reject::custom(ApiError(
                                 GatewayError::unauthenticated("missing admin token"),
                             )));
                         }
                     };
 
+                    // 携带了令牌时：如果校验成功，直接解封并放行；
+                    // 如果校验失败，才查封禁状态并累加失败计数。
                     if constant_time_eq(
                         refract_store::ApiKeyRepo::hash(&token).as_bytes(),
                         expected_hash.as_bytes(),
@@ -343,11 +334,20 @@ pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Re
                         state.admin_guard().record_success(client_ip);
                         Ok(())
                     } else {
-                        state.admin_guard().record_failure(client_ip);
-                        Err(warp::reject::custom(ApiError(GatewayError::new(
-                            ErrorKind::PermissionDenied,
-                            "invalid admin token",
-                        ))))
+                        let _locked = state.admin_guard().record_failure(client_ip);
+                        if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
+                            let err = GatewayError::new(
+                                ErrorKind::PermissionDenied,
+                                format!("too many failed login attempts, locked for {wait_secs}s"),
+                            )
+                            .with_retry_after(std::time::Duration::from_secs(wait_secs));
+                            Err(warp::reject::custom(ApiError(err)))
+                        } else {
+                            Err(warp::reject::custom(ApiError(GatewayError::new(
+                                ErrorKind::PermissionDenied,
+                                "invalid admin token",
+                            ))))
+                        }
                     }
                 }
             },

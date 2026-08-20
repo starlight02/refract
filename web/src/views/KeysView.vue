@@ -19,6 +19,7 @@ import {
 } from 'reka-ui'
 import { useKeysStore } from '@/stores/keys'
 import { logs as logsApi } from '@/api/client'
+import { numOr } from '@/utils/num'
 import type { ApiKey, KeyUsageStat, NewApiKey } from '@/api/types'
 
 const store = useKeysStore()
@@ -139,10 +140,11 @@ async function submit() {
     name: draft.value.name.trim(),
     allowed_models: splitList(draft.value.models),
     allowed_tags: splitList(draft.value.tags),
-    quota: draft.value.quota > 0 ? draft.value.quota : 0,
-    budget: draft.value.budget > 0 ? draft.value.budget : 0,
-    rpm_limit: draft.value.rpm > 0 ? draft.value.rpm : 0,
-    tpm_limit: draft.value.tpm > 0 ? draft.value.tpm : 0,
+    // 数字输入清空归一成 0（= 不限额）；负数钳回 0，保持原 `> 0 ? : 0` 语义。
+    quota: Math.max(0, numOr(draft.value.quota, 0)),
+    budget: Math.max(0, numOr(draft.value.budget, 0)),
+    rpm_limit: Math.max(0, numOr(draft.value.rpm, 0)),
+    tpm_limit: Math.max(0, numOr(draft.value.tpm, 0)),
     note: draft.value.note.trim() || null,
     // datetime-local 给的是无时区字符串，补上秒并交给后端按 UTC 解析。
     expires_at: draft.value.expiresAt ? new Date(draft.value.expiresAt).toISOString() : null,

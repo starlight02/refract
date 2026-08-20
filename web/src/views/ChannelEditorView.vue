@@ -29,6 +29,7 @@ import {
 } from '@/components/protocol'
 import { useChannelsStore } from '@/stores/channels'
 import { channels as channelsApi } from '@/api/client'
+import { numOrNull, numOr } from '@/utils/num'
 import type {
   Channel,
   ChannelEndpoint,
@@ -562,6 +563,16 @@ async function save() {
   const parsedHeaders = parseHeaders(headersText.value)
   const payload: Channel = {
     ...form.value,
+    // 数字输入清空时 v-model.number 留下空串，serde 拒收；归一回默认值。
+    priority: numOr(form.value.priority, 0),
+    weight: numOr(form.value.weight, 1),
+    timeout_secs: numOr(form.value.timeout_secs, 0),
+    endpoints: form.value.endpoints.map((ep) => ({ ...ep, order: numOr(ep.order, 0) })),
+    // 可空数字清空即「继承全局」，与价表 cached_input 的空语义一致。
+    empty_response_retry: {
+      window_secs: numOrNull(form.value.empty_response_retry.window_secs),
+      max_retries: numOrNull(form.value.empty_response_retry.max_retries),
+    },
     tags: tagsText.value
       .split(',')
       .map((t) => t.trim())
@@ -578,7 +589,6 @@ async function save() {
     proxy: form.value.proxy?.trim() || null,
     note: form.value.note?.trim() || null,
     test_model: form.value.test_model?.trim() || null,
-    empty_response_retry: { ...form.value.empty_response_retry },
   }
 
   try {
