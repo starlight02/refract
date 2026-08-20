@@ -230,8 +230,8 @@ importers:
   .:
     devDependencies:
       concurrently:
-        specifier: ^10.0.4
-        version: 10.0.4
+        specifier: ^10.0.5
+        version: 10.0.5
       lefthook:
         specifier: ^2.1.9
         version: 2.1.10
@@ -246,7 +246,7 @@ importers:
     dependencies:
       '@lucide/vue':
         specifier: ^1.31.0
-        version: 1.32.0(vue@3.6.0-rc.4(typescript@6.0.3))
+        version: 1.31.0(vue@3.6.0-rc.4(typescript@6.0.3))
       '@refract/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
@@ -325,7 +325,7 @@ importers:
         version: link:../../packages/contracts
       '@tanstack/react-router':
         specifier: ^1.168.0
-        version: 1.170.30(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+        version: 1.170.29(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       class-variance-authority:
         specifier: ^0.7.1
         version: 0.7.1
@@ -334,7 +334,7 @@ importers:
         version: 2.1.1
       lucide-react:
         specifier: ^1.16.0
-        version: 1.32.0(react@19.2.8)
+        version: 1.31.0(react@19.2.8)
       react:
         specifier: ^19.2.0
         version: 19.2.8
@@ -356,7 +356,7 @@ importers:
         version: 4.3.3(@voidzero-dev/vite-plus-core@0.2.9(@types/node@26.2.0)(jiti@2.7.0)(typescript@6.0.3)(yaml@2.9.0))
       '@tanstack/router-plugin':
         specifier: ^1.168.0
-        version: 1.168.33(@tanstack/react-router@1.170.30(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@voidzero-dev/vite-plus-core@0.2.9(@types/node@26.2.0)(jiti@2.7.0)(typescript@6.0.3)(yaml@2.9.0))(supports-color@10.2.2)
+        version: 1.168.32(@tanstack/react-router@1.170.29(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@voidzero-dev/vite-plus-core@0.2.9(@types/node@26.2.0)(jiti@2.7.0)(typescript@6.0.3)(yaml@2.9.0))(supports-color@10.2.2)
       '@types/node':
         specifier: ^26.2.0
         version: 26.2.0
@@ -594,8 +594,8 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@lucide/vue@1.32.0':
-    resolution: {integrity: sha512-1JU7YEsgE2QhugazyzHZDkqAAZz+Iiwr4bmGxVNDIFEXryPoACCnB7nognKklSitCTbp1mfC1xetruPczxM6uw==}
+  '@lucide/vue@1.31.0':
+    resolution: {integrity: sha512-NtjEHhcAa7umPh40wrRmlESJqNGdnpc7LziBKFnW3fmlrW0g2xMCDpdWU7WeEHRSl3xOpxbqiFTLKxoK3CoVCg==}
     peerDependencies:
       vue: ~3.6.0-rc.3
 
@@ -1029,8 +1029,8 @@ packages:
     resolution: {integrity: sha512-DR9t6lfLVdrjgCwpglrR9DR7Ok8/HlXjcOE+goWXF3zyuLUO/ug7vMbSFxTqrQTtbRghJfyhmIZ0S6LhPIy44w==}
     engines: {node: '>=20.19'}
 
-  '@tanstack/react-router@1.170.30':
-    resolution: {integrity: sha512-FB3FD6cPPKQFMyYaEsm3Isb8TkIvNAuSeADCS25OzMgKyFXZK/B/Y3m9fpBoKS55pjbvtRPpW87NMY8GVwNPlg==}
+  '@tanstack/react-router@1.170.29':
+    resolution: {integrity: sha512-xQwakR0ReaUGu3xeXEl2CqzlIXk4i9vxaf/zqdzoELMY0mDZgMOr+xobiA5cQdn8cnovqZgqqUxcwXhsruC+NA==}
     engines: {node: '>=20.19'}
     peerDependencies:
       react: '>=18.0.0 || >=19.0.0'
@@ -1042,20 +1042,20 @@ packages:
       react: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
       react-dom: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
 
-  '@tanstack/router-core@1.171.25':
-    resolution: {integrity: sha512-w74Al2ar8UKx3Xp4ICTxIZD2Vmd6N9Yn4xH8ILq40gI5UqlxzjPPYoR5l2+5cmv9XCWZehxw7saIofmZpf1G4w==}
+  '@tanstack/router-core@1.171.24':
+    resolution: {integrity: sha512-+j+8NmV4QOS+ILNLdXFlLTdKPPbBQIy6mXDZ0QWEKYZ0xQOdlnOCXVHPflyGanD2SWSxjqGkw8CsW0CXXP7fLg==}
     engines: {node: '>=20.19'}
 
-  '@tanstack/router-generator@1.167.31':
-    resolution: {integrity: sha512-xgk+8BCKzAoIONVJPeyyzLRKhb9W0PNWJepPIjx5gRU36+FDZUMNeZ/gjyOBZ4EzQgrUOCPs4/Vkr8JcnuRLLA==}
+  '@tanstack/router-generator@1.167.30':
+    resolution: {integrity: sha512-Tf9TJfdpP0yL3k1D1ke6hR1dvPCgKShTik3HcBRDeTK5eNrp9/X0Q0YApN8thE6pVcXL6a78O3ZE7XN7s7KwNw==}
     engines: {node: '>=20.19'}
 
-  '@tanstack/router-plugin@1.168.33':
-    resolution: {integrity: sha512-Zdz2Cis8hf/U7Ft9pv7QjwLJgKO2lYej10Sr5cpBWX1Y1fO9sXqdQGy0OW6XLiDt5RgcdfEST81k4I3cRCD4Ag==}
+  '@tanstack/router-plugin@1.168.32':
+    resolution: {integrity: sha512-P+qYIY9b/K+ZGUPNiyLqsd20vN/1abgmSNG0Ch9KTKldag3icR7TlrJgnM2km86yuRdXa4nJ5YT7+JLV5rJRZg==}
     engines: {node: '>=20.19'}
     peerDependencies:
       '@rsbuild/core': '>=1.0.2 || ^2.0.0'
-      '@tanstack/react-router': ^1.170.30
+      '@tanstack/react-router': ^1.170.29
       vite: '>=5.0.0 || >=6.0.0 || >=7.0.0 || >=8.0.0'
       vite-plugin-solid: ^2.11.10 || ^3.0.0-0
       webpack: '>=5.92.0'
@@ -1550,8 +1550,8 @@ packages:
     resolution: {integrity: sha512-quJQXlTSUGL2LH9SUXo8VwsY4soanhgo6LNSm84E1LBcE8s3O0wpdiRzyR9z/ZZJMlMWv37qOOb9pdJlMUEKFQ==}
     engines: {node: '>=8'}
 
-  ansi-regex@6.2.2:
-    resolution: {integrity: sha512-Bq3SmSpyFHaWjPk8If9yc6svM8c56dB5BAtW4Qbw5jHTwwXXcTLoRMkpDJp6VL0XzlWaCHTXrkFURMYmD0sLqg==}
+  ansi-regex@6.3.0:
+    resolution: {integrity: sha512-WpDfL7NO6j7tH88IDBNVdUJxDh9nmCteAVW9dsep846XdwF4naCBK+/tGLX3KJgcpgMRXCFlTM2hKGoK9FsdrQ==}
     engines: {node: '>=12'}
 
   ansi-styles@5.2.0:
@@ -1635,8 +1635,8 @@ packages:
     resolution: {integrity: sha512-eYm0QWBtUrBWZWG0d386OGAw16Z995PiOVo2B7bjWSbHedGl5e0ZWaq65kOGgUSNesEIDkB9ISbTg/JK9dhCZA==}
     engines: {node: '>=6'}
 
-  concurrently@10.0.4:
-    resolution: {integrity: sha512-trZql+7l/0+WRAsAnEdctr4+iiOS6ZrViI6H8QWcCF9MFS/LT0dKpe8vluB1to6it+OxSI4VospFTIFMW8DJRw==}
+  concurrently@10.0.5:
+    resolution: {integrity: sha512-JaP/CoftUrCcAFW/g//RbgEGwlelnEae6cfBLgH6ZdO6s8jPkn6p9SB9u6pdVxYXoiSnFqseOlHfrEfF82TVOg==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -1689,8 +1689,8 @@ packages:
   dom-accessibility-api@0.5.16:
     resolution: {integrity: sha512-X7BJ2yElsnOJ30pZF4uIIDfBEVgF4XEBxL9Bxhy6dnrm5hkzqmsWHGTiHqRiITNhMyFLyAiWndIJP7Z1NTteDg==}
 
-  electron-to-chromium@1.5.411:
-    resolution: {integrity: sha512-gglkxzokjHfawpGxq75XdBV2/l3BAPzrsMs70qgaZdTW5rpV1tC4MdgJVP9fN126bODA4ZJQkn1wryEzJyQXIg==}
+  electron-to-chromium@1.5.408:
+    resolution: {integrity: sha512-SLoprcYpJ/OH2v2ps0+N5biv9H4/KBT3+YmmDew64TwK5y9j2wv7pMOFY7IorVkyMtEyLSCRlXKLsNlakeAlPw==}
 
   emoji-regex@10.6.0:
     resolution: {integrity: sha512-toUI84YS5YmxW219erniWD0CIVOo46xGKColeNQRgOzDorgBi1v4D71/OFzgD9GO2UGKIv1C3Sp8DAn0+j5w7A==}
@@ -2113,8 +2113,8 @@ packages:
   lru-cache@5.1.1:
     resolution: {integrity: sha512-KpNARQA3Iwv+jTA0utUVVbrh+Jlrr1Fv0e56GGzAFOXN7dk/FviaDW8LHmK52DlcH4WP2n6gI8vN1aesBFgo9w==}
 
-  lucide-react@1.32.0:
-    resolution: {integrity: sha512-txX56hMFnRxPi1f9/nH69YN8uvAO6a7Y1KSWKjCDAtdD9+soEgmWuCt6iRm1pkxUZo2+YntSdsE1L6bIuKoY8Q==}
+  lucide-react@1.31.0:
+    resolution: {integrity: sha512-G8u2eEtoHUnUa9f8lbvqDhCiORMnYLdUEo06EEG9MQvHQrInKcX3Pa2TH39MM5qyzRcWETxB0+aOwAPI1g1kEg==}
     peerDependencies:
       react: ^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0
 
@@ -2902,7 +2902,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@lucide/vue@1.32.0(vue@3.6.0-rc.4(typescript@6.0.3))':
+  '@lucide/vue@1.31.0(vue@3.6.0-rc.4(typescript@6.0.3))':
     dependencies:
       vue: 3.6.0-rc.4(typescript@6.0.3)
 
@@ -3149,11 +3149,11 @@ snapshots:
 
   '@tanstack/history@1.162.1': {}
 
-  '@tanstack/react-router@1.170.30(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
+  '@tanstack/react-router@1.170.29(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
     dependencies:
       '@tanstack/history': 1.162.1
       '@tanstack/react-store': 0.9.3(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
-      '@tanstack/router-core': 1.171.25
+      '@tanstack/router-core': 1.171.24
       isbot: 5.2.1
       react: 19.2.8
       react-dom: 19.2.8(react@19.2.8)
@@ -3165,17 +3165,17 @@ snapshots:
       react-dom: 19.2.8(react@19.2.8)
       use-sync-external-store: 1.6.0(react@19.2.8)
 
-  '@tanstack/router-core@1.171.25':
+  '@tanstack/router-core@1.171.24':
     dependencies:
       '@tanstack/history': 1.162.1
       cookie-es: 3.1.1
       seroval: 1.6.2
       seroval-plugins: 1.6.2(seroval@1.6.2)
 
-  '@tanstack/router-generator@1.167.31(supports-color@10.2.2)':
+  '@tanstack/router-generator@1.167.30(supports-color@10.2.2)':
     dependencies:
       '@babel/types': 7.29.8
-      '@tanstack/router-core': 1.171.25
+      '@tanstack/router-core': 1.171.24
       '@tanstack/router-utils': 1.162.2(supports-color@10.2.2)
       '@tanstack/virtual-file-routes': 1.162.0
       jiti: 2.7.0
@@ -3185,19 +3185,19 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@tanstack/router-plugin@1.168.33(@tanstack/react-router@1.170.30(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@voidzero-dev/vite-plus-core@0.2.9(@types/node@26.2.0)(jiti@2.7.0)(typescript@6.0.3)(yaml@2.9.0))(supports-color@10.2.2)':
+  '@tanstack/router-plugin@1.168.32(@tanstack/react-router@1.170.29(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@voidzero-dev/vite-plus-core@0.2.9(@types/node@26.2.0)(jiti@2.7.0)(typescript@6.0.3)(yaml@2.9.0))(supports-color@10.2.2)':
     dependencies:
       '@babel/core': 7.29.7(supports-color@10.2.2)
       '@babel/template': 7.29.7
       '@babel/types': 7.29.8
-      '@tanstack/router-core': 1.171.25
-      '@tanstack/router-generator': 1.167.31(supports-color@10.2.2)
+      '@tanstack/router-core': 1.171.24
+      '@tanstack/router-generator': 1.167.30(supports-color@10.2.2)
       '@tanstack/router-utils': 1.162.2(supports-color@10.2.2)
       chokidar: 5.0.0
       unplugin: 3.3.0(@voidzero-dev/vite-plus-core@0.2.9(@types/node@26.2.0)(jiti@2.7.0)(typescript@6.0.3)(yaml@2.9.0))
       zod: 4.4.3
     optionalDependencies:
-      '@tanstack/react-router': 1.170.30(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+      '@tanstack/react-router': 1.170.29(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       vite: '@voidzero-dev/vite-plus-core@0.2.9(@types/node@26.2.0)(jiti@2.7.0)(typescript@6.0.3)(yaml@2.9.0)'
     transitivePeerDependencies:
       - '@farmfe/core'
@@ -3656,7 +3656,7 @@ snapshots:
 
   ansi-regex@5.0.1: {}
 
-  ansi-regex@6.2.2: {}
+  ansi-regex@6.3.0: {}
 
   ansi-styles@5.2.0: {}
 
@@ -3708,7 +3708,7 @@ snapshots:
     dependencies:
       baseline-browser-mapping: 2.11.15
       caniuse-lite: 1.0.30001809
-      electron-to-chromium: 1.5.411
+      electron-to-chromium: 1.5.408
       node-releases: 2.0.53
       update-browserslist-db: 1.3.1(browserslist@4.28.8)
 
@@ -3734,7 +3734,7 @@ snapshots:
 
   clsx@2.1.1: {}
 
-  concurrently@10.0.4:
+  concurrently@10.0.5:
     dependencies:
       chalk: 5.6.2
       rxjs: 7.8.2
@@ -3777,7 +3777,7 @@ snapshots:
 
   dom-accessibility-api@0.5.16: {}
 
-  electron-to-chromium@1.5.411: {}
+  electron-to-chromium@1.5.408: {}
 
   emoji-regex@10.6.0: {}
 
@@ -4115,7 +4115,7 @@ snapshots:
     dependencies:
       yallist: 3.1.1
 
-  lucide-react@1.32.0(react@19.2.8):
+  lucide-react@1.31.0(react@19.2.8):
     dependencies:
       react: 19.2.8
 
@@ -4374,7 +4374,7 @@ snapshots:
 
   strip-ansi@7.2.0:
     dependencies:
-      ansi-regex: 6.2.2
+      ansi-regex: 6.3.0
 
   supports-color@10.2.2: {}
 
