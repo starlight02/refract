@@ -4,6 +4,8 @@
 
 English · [简体中文](./README.zh-Hans.md)
 
+![Refract protocol-first LLM gateway](./apps/homepage/public/og.jpg)
+
 ## Why not new-api
 
 new-api models channel types as a flat enum: OpenAI, Anthropic, Gemini, every cloud vendor, every relay site… each new upstream adds one enum value and one adapter. Channel type equals vendor, so a single relay that speaks two protocols needs two channels, and protocol translation logic is scattered across if/else branches in the relay layer.
@@ -45,10 +47,14 @@ Aggregate channels can express things new-api cannot: *"My relay offers both Ope
 Building requires Rust (2024-edition toolchain) and Node.js (pnpm):
 
 ```sh
-# 1. Build the frontend (output in web/dist, embedded into the binary)
-cd web && vp install && vp build && cd ..
+# 1. Install the shared pnpm workspace and build the embedded admin UI
+pnpm install
+pnpm --filter @refract/admin build
 
-# 2. Build and run the gateway
+# 2. Build the standalone public homepage when deploying it separately
+pnpm --filter @refract/homepage build
+
+# 3. Build and run the gateway
 cargo run --release -p refract-server
 ```
 
@@ -135,18 +141,20 @@ pnpm dev
 ```
 
 - Backend on `127.0.0.1:3939` — recompiles and restarts on Rust/SQL changes.
-- Frontend on `localhost:5173` — Vite HMR, with `/api`, `/v1`, `/v1beta`, `/health` and `/metrics` proxied to the backend. Open this one in the browser.
+- Admin on `localhost:5173` — Vite HMR, with `/api`, `/v1`, `/v1beta`, `/health` and `/metrics` proxied to the backend. Open this one in the browser.
+- Homepage on `localhost:3940` — start it separately with `pnpm dev:homepage`; it builds to `apps/homepage/dist` and is not embedded into the gateway.
 
-Commit gating is handled by [lefthook](https://lefthook.dev) (installed into `.git/hooks` automatically by `pnpm install`): every `git commit` runs a privacy scan (real emails / API keys / machine paths, see `scripts/privacy-check.sh`), auto-formatting for both ends (fixes are re-staged into the commit), and the quality gates (`vp check` + `clippy -D warnings`). For intentional demo values, mark the line with a `privacy-allow` comment.
+Commit gating is handled by [lefthook](https://lefthook.dev) (installed into `.git/hooks` automatically by `pnpm install`): every `git commit` runs a privacy scan (real emails / API keys / machine paths, see `scripts/privacy-check.sh`), Vite Plus formatting and checks for both apps and the shared contracts package, and the Rust quality gate (`clippy -D warnings`). For intentional demo values, mark the line with a `privacy-allow` comment.
 
 Full regression (hooks skip tests; run manually before releasing):
 
 ```sh
 cargo test --workspace --all-targets --all-features --locked
-cd web
-vp test                       # frontend unit tests
-vp build
-vp run test:e2e               # full flows against the real server binary
+pnpm --filter @refract/admin test:unit
+pnpm --filter @refract/admin build
+pnpm --filter @refract/admin test:e2e  # full flows against the real server binary
+pnpm --filter @refract/homepage check
+pnpm --filter @refract/homepage build
 ```
 
 Architecture details in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md); implementation rationale in [`docs/research/FOUNDATIONS.md`](./docs/research/FOUNDATIONS.md).

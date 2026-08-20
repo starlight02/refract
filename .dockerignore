@@ -3,10 +3,11 @@
 .pnpm-store
 target
 node_modules
-web/node_modules
-web/dist
-web/test-results
-web/playwright-report
+apps/*/node_modules
+apps/*/dist
+apps/admin/test-results
+apps/admin/playwright-report
+packages/*/node_modules
 *.db
 *.db-shm
 *.db-wal

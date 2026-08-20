@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 同步前端与根目录 package.json 版本号（供 cargo-release 钩子与自动化流程调用）
+# 同步 workspace 内所有可发布 package.json 版本号（供 cargo-release 钩子与自动化流程调用）
 #
 # 用法：
 #   ./scripts/sync-version.sh 0.2.0
@@ -16,14 +16,15 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-for file in package.json web/package.json; do
+for file in \
+  package.json \
+  apps/admin/package.json \
+  apps/homepage/package.json \
+  packages/contracts/package.json; do
   if [ -f "$file" ]; then
     dir="$(dirname "$file")"
     (cd "$dir" && pnpm pkg set version="$VERSION")
   fi
 done
-
-# 重新格式化受影响的前端文件
-(cd web && pnpm exec vp check --fix >/dev/null 2>&1 || true)
 
 echo "==> 已同步 package.json 版本为 ${VERSION}"

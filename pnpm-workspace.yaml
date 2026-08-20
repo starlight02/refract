@@ -1,5 +1,50 @@
-# 根工程只有开发工具依赖（concurrently、lefthook），不是多包 workspace；
-# 这个文件存在的意义是承载 pnpm 11+ 的设置项（package.json 的 "pnpm" 字段已废弃）。
-# lefthook 的 postinstall 负责解压平台二进制，必须放行。
+packages:
+  - apps/*
+  - packages/*
+
 allowBuilds:
   lefthook: true
+  vue-demi: true
+
+managePackageManagerVersions: false
+updateNotifier: false
+
+catalog:
+  vite: npm:@voidzero-dev/vite-plus-core@~0.2.9
+  vite-plus: ~0.2.9
+
+overrides:
+  '@vue/compat': ~3.6.0-rc.3
+  '@vue/compiler-core': ~3.6.0-rc.3
+  '@vue/compiler-dom': ~3.6.0-rc.3
+  '@vue/compiler-sfc': ~3.6.0-rc.3
+  '@vue/compiler-ssr': ~3.6.0-rc.3
+  '@vue/reactivity': ~3.6.0-rc.3
+  '@vue/runtime-core': ~3.6.0-rc.3
+  '@vue/runtime-dom': ~3.6.0-rc.3
+  '@vue/runtime-vapor': ~3.6.0-rc.3
+  '@vue/server-renderer': ~3.6.0-rc.3
+  '@vue/shared': ~3.6.0-rc.3
+  vite: 'catalog:'
+  vitest: 4.1.10
+  vue: ~3.6.0-rc.3
+
+peerDependencyRules:
+  allowAny:
+    - vite
+  allowedVersions:
+    vite: '*'
+
+minimumReleaseAgeExclude:
+  - '@vue/compiler-core@3.6.0-rc.3'
+  - '@vue/compiler-dom@3.6.0-rc.3'
+  - '@vue/compiler-sfc@3.6.0-rc.3'
+  - '@vue/compiler-ssr@3.6.0-rc.3'
+  - '@vue/compiler-vapor@3.6.0-rc.3'
+  - '@vue/reactivity@3.6.0-rc.3'
+  - '@vue/runtime-core@3.6.0-rc.3'
+  - '@vue/runtime-dom@3.6.0-rc.3'
+  - '@vue/runtime-vapor@3.6.0-rc.3'
+  - '@vue/server-renderer@3.6.0-rc.3'
+  - '@vue/shared@3.6.0-rc.3'
+  - vue@3.6.0-rc.3

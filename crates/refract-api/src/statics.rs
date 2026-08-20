@@ -14,10 +14,10 @@ use warp::{Filter, Reply, filters::BoxedFilter};
 
 /// 编译期内嵌的前端产物。
 ///
-/// `web/dist` 由 `build.rs` 保证存在 —— rust-embed 对不存在的目录会直接
+/// `apps/admin/dist` 由 `build.rs` 保证存在 —— rust-embed 对不存在的目录会直接
 /// 编译失败，而后端必须能在前端还没构建时独立编译（CI 里就是分开跑的）。
 #[derive(rust_embed::Embed)]
-#[folder = "../../web/dist"]
+#[folder = "../../apps/admin/dist"]
 struct Assets;
 
 /// 不应被 SPA fallback 接管的路径前缀。
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn unhashed_files_get_a_short_cache() {
-        let policy = cache_policy("favicon.ico");
+        let policy = cache_policy("favicon.svg");
         assert!(policy.contains("max-age=3600"));
         assert!(!policy.contains("immutable"));
     }

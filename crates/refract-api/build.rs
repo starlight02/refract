@@ -8,12 +8,12 @@ use std::path::Path;
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    let dist = Path::new(&manifest).join("../../web/dist");
+    let dist = Path::new(&manifest).join("../../apps/admin/dist");
 
     if !dist.exists() {
-        std::fs::create_dir_all(&dist).expect("failed to create web/dist placeholder");
+        std::fs::create_dir_all(&dist).expect("failed to create apps/admin/dist placeholder");
     }
 
     // 前端产物变化时要重新编译，否则改了界面却还嵌着旧文件。
-    println!("cargo:rerun-if-changed=../../web/dist");
+    println!("cargo:rerun-if-changed=../../apps/admin/dist");
 }

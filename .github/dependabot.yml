@@ -14,9 +14,9 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
-  # 前端依赖：聚合为单个 PR，忽略破坏性 major（如 typescript 7 等），只接收平滑的 minor 与 patch。
+  # pnpm workspace 只有根锁文件：从仓库根统一更新 apps/* 与 packages/* 依赖。
   - package-ecosystem: npm
-    directory: /web
+    directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 50

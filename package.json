@@ -4,17 +4,33 @@
   "private": true,
   "license": "AGPL-3.0-only",
   "scripts": {
-    "dev": "concurrently --kill-others --names server,web --prefix-colors yellow,cyan \"pnpm run dev:server\" \"pnpm run dev:web\"",
+    "dev": "concurrently --kill-others --names server,admin --prefix-colors yellow,cyan \"pnpm run dev:server\" \"pnpm --filter @refract/admin dev\"",
     "dev:server": "cargo watch --watch crates --watch Cargo.toml --exec 'run -p refract-server'",
-    "dev:web": "pnpm --dir web dev",
+    "dev:admin": "pnpm --filter @refract/admin dev",
+    "dev:homepage": "pnpm --filter @refract/homepage dev",
+    "check:frontend": "vp run -r check",
+    "test:frontend": "vp run -r test:unit",
+    "build:frontend": "vp run -r build",
+    "build:admin": "pnpm --filter @refract/admin build",
+    "build:homepage": "pnpm --filter @refract/homepage build",
     "version:bump": "bash scripts/bump-version.sh",
     "prepare": "git rev-parse --is-inside-work-tree >/dev/null 2>&1 && lefthook install || true"
   },
   "devDependencies": {
     "concurrently": "^10.0.4",
-    "lefthook": "^2.1.9"
+    "lefthook": "^2.1.9",
+    "pnpm": "11.22.0",
+    "vite-plus": "catalog:"
   },
   "engines": {
     "node": "^22.18.0 || >=24.12.0"
+  },
+  "packageManager": "pnpm@11.22.0",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.22.0",
+      "onFail": "download"
+    }
   }
 }

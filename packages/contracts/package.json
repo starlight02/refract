@@ -1,0 +1,20 @@
+{
+  "name": "@refract/contracts",
+  "version": "0.2.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./admin-api": "./src/admin-api.ts",
+    "./protocol": "./src/protocol.ts"
+  },
+  "scripts": {
+    "check": "vp check && tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.3",
+    "vite-plus": "catalog:"
+  }
+}

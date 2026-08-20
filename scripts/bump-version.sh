@@ -70,18 +70,18 @@ toml = toml.replace(/^version = \".*?\"/m, 'version = \"${NEW_VERSION}\"');
 fs.writeFileSync('Cargo.toml', toml);
 "
 
-# 3. 同步 package.json 与 web/package.json
+# 3. 同步 workspace 内所有 package.json
 ./scripts/sync-version.sh "$NEW_VERSION"
-# 4. 刷新 Cargo.lock 与前端格式
-echo "==> 刷新 Cargo.lock 与前端产物..."
+# 4. 刷新 Cargo.lock
+echo "==> 刷新 Cargo.lock..."
 cargo check --workspace --quiet
-(cd web && pnpm exec vp check --fix >/dev/null 2>&1 || true)
 
 echo "==> 已成功将版本更新为 v${NEW_VERSION}"
 
 if [ "$CREATE_TAG" = true ]; then
   echo "==> 创建签名提交与签名 Tag..."
-  git add Cargo.toml Cargo.lock package.json web/package.json
+  git add Cargo.toml Cargo.lock package.json \
+    apps/admin/package.json apps/homepage/package.json packages/contracts/package.json
   git commit -m "chore: release v${NEW_VERSION}"
   git tag -s "v${NEW_VERSION}" -m "chore: release v${NEW_VERSION}"
   echo "==> 已创建签名 Tag: v${NEW_VERSION}"

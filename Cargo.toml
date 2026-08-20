@@ -20,7 +20,7 @@ authors = ["星光の殲滅者 <starshine@aili.moe>"]
 
 
 [workspace.metadata.release]
-# 发版配置：统一管理 workspace 7 个 crate 与 web 前端的版本步调（Lockstep Versioning）。
+# 发版配置：统一管理 7 个 crate、两个前端与 contracts 的版本步调（Lockstep Versioning）。
 pre-release-commit-message = "chore: release v{{version}}"
 tag-message = "chore: release v{{version}}"
 tag-prefix = "v"

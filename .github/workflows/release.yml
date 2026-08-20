@@ -1,11 +1,12 @@
 # 发布流水线：推 v* 标签触发。
 #
-# 产物两类：
-# 1. 多平台单二进制（前端已嵌入）—— 下载即用，个人部署的主路径；
-# 2. ghcr 容器镜像（amd64 + arm64）—— compose/k8s 用户的路径。
+# 产物三类：
+# 1. 多平台单二进制（后台已嵌入）—— 下载即用，个人部署的主路径；
+# 2. Homepage 静态包 —— 独立部署到 CDN / 静态站点；
+# 3. ghcr 容器镜像（amd64 + arm64）—— compose/k8s 用户的路径。
 #
-# 前端只构建一次并在各平台间共享：五个平台各跑一遍 pnpm build 纯属浪费，
-# 且会让「同一版本不同平台的前端产物不一致」成为可能。
+# 两个前端在同一个 pnpm workspace 中构建；后台产物只构建一次并在各平台间
+# 共享，确保同一版本的二进制嵌入完全相同的管理界面。
 name: Release
 
 on:
@@ -16,32 +17,55 @@ permissions:
   contents: read
 
 jobs:
-  web:
-    name: Build embedded frontend
+  frontend:
+    name: Build frontend artifacts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
         with:
-          version: 11.21.0
+          version: 11.22.0
       - uses: actions/setup-node@v7
         with:
           node-version: 24.12.0
           cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
-      - working-directory: web
-        run: pnpm install --frozen-lockfile
-      - working-directory: web
-        run: pnpm run build
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Check contracts
+        run: pnpm --filter @refract/contracts check
+      - name: Build embedded admin
+        run: pnpm --filter @refract/admin build
+      - name: Test admin
+        run: pnpm --filter @refract/admin test:unit
+      - name: Build standalone homepage
+        run: pnpm --filter @refract/homepage build
       - uses: actions/upload-artifact@v7
         with:
-          name: web-dist
-          path: web/dist
+          name: admin-dist
+          path: apps/admin/dist
           retention-days: 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: homepage-dist
+          path: apps/homepage/dist
+          retention-days: 1
+
+  rust-quality:
+    name: Rust release quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-targets --all-features --locked
 
   binaries:
     name: ${{ matrix.target }}
-    needs: [web]
+    needs: [frontend, rust-quality]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -74,8 +98,8 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends musl-tools
       - uses: actions/download-artifact@v8
         with:
-          name: web-dist
-          path: web/dist
+          name: admin-dist
+          path: apps/admin/dist
       - name: Build
         run: cargo build --release --locked -p refract-server --target ${{ matrix.target }}
       - name: Package (unix)
@@ -90,16 +114,21 @@ jobs:
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path refract-server.exe -DestinationPath "refract-${{ github.ref_name }}-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v7
+        if: runner.os != 'Windows'
         with:
           name: binary-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/refract-*.tar.gz
-            target/${{ matrix.target }}/release/refract-*.zip
+          path: target/${{ matrix.target }}/release/refract-*.tar.gz
+          retention-days: 1
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/refract-*.zip
           retention-days: 1
 
   release:
     name: Publish GitHub Release
-    needs: [binaries]
+    needs: [binaries, frontend, rust-quality]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -109,13 +138,19 @@ jobs:
           pattern: binary-*
           merge-multiple: true
           path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: homepage-dist
+          path: homepage-dist
+      - name: Package homepage
+        run: tar czf "dist/refract-${{ github.ref_name }}-homepage.tar.gz" -C homepage-dist .
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
 
   # 双平台镜像 = 两台原生 runner 各自组装 + 合并多架构清单，
-  # 全程无 QEMU：binaries 已在原生架构下编好 musl 二进制（前端已内嵌），
+  # 全程无 QEMU：binaries 已在原生架构下编好 musl 二进制（后台已内嵌），
   # 镜像只做 alpine 底座 + COPY。单 job 双平台方案会让 arm64 stage
   # 在 amd64 runner 上走 QEMU 模拟，既慢又会 OOM。
   image:
@@ -143,8 +178,8 @@ jobs:
           path: dist
       - uses: actions/download-artifact@v8
         with:
-          name: web-dist
-          path: web-dist/web/dist
+          name: admin-dist
+          path: admin-dist/admin/dist
       - run: |
           mkdir -p bin/${{ matrix.arch }}
           tar xzf dist/refract-*.tar.gz -C bin/${{ matrix.arch }}
@@ -158,6 +193,7 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}},suffix=-${{ matrix.arch }}
             type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.arch }}
@@ -171,13 +207,13 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            web_src=web-dist
+            admin_src=admin-dist
             bin_src=bin
             NPM_REGISTRY=https://registry.npmjs.org
             ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
           build-contexts: |
             bin=./bin
-            web-dist=./web-dist
+            admin-dist=./admin-dist
           cache-from: type=gha,scope=refract-release-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=refract-release-${{ matrix.arch }}
 
@@ -199,6 +235,7 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

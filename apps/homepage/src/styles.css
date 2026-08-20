@@ -1,0 +1,206 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import '@fontsource-variable/fraunces/wght.css';
+@import '@fontsource-variable/fraunces/wght-italic.css';
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-sans/400-italic.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+
+@theme {
+  --color-bg: #08090c;
+  --color-bg-elevated: #101218;
+  --color-surface: #16181f;
+  --color-fg: #ecece8;
+  --color-muted: #8e939c;
+  --color-subtle: #5c616b;
+  --color-primary: #c5cdd8;
+  --color-primary-fg: #08090c;
+  --color-border: color-mix(in oklab, var(--color-fg) 12%, transparent);
+  --color-border-strong: color-mix(in oklab, var(--color-fg) 22%, transparent);
+  --color-line: color-mix(in oklab, var(--color-fg) 8%, transparent);
+  --color-danger: #c45b4a;
+
+  --font-display:
+    'Fraunces Variable', 'Fraunces', 'Songti SC', 'Noto Serif SC', 'Noto Serif CJK SC', 'STSong',
+    'Liberation Serif', Georgia, serif;
+  --font-sans:
+    'IBM Plex Sans', 'PingFang SC', 'Noto Sans SC', 'Noto Sans CJK SC', 'Microsoft YaHei',
+    'WenQuanYi Zen Hei', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'Liberation Mono', ui-monospace, Menlo, Consolas, monospace;
+
+  --text-xs: clamp(0.75rem, 0.7rem + 0.2vw, 0.8125rem);
+  --text-sm: clamp(0.875rem, 0.82rem + 0.25vw, 0.9375rem);
+  --text-base: clamp(1rem, 0.95rem + 0.25vw, 1.0625rem);
+  --text-lg: clamp(1.125rem, 1rem + 0.5vw, 1.25rem);
+  --text-xl: clamp(1.5rem, 1.2rem + 1vw, 2rem);
+  --text-2xl: clamp(2rem, 1.4rem + 2vw, 3rem);
+  --text-3xl: clamp(2.5rem, 1.6rem + 3vw, 4rem);
+  --text-display: clamp(2.6rem, 1.1rem + 6.4vw, 5.75rem);
+
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 18px;
+  --radius-xl: 28px;
+
+  --shadow-border: 0 0 0 1px color-mix(in oklab, var(--color-fg) 10%, transparent);
+  --shadow-border-hover: 0 0 0 1px color-mix(in oklab, var(--color-fg) 18%, transparent);
+
+  --ease-out-smooth: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out-quart: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: var(--color-bg);
+  }
+
+  body {
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+    font-optical-sizing: auto;
+  }
+
+  section[id] {
+    scroll-margin-top: 5.5rem;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-primary) 35%, transparent);
+    color: var(--color-fg);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 3px;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .hero-in,
+  .hero-in > * {
+    animation: none !important;
+    opacity: 1 !important;
+    filter: none !important;
+    transform: none !important;
+  }
+}
+
+.optical-grid {
+  background-image:
+    linear-gradient(
+      to right,
+      color-mix(in oklab, var(--color-fg) 5.5%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      to bottom,
+      color-mix(in oklab, var(--color-fg) 5.5%, transparent) 1px,
+      transparent 1px
+    );
+  background-size: 72px 72px;
+  mask-image: radial-gradient(ellipse 85% 70% at 50% 18%, #000 10%, transparent 72%);
+}
+
+.optical-axis {
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklab, var(--color-primary) 28%, transparent),
+    transparent
+  );
+}
+
+.vignette {
+  background:
+    radial-gradient(
+      ellipse 80% 50% at 50% -10%,
+      color-mix(in oklab, var(--color-primary) 7%, transparent),
+      transparent 55%
+    ),
+    radial-gradient(ellipse at 50% 100%, rgb(8 9 12), transparent 45%);
+}
+
+.hero-in > * {
+  animation: rise 700ms var(--ease-out-smooth) both;
+}
+
+.hero-in > *:nth-child(1) {
+  animation-delay: 40ms;
+}
+.hero-in > *:nth-child(2) {
+  animation-delay: 120ms;
+}
+.hero-in > *:nth-child(3) {
+  animation-delay: 200ms;
+}
+.hero-in > *:nth-child(4) {
+  animation-delay: 280ms;
+}
+.hero-in > *:nth-child(5) {
+  animation-delay: 360ms;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+    filter: blur(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+
+@keyframes dash-travel {
+  to {
+    stroke-dashoffset: -240;
+  }
+}
+
+.ray-photon {
+  stroke-dasharray: 10 230;
+  animation: dash-travel 2.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ray-photon {
+    animation: none;
+    stroke-dasharray: none;
+  }
+}

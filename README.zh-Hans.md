@@ -4,6 +4,8 @@
 
 [English](./README.md) · 简体中文
 
+![Refract 协议优先 LLM 网关](./apps/homepage/public/og.jpg)
+
 ## 为什么不是 new-api
 
 new-api 的渠道类型是一个扁平枚举：OpenAI、Anthropic、Gemini、各家云厂商、各种中转站……每接一个新上游就加一个枚举值和一个适配器。渠道类型等于厂商，同一个中转站想同时走两种协议就得建两个渠道，协议转换逻辑散落在转发层的分支里。
@@ -45,10 +47,14 @@ Refract 的模型是：**渠道类型 = 协议**。只有五种：
 构建需要 Rust（2024 edition 工具链）与 Node.js（pnpm）：
 
 ```sh
-# 1. 构建前端（产物在 web/dist，会被内嵌进二进制）
-cd web && vp install && vp build && cd ..
+# 1. 安装共享 pnpm workspace，并构建会内嵌进二进制的后台
+pnpm install
+pnpm --filter @refract/admin build
 
-# 2. 构建并运行网关
+# 2. 独立部署公开首页时，再构建 homepage 静态产物
+pnpm --filter @refract/homepage build
+
+# 3. 构建并运行网关
 cargo run --release -p refract-server
 ```
 
@@ -135,18 +141,20 @@ pnpm dev
 ```
 
 - 后端 `127.0.0.1:3939` —— 改 Rust/SQL 自动重编译重启。
-- 前端 `localhost:5173` —— Vite HMR，`/api`、`/v1`、`/v1beta`、`/health`、`/metrics` 已代理到后端。浏览器开这个地址。
+- 后台 `localhost:5173` —— Vite HMR，`/api`、`/v1`、`/v1beta`、`/health`、`/metrics` 已代理到后端。浏览器开这个地址。
+- 首页 `localhost:3940` —— 用 `pnpm dev:homepage` 单独启动；产物在 `apps/homepage/dist`，不会嵌入网关。
 
-提交门禁由 [lefthook](https://lefthook.dev) 承担（`pnpm install` 时自动装进 `.git/hooks`）：每次 `git commit` 会依次跑隐私检查（真实邮箱 / API 密钥 / 本机路径，见 `scripts/privacy-check.sh`）、前后端自动格式化（修复直接回填本次提交）与质量门禁（`vp check` + `clippy -D warnings`）。误报时在该行加 `privacy-allow` 注释标记豁免。
+提交门禁由 [lefthook](https://lefthook.dev) 承担（`pnpm install` 时自动装进 `.git/hooks`）：每次 `git commit` 会依次跑隐私检查（真实邮箱 / API 密钥 / 本机路径，见 `scripts/privacy-check.sh`）、两个前端和共享 contracts 的 Vite Plus 格式化/检查，以及 Rust 质量门禁（`clippy -D warnings`）。误报时在该行加 `privacy-allow` 注释标记豁免。
 
 完整回归（钩子不含测试，发版前手动跑）：
 
 ```sh
 cargo test --workspace --all-targets --all-features --locked
-cd web
-vp test                       # 前端单元测试
-vp build
-vp run test:e2e               # E2E：对真实后端二进制跑完整流程
+pnpm --filter @refract/admin test:unit
+pnpm --filter @refract/admin build
+pnpm --filter @refract/admin test:e2e  # E2E：对真实后端二进制跑完整流程
+pnpm --filter @refract/homepage check
+pnpm --filter @refract/homepage build
 ```
 
 架构细节见 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)，实现依据见 [`docs/research/FOUNDATIONS.md`](./docs/research/FOUNDATIONS.md)。

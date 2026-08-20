@@ -168,7 +168,7 @@ Database migrations run when Refract opens the database. To roll back across a s
 
 ## Release process and versioning
 
-Refract uses **lockstep semantic versioning** across all 7 workspace crates and the embedded Vue frontend. `[workspace.package].version` in `Cargo.toml` is the single source of truth.
+Refract uses **lockstep semantic versioning** across all 7 Rust workspace crates, both frontend apps, and the shared contracts package. `[workspace.package].version` in `Cargo.toml` is the single source of truth.
 
 ### Bumping versions
 
@@ -184,7 +184,7 @@ To prepare a release, run either the helper script or `cargo-release`:
 cargo release patch --execute
 ```
 
-This automatically syncs `Cargo.toml`, `Cargo.lock`, `package.json`, and `web/package.json`, and rebuilds frontend version definitions.
+This automatically syncs `Cargo.toml`, `Cargo.lock`, the root `package.json`, `apps/admin/package.json`, `apps/homepage/package.json`, and `packages/contracts/package.json`.
 
 ### Triggering CI builds
 
@@ -195,9 +195,9 @@ git push origin main --tags
 ```
 
 The `.github/workflows/release.yml` pipeline will:
-1. Build the production web bundle once;
-2. Compile native release binaries for Linux (x64/arm64 musl), macOS (Intel/Apple Silicon), and Windows;
-3. Publish GitHub Release tarballs and auto-generated release notes;
+1. Install the root pnpm workspace and build the embedded admin plus standalone homepage once;
+2. Compile native release binaries for Linux (x64/arm64 musl), macOS (Intel/Apple Silicon), and Windows with the admin embedded;
+3. Publish the binary archives, a standalone homepage tarball, and auto-generated release notes;
 4. Build and push multi-arch container images to `ghcr.io`.
 
 ## Reverse proxy

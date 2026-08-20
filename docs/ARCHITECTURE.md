@@ -298,11 +298,35 @@ refract-server    二进制：配置加载、装配、嵌入前端、优雅关�
 
 ## 7. 前端
 
+前端是同一 pnpm + Vite Plus workspace 中的两个独立应用，不共享框架运行时：
+
+```text
+apps/admin       Vue 管理后台；构建产物嵌入 refract-server
+apps/homepage    React 产品首页；构建为独立静态站点
+packages/contracts
+                 管理 API 类型与协议元数据；两个应用共同依赖
+```
+
+边界原则：
+
+- `admin` 是管理面客户端，与 `/api/*` 同源部署；它使用管理令牌，不承载公开站点会话。
+- `homepage` 是公开展示面，独立发布到静态托管/CDN；它不进入网关二进制，也不直接依赖管理 API。
+- `contracts` 只保存线上的 JSON 类型和稳定协议元数据，不放 UI 组件、状态管理或 HTTP transport。
+- 两个应用可以使用不同 UI 框架；共享发生在协议和设计 token 层，不做跨 React/Vue 组件封装。
+- 根目录只有一个 `pnpm-lock.yaml`，Vite Plus 通过 `vp run -r <task>` 执行 workspace 任务。
+
+管理后台：
+
 - Vue 3.6 RC + **Vapor Mode**（`@vitejs/plugin-vue` 全局启用）
-- Vite 8.2 + Tailwind CSS v4.3（`@tailwindcss/vite`）
+- Vite Plus + Tailwind CSS v4.3（`@tailwindcss/vite`）
 - reka-ui 2.10（无样式可访问性原语）
-- 液态玻璃：自建 Tailwind v4 `@utility` 玻璃层 + `@wxperia/liquid-glass-vue` 用于重点交互元素
 - 状态：Pinia 4，路由：vue-router 5
+
+公开首页：
+
+- React 19 + TanStack Router
+- Vite Plus + Tailwind CSS v4.3
+- 静态构建产物独立发布；Release 同时提供 homepage 压缩包
 
 ## 8. 测试策略
 

@@ -2,26 +2,30 @@
 ARG NPM_REGISTRY=https://registry.npmjs.org
 ARG ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 # 构建源可用 --build-arg + --build-context 切换（CI/release 加速用）：
-#   web_src: web-builder（镜像内构建前端，默认）/ web-dist（预构建产物）
+#   admin_src: admin-builder（镜像内构建后台，默认）/ admin-dist（预构建产物）
 #   bin_src: rust-builder（镜像内编译，默认）/ bin（预构建二进制，
 #            布局 bin/<arch>/refract-server，多平台按 $TARGETARCH 选取）
-# 不传参数时行为与从前完全一致：前端与后端都在镜像内现场构建。
-ARG web_src=web-builder
+# 不传参数时：后台与后端都在镜像内现场构建；homepage 是独立部署产物，
+# 不会被嵌入网关二进制。
+ARG admin_src=admin-builder
 ARG bin_src=rust-builder
 
-FROM node:26-alpine AS web-builder
+FROM node:24.12-alpine AS admin-builder
 ARG NPM_REGISTRY
-WORKDIR /build/web
-RUN npm install -g pnpm@11.21.0 --registry="$NPM_REGISTRY" && \
+WORKDIR /build
+RUN npm install -g pnpm@11.22.0 --registry="$NPM_REGISTRY" && \
     pnpm config set registry "$NPM_REGISTRY"
-COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/admin/package.json ./apps/admin/package.json
+COPY packages/contracts/package.json ./packages/contracts/package.json
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile --registry="$NPM_REGISTRY"
-COPY web/ ./
-RUN pnpm run build
-# 统一输出位置：无论选哪个 web 源，dist 都取 /web/dist。
-RUN mkdir -p /web && cp -r /build/web/dist /web/dist
-FROM $web_src AS web-final
+    pnpm install --frozen-lockfile --filter @refract/admin... --registry="$NPM_REGISTRY"
+COPY apps/admin/ ./apps/admin/
+COPY packages/contracts/ ./packages/contracts/
+RUN pnpm --filter @refract/admin build
+# 统一输出位置：无论选哪个 admin 源，dist 都取 /admin/dist。
+RUN mkdir -p /admin && cp -r /build/apps/admin/dist /admin/dist
+FROM $admin_src AS admin-final
 
 FROM rust:1.97-alpine AS rust-builder
 ARG ALPINE_MIRROR
@@ -33,7 +37,7 @@ RUN sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${ALPINE_MIRROR}|g" /etc/apk
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
-COPY --from=web-final /web/dist ./web/dist
+COPY --from=admin-final /admin/dist ./apps/admin/dist
 # 产物统一放 /<arch>/refract-server，与外部 bin context 布局一致。
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

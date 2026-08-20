@@ -10,26 +10,45 @@ pre-commit:
     - name: privacy
       run: sh scripts/privacy-check.sh
 
-    # 2) 前端格式化：vp fmt 就地修复暂存文件，并回填到本次提交。
-    - name: web fmt
-      root: "web/"
+    # 2) 后台格式化：vp fmt 就地修复暂存文件，并回填到本次提交。
+    - name: admin fmt
+      root: "apps/admin/"
       glob: "*.{ts,tsx,vue,css,json,md,html}"
       run: pnpm exec vp fmt {staged_files}
       stage_fixed: true
 
-    # 3) 前端质量门禁：oxlint + 类型检查（与 CI 的 web check 一致）。
-    - name: web check
-      root: "web/"
+    # 3) 后台质量门禁：oxlint + 类型检查（与 CI 的 admin check 一致）。
+    - name: admin check
+      root: "apps/admin/"
       glob: "*.{ts,tsx,vue,css,json,html}"
       run: pnpm exec vp check
 
-    # 4) 后端格式化：cargo fmt 就地修复并回填。
+    # 4) 首页格式化与质量门禁。首页是独立 React 产品，不能让后台 hook
+    # 代替它的 lint/type-check。
+    - name: homepage fmt
+      root: "apps/homepage/"
+      glob: "*.{ts,tsx,css,json,md,html}"
+      run: pnpm exec vp fmt {staged_files}
+      stage_fixed: true
+
+    - name: homepage check
+      root: "apps/homepage/"
+      glob: "*.{ts,tsx,css,json,html}"
+      run: pnpm exec vp check
+
+    # 共享契约变化会同时影响两个前端；先检查契约自身，再由 CI 跑完整消费者门禁。
+    - name: contracts check
+      root: "packages/contracts/"
+      glob: "*.{ts,json}"
+      run: pnpm exec vp check
+
+    # 5) 后端格式化：cargo fmt 就地修复并回填。
     - name: rust fmt
       glob: "*.rs"
       run: cargo fmt --all
       stage_fixed: true
 
-    # 5) 后端质量门禁：clippy 全目标全特性，warning 即失败（等同 CI）。
+    # 6) 后端质量门禁：clippy 全目标全特性，warning 即失败（等同 CI）。
     - name: rust clippy
       glob: "{*.rs,Cargo.toml,Cargo.lock}"
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
