@@ -179,11 +179,9 @@ const KEY_STRATEGY_OPTIONS: { value: KeyStrategy; label: string; hint: string }[
   { value: 'random', label: '随机', hint: '每次请求随机选一把钥匙' },
 ]
 
-/** 钥匙池行数（忽略空行）—— 主密钥单独算一把，不重复计入。 */
+/** 钥匙池行数（忽略空行） */
 const poolLineCount = computed(
-  () =>
-    credentialsText.value.split('\n').filter((line) => line.trim() !== '').length +
-    (form.value.credential.trim() ? 1 : 0),
+  () => credentialsText.value.split('\n').filter((line) => line.trim() !== '').length,
 )
 
 /** 探测结果，供一键同步。 */
@@ -273,7 +271,9 @@ onMounted(async () => {
     tagsText.value = (ch.tags ?? []).join(', ')
     paramOverrideText.value = ch.param_override ? JSON.stringify(ch.param_override, null, 2) : ''
     headersText.value = (ch.extra_headers ?? []).map(([k, v]) => `${k}: ${v}`).join('\n')
-    credentialsText.value = (ch.credentials ?? []).join('\n')
+    const allCreds = [ch.credential, ...(ch.credentials ?? [])].filter((c) => c && c.trim() !== '')
+    credentialsText.value = allCreds.join('\n')
+    form.value.credential = ''
     if (
       ch.param_override ||
       (ch.extra_headers ?? []).length > 0 ||
@@ -496,7 +496,8 @@ async function openProbeDialog(ep: ChannelEndpoint) {
       ep.address.unofficial || ep.address.full_address || !!ep.address.base_url
         ? ep.address
         : form.value.address
-    const effectiveCredential = ep.credential ?? form.value.credential
+    const effectiveCredential =
+      ep.credential ?? (credentialsText.value.split('\n')[0]?.trim() || '')
 
     const res = await store.probeDirect({
       protocol: ep.protocol,
@@ -593,9 +594,7 @@ const validation = computed<string[]>(() => {
 
     const hasOwn = !!ep.credential && ep.credential.trim() !== ''
     // 主密钥与钥匙池任一非空即可兜底。
-    const hasDefault =
-      f.credential.trim() !== '' ||
-      credentialsText.value.split('\n').some((line) => line.trim() !== '')
+    const hasDefault = credentialsText.value.split('\n').some((line) => line.trim() !== '')
     if (!hasOwn && !hasDefault) errors.push(`端点 ${ep.protocol} 没有密钥，且渠道默认密钥为空`)
 
     // 地址校验只在非官方且非完整地址时有意义。
@@ -639,6 +638,7 @@ async function save() {
       .map((t) => t.trim())
       .filter(Boolean),
     // 密钥池：一行一把，空行忽略；掩码行由后端按值还原成真实密钥。
+    credential: '',
     credentials: credentialsText.value
       .split('\n')
       .map((line) => line.trim())
@@ -878,46 +878,23 @@ function previewUrl(ep: ChannelEndpoint): string {
 
       <!-- 默认凭据 -->
       <section class="glass glass-specular p-5">
-        <h2 class="mb-1 text-sm font-semibold text-ink-soft uppercase">默认密钥</h2>
-        <p class="mb-4 text-xs text-ink-faint">
-          端点未单独配置密钥时继承这里。支持多把钥匙轮换：每行一把，第一把与上面单独填写的主密钥共同构成钥匙池。
-        </p>
-
-        <div class="relative">
-          <input
-            v-model="form.credential"
-            :type="showCredential ? 'text' : 'password'"
-            placeholder="sk-..."
-            autocomplete="new-password"
-            aria-label="默认渠道 API 密钥"
-            class="glass-field w-full px-3 py-2 pr-16 font-mono text-sm outline-none"
-          />
+        <div class="mb-1 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-ink-soft uppercase">默认密钥</h2>
           <button
             type="button"
-            class="absolute top-1/2 right-2 -translate-y-1/2 rounded px-2 py-1 text-xs text-ink-faint hover:text-ink"
-            :aria-label="showCredential ? '隐藏默认渠道 API 密钥' : '显示默认渠道 API 密钥'"
+            class="rounded px-2 py-1 text-xs text-ink-faint hover:text-ink"
             :aria-pressed="showCredential"
             @click="showCredential = !showCredential"
           >
             {{ showCredential ? '隐藏' : '显示' }}
           </button>
         </div>
+        <p class="mb-4 text-xs text-ink-faint">
+          端点未单独配置密钥时继承这里。每行一把，支持多把钥匙轮换。
+        </p>
 
         <!-- 密钥池：一行一把，保存时原样回传掩码行由后端还原 -->
         <div class="mt-4">
-          <div class="mb-1 flex items-center justify-between">
-            <label for="credentials-pool" class="text-xs font-medium text-ink-soft"
-              >钥匙池（每行一把）</label
-            >
-            <button
-              type="button"
-              class="rounded px-2 py-1 text-xs text-ink-faint hover:text-ink"
-              :aria-pressed="showCredential"
-              @click="showCredential = !showCredential"
-            >
-              {{ showCredential ? '隐藏' : '显示' }}
-            </button>
-          </div>
           <textarea
             id="credentials-pool"
             v-model="credentialsText"
@@ -930,7 +907,7 @@ function previewUrl(ep: ChannelEndpoint): string {
             :class="showCredential ? undefined : '[webkit-text-security:disc]'"
           ></textarea>
           <p class="mt-1 text-xs text-ink-faint">
-            {{ poolLineCount }} 把钥匙参与轮换；留空表示仅使用主密钥。
+            {{ poolLineCount }} 把钥匙参与轮换；留空则不可用（端点也未配置时）。
           </p>
         </div>
 
