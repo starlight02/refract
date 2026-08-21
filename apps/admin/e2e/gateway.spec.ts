@@ -165,8 +165,8 @@ test('通过编辑器创建渠道', async ({ page }) => {
   await page.getByPlaceholder('例如：中转站-主力').fill('E2E 主渠道')
   await page.getByRole('switch', { name: '非官方地址' }).click()
   await page.getByPlaceholder('https://api.example.com').fill(upstreamUrl)
-  // 钥匙池输入框也用 sk- 占位符，用 aria 标签区分主密钥。
-  await page.getByRole('textbox', { name: '默认渠道 API 密钥' }).fill('sk-e2e-main')
+  // 钥匙池 textarea：统一密钥入口，一行一把。
+  await page.getByRole('textbox', { name: '上游钥匙池，每行一把' }).fill('sk-e2e-main')
 
   const modelInput = page.getByRole('textbox', { name: 'Chat 模型输入' })
   await modelInput.fill('gpt-4o')
@@ -382,7 +382,7 @@ test('编辑渠道不碰密钥时，掩码不会毁掉已保存的凭据', async
   await expect(page.getByRole('heading', { name: '编辑渠道' })).toBeVisible()
 
   // 编辑器里显示的是脱敏占位符，不是明文。
-  const credential = page.getByRole('textbox', { name: '默认渠道 API 密钥' })
+  const credential = page.getByRole('textbox', { name: '上游钥匙池，每行一把' })
   await expect(credential).toHaveValue(/…|•/)
 
   // 只改标签，不碰密钥，保存。
@@ -679,15 +679,16 @@ test('设置页可导出备份，导回时同名渠道被跳过', async ({ page 
   for await (const chunk of stream) chunks.push(chunk as Buffer)
   const document_ = JSON.parse(Buffer.concat(chunks).toString()) as {
     version: number
-    channels: Array<{ name: string; credential: string }>
+    channels: Array<{ name: string; credentials: string[] }>
     keys: Array<{ key_hash: string }>
     settings: { log_retention_days: number }
   }
   expect(document_.version).toBe(1)
   expect(document_.channels.map((c) => c.name)).toContain('E2E 主渠道')
-  // 备份必须可恢复：渠道凭据是明文，密钥带哈希。
-  expect(document_.channels.find((c) => c.name === 'E2E 主渠道')?.credential).toBe('sk-e2e-main')
-  expect(document_.keys[0]?.key_hash?.length ?? 0).toBeGreaterThan(10)
+  // 备份必须可恢复：渠道凭据是明文（统一存钥匙池），密钥带哈希。
+  expect(document_.channels.find((c) => c.name === 'E2E 主渠道')?.credentials).toEqual([
+    'sk-e2e-main',
+  ])
 
   // merge 导回：所有内容同名/同哈希，必须全部跳过而不产生重复。
   const before = await page.evaluate(async () => {

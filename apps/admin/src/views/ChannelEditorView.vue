@@ -179,10 +179,15 @@ const KEY_STRATEGY_OPTIONS: { value: KeyStrategy; label: string; hint: string }[
   { value: 'random', label: '随机', hint: '每次请求随机选一把钥匙' },
 ]
 
+/** 合并后的钥匙池（忽略空行），供探测快照与保存载荷复用。 */
+const poolCredentials = () =>
+  credentialsText.value
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+
 /** 钥匙池行数（忽略空行） */
-const poolLineCount = computed(
-  () => credentialsText.value.split('\n').filter((line) => line.trim() !== '').length,
-)
+const poolLineCount = computed(() => poolCredentials().length)
 
 /** 探测结果，供一键同步。 */
 const probing = ref<Record<string, boolean>>({})
@@ -238,11 +243,11 @@ function normalizeEmptyRetryOverride(key: 'window_secs' | 'max_retries') {
 }
 
 /** 只序列化影响探测的字段：改模型列表这类字段不应该把探测按钮锁掉。 */
-function probeConfigOf(ch: Channel): string {
+function probeConfigOf(ch: Channel, credentials: string[]): string {
   return JSON.stringify({
     kind: ch.kind,
     address: ch.address,
-    credential: ch.credential,
+    credentials,
     proxy: ch.proxy,
     endpoints: ch.endpoints.map((e) => ({
       protocol: e.protocol,
@@ -254,7 +259,7 @@ function probeConfigOf(ch: Channel): string {
 
 /** 表单里影响探测的配置与已保存版本不一致 —— 此时探测结果会误导用户。 */
 const probeStale = computed(
-  () => isEdit.value && savedProbeConfig.value !== probeConfigOf(form.value),
+  () => isEdit.value && savedProbeConfig.value !== probeConfigOf(form.value, poolCredentials()),
 )
 
 onMounted(async () => {
@@ -284,8 +289,7 @@ onMounted(async () => {
     ) {
       showAdvanced.value = true
     }
-    savedProbeConfig.value = probeConfigOf(ch)
-    pristineSnapshot.value = getSnapshot()
+    savedProbeConfig.value = probeConfigOf(ch, allCreds)
   } catch (e) {
     saveError.value = e instanceof Error ? e.message : '加载渠道失败'
   } finally {
@@ -639,10 +643,7 @@ async function save() {
       .filter(Boolean),
     // 密钥池：一行一把，空行忽略；掩码行由后端按值还原成真实密钥。
     credential: '',
-    credentials: credentialsText.value
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean),
+    credentials: poolCredentials(),
     param_override: paramOverrideText.value.trim()
       ? (JSON.parse(paramOverrideText.value) as Record<string, unknown>)
       : null,
