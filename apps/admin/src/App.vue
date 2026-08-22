@@ -9,12 +9,7 @@ import {
   DialogRoot,
   DialogTitle,
 } from 'reka-ui'
-import {
-  AUTH_REQUIRED_EVENT,
-  BACKEND_DOWN_EVENT,
-  BACKEND_RESTORED_EVENT,
-  setAdminToken,
-} from '@/api/client'
+import { AUTH_REQUIRED_EVENT, BACKEND_DOWN_EVENT, BACKEND_RESTORED_EVENT, auth } from '@/api/client'
 import AppIcon from '@/components/AppIcon.vue'
 import GlassToastContainer from '@/components/GlassToastContainer.vue'
 import { initLiquidGlass } from '@/utils/liquidGlass'
@@ -34,7 +29,7 @@ function applyTheme(dark: boolean) {
   localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light')
 }
 
-onMounted(() => {
+onMounted(async () => {
   // 挂载物理液态玻璃滤镜
   initLiquidGlass()
   // 首次访问没有存储值时跟随系统，之后用户的显式选择优先。
@@ -43,6 +38,15 @@ onMounted(() => {
     saved === 'dark' ||
     (saved === null && window.matchMedia('(prefers-color-scheme: dark)').matches)
   applyTheme(dark)
+
+  try {
+    const sess = await auth.session()
+    if (sess.configured && !sess.authenticated) {
+      tokenDialogOpen.value = true
+    }
+  } catch {
+    /* 忽略初始化探测失败 */
+  }
 })
 
 /**
@@ -56,21 +60,32 @@ onMounted(() => {
 const tokenDialogOpen = ref(false)
 const tokenDraft = ref('')
 const showToken = ref(false)
-const reloading = ref(false)
+const tokenBusy = ref(false)
+const tokenError = ref<string | null>(null)
 
 function onAuthRequired() {
   if (!tokenDialogOpen.value) {
     tokenDraft.value = ''
+    tokenError.value = null
     tokenDialogOpen.value = true
   }
 }
 
-function saveTokenAndReload() {
+async function saveTokenAndReload() {
   const token = tokenDraft.value.trim()
-  if (!token || reloading.value) return
-  reloading.value = true
-  setAdminToken(token)
-  window.location.reload()
+  if (!token || tokenBusy.value) return
+  tokenBusy.value = true
+  tokenError.value = null
+  try {
+    await auth.login(token)
+    tokenDraft.value = ''
+    tokenDialogOpen.value = false
+    window.location.reload()
+  } catch (e) {
+    tokenError.value = e instanceof Error ? e.message : '登录失败，请检查管理令牌'
+  } finally {
+    tokenBusy.value = false
+  }
 }
 
 onMounted(() => window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired))
@@ -313,6 +328,9 @@ const version = __APP_VERSION__
           </DialogDescription>
 
           <form class="mt-5 flex flex-col gap-4" @submit.prevent="saveTokenAndReload">
+            <div v-if="tokenError" class="rounded-lg bg-danger/10 p-3 text-xs text-danger">
+              {{ tokenError }}
+            </div>
             <div>
               <label class="mb-1 block text-xs font-medium text-ink-soft">管理员账号</label>
               <input
@@ -353,10 +371,10 @@ const version = __APP_VERSION__
               <button
                 type="submit"
                 class="glass-button-primary px-4 py-2.5 text-sm font-medium disabled:opacity-50"
-                :disabled="!tokenDraft.trim() || reloading"
+                :disabled="!tokenDraft.trim() || tokenBusy"
               >
-                <AppIcon v-if="reloading" name="spinner" class="animate-spin mr-1" :size="14" />
-                {{ reloading ? '正在重新加载…' : '保存并重新加载' }}
+                <AppIcon v-if="tokenBusy" name="spinner" class="animate-spin mr-1" :size="14" />
+                {{ tokenBusy ? '正在登录…' : '登录并进入系统' }}
               </button>
               <button
                 type="button"

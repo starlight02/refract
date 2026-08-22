@@ -72,6 +72,7 @@ struct Inner {
     master_key: ArcSwap<Option<[u8; 32]>>,
     admin_guard: crate::auth::AdminGuard,
     transport_crypto: crate::crypto::TransportCrypto,
+    session_secret: [u8; 32],
 }
 
 /// 由限制值构造并发信号量。0 = 不限（None）。
@@ -174,6 +175,10 @@ impl AppState {
                 master_key: ArcSwap::from_pointee(master_key),
                 admin_guard: crate::auth::AdminGuard::new(),
                 transport_crypto: crate::crypto::TransportCrypto::new_random(),
+                session_secret: {
+                    use rand::RngExt as _;
+                    rand::rng().random()
+                },
             }),
         };
         crate::notify::spawn_event_worker(state.clone(), receiver);
@@ -183,6 +188,11 @@ impl AppState {
     /// 传输层端到端加密管理器。
     pub fn transport_crypto(&self) -> &crate::crypto::TransportCrypto {
         &self.inner.transport_crypto
+    }
+
+    /// 会话签名密钥。
+    pub fn session_secret(&self) -> &[u8; 32] {
+        &self.inner.session_secret
     }
 
     /// 当前全局限制快照。

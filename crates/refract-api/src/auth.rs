@@ -19,6 +19,85 @@ use std::sync::Mutex;
 use std::time::Instant;
 use warp::Filter;
 
+/// Session Cookie 名称。
+pub const SESSION_COOKIE_NAME: &str = "refract_session";
+/// Session Cookie 有效期（7天）。
+pub const SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
+/// 生成 Session Ticket 字符串。
+/// 格式: `<issued_at>.<expiry>.<signature_hex>`
+/// 签名数据: `format!("{admin_token_hash}:{issued_at}:{expiry}")`
+pub fn create_session_ticket(
+    session_secret: &[u8; 32],
+    admin_token_hash: &str,
+    ttl_secs: u64,
+) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expiry = now.saturating_add(ttl_secs);
+    let msg = format!("{admin_token_hash}:{now}:{expiry}");
+    let sig_bytes = crate::notify::hmac_sha256(session_secret, msg.as_bytes());
+    let sig = hex::encode(sig_bytes);
+    format!("{now}.{expiry}.{sig}")
+}
+
+/// 验证 Session Ticket 字符串。
+pub fn verify_session_ticket(
+    ticket: &str,
+    session_secret: &[u8; 32],
+    expected_token_hash: &str,
+) -> bool {
+    let mut parts = ticket.split('.');
+    let Some(issued_str) = parts.next() else {
+        return false;
+    };
+    let Some(expiry_str) = parts.next() else {
+        return false;
+    };
+    let Some(sig_hex) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+
+    let Ok(expiry) = expiry_str.parse::<u64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now >= expiry {
+        return false;
+    }
+
+    let Ok(expected_sig_bytes) = hex::decode(sig_hex) else {
+        return false;
+    };
+    let msg = format!("{expected_token_hash}:{issued_str}:{expiry_str}");
+    let computed_sig = crate::notify::hmac_sha256(session_secret, msg.as_bytes());
+    constant_time_eq(&computed_sig, &expected_sig_bytes)
+}
+
+/// 从 Cookie 请求头中解析指定名称的 Cookie 值。
+pub fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
+    for pair in cookie_header.split(';') {
+        let mut parts = pair.trim().splitn(2, '=');
+        if let (Some(name), Some(val)) = (parts.next(), parts.next())
+            && name.trim() == cookie_name
+        {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 use crate::error::{ApiError, ProtocolRejection};
 use crate::state::AppState;
 
@@ -163,7 +242,7 @@ impl Authenticator for SingleUserAuthenticator {
 ///
 /// 四家的头不一样，且客户端会用它们**原本**的头来调我们 —— 只认
 /// `Authorization` 会让 Anthropic SDK 和 Google SDK 直接 401。
-fn extract_token(
+pub fn extract_token(
     authorization: Option<String>,
     x_api_key: Option<String>,
     x_goog_api_key: Option<String>,
@@ -291,10 +370,12 @@ impl AdminGuard {
 pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("authorization")
         .and(warp::header::optional::<String>("x-admin-token"))
+        .and(warp::header::optional::<String>("cookie"))
         .and(warp::filters::addr::remote())
         .and_then(
             move |auth: Option<String>,
                   x_admin: Option<String>,
+                  cookie: Option<String>,
                   remote_addr: Option<std::net::SocketAddr>| {
                 let state = state.clone();
                 async move {
@@ -314,41 +395,47 @@ pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Re
                         return Ok(());
                     };
 
-                    let token = match extract_token(auth, x_admin, None, None, None) {
-                        Some(t) => t,
-                        None => {
-                            // 未携带令牌属于未鉴权访问，返回 401 触发前端输入弹窗；
-                            // 不计入爆破失败计数，避免无令牌页面刷新时的并发请求熔断自身。
-                            return Err(warp::reject::custom(ApiError(
-                                GatewayError::unauthenticated("missing admin token"),
-                            )));
-                        }
-                    };
-
-                    // 携带了令牌时：如果校验成功，直接解封并放行；
-                    // 如果校验失败，才查封禁状态并累加失败计数。
-                    if constant_time_eq(
-                        refract_store::ApiKeyRepo::hash(&token).as_bytes(),
-                        expected_hash.as_bytes(),
-                    ) {
-                        state.admin_guard().record_success(client_ip);
-                        Ok(())
-                    } else {
-                        let _locked = state.admin_guard().record_failure(client_ip);
-                        if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
-                            let err = GatewayError::new(
-                                ErrorKind::PermissionDenied,
-                                format!("too many failed login attempts, locked for {wait_secs}s"),
-                            )
-                            .with_retry_after(std::time::Duration::from_secs(wait_secs));
-                            Err(warp::reject::custom(ApiError(err)))
+                    // 1. 优先检查请求头显式传递的令牌（CLI / 脚本）
+                    if let Some(token) = extract_token(auth, x_admin, None, None, None) {
+                        if constant_time_eq(
+                            refract_store::ApiKeyRepo::hash(&token).as_bytes(),
+                            expected_hash.as_bytes(),
+                        ) {
+                            state.admin_guard().record_success(client_ip);
+                            return Ok(());
                         } else {
-                            Err(warp::reject::custom(ApiError(GatewayError::new(
-                                ErrorKind::PermissionDenied,
-                                "invalid admin token",
-                            ))))
+                            let _locked = state.admin_guard().record_failure(client_ip);
+                            if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
+                                let err = GatewayError::new(
+                                    ErrorKind::PermissionDenied,
+                                    format!(
+                                        "too many failed login attempts, locked for {wait_secs}s"
+                                    ),
+                                )
+                                .with_retry_after(std::time::Duration::from_secs(wait_secs));
+                                return Err(warp::reject::custom(ApiError(err)));
+                            } else {
+                                return Err(warp::reject::custom(ApiError(GatewayError::new(
+                                    ErrorKind::PermissionDenied,
+                                    "invalid admin token",
+                                ))));
+                            }
                         }
                     }
+
+                    // 2. 检查 HttpOnly Session Cookie（Web 控制台）
+                    if let Some(cookie_str) = cookie
+                        && let Some(ticket) = extract_cookie_value(&cookie_str, SESSION_COOKIE_NAME)
+                        && verify_session_ticket(&ticket, state.session_secret(), &expected_hash)
+                    {
+                        state.admin_guard().record_success(client_ip);
+                        return Ok(());
+                    }
+
+                    // 3. 未提供有效凭据
+                    Err(warp::reject::custom(ApiError(
+                        GatewayError::unauthenticated("missing admin token or session"),
+                    )))
                 }
             },
         )
@@ -361,7 +448,7 @@ pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Re
 /// 不可利用（泄漏的是 hash 前缀而非明文）；这里仍然用恒时实现，是让
 /// 鉴权路径不依赖「上一层恰好做了 hash」这个前提。长度不等时提前返回
 /// 只泄漏长度 —— hash 输出定长，无信息量。
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -601,5 +688,38 @@ mod tests {
                 .kind,
             ErrorKind::Unauthenticated
         );
+    }
+
+    #[test]
+    fn test_session_ticket_lifecycle() {
+        let secret = [42u8; 32];
+        let token_hash = "hash_of_admin_token_123";
+        let ticket = create_session_ticket(&secret, token_hash, 3600);
+
+        assert!(verify_session_ticket(&ticket, &secret, token_hash));
+        // 密码被修改导致 token_hash 变化：已有 ticket 必须立即失效
+        assert!(!verify_session_ticket(
+            &ticket,
+            &secret,
+            "new_token_hash_456"
+        ));
+        // 伪造签名：必须拒绝
+        assert!(!verify_session_ticket(
+            "100.200.bad_sig",
+            &secret,
+            token_hash
+        ));
+        // 格式非法：必须拒绝
+        assert!(!verify_session_ticket("invalid", &secret, token_hash));
+    }
+
+    #[test]
+    fn test_extract_cookie_value() {
+        let header = "theme=dark; refract_session=abc.def.123; lang=zh-CN";
+        assert_eq!(
+            extract_cookie_value(header, SESSION_COOKIE_NAME),
+            Some("abc.def.123".to_string())
+        );
+        assert_eq!(extract_cookie_value(header, "non_existent"), None);
     }
 }

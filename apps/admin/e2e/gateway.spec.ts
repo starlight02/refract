@@ -533,36 +533,31 @@ test('390px 视口使用移动导航且核心内容可见', async ({ page }) => 
   await expect(page.getByRole('link', { name: /渠道/ })).toBeVisible()
 })
 
-test('管理令牌保护整个管理界面', async ({ page }) => {
+test('管理令牌保护整个管理界面', async ({ page, context }) => {
   await page.goto('/settings')
   await page.getByPlaceholder('新令牌（启用或更换）').fill('e2e-admin-secret')
   await page.getByRole('button', { name: '启用或更换' }).click()
-  await expect(page.getByText('令牌已生效，本浏览器已保存。')).toBeVisible()
+  await expect(page.getByText('令牌已生效，会话已更新。')).toBeVisible()
 
-  // 模拟「换了浏览器」：本地没有令牌，管理界面必须被挡住。
-  await page.evaluate(() => localStorage.removeItem('refract.admin_token'))
+  // 模拟「换了浏览器」：清除 Session Cookie，管理界面必须被挡住。
+  await context.clearCookies()
   await page.reload()
   const dialog = page.getByRole('dialog')
-  await expect(dialog).toContainText('需要管理令牌')
+  await expect(dialog).toContainText('管理端身份验证')
 
-  // 错误令牌不能放行：填错令牌点击重载，等待新页面加载并再次弹出令牌弹窗。
-  await dialog.getByPlaceholder('管理令牌').fill('wrong-token')
+  // 错误令牌不能放行：填错令牌点击登录，弹窗显示错误且依然拦截。
+  await dialog.getByPlaceholder('adm_... 或自定义管理令牌').fill('wrong-token')
+  await dialog.getByRole('button', { name: '登录并进入系统' }).click()
+  await expect(dialog.getByText('invalid admin token')).toBeVisible()
+
+  // 正确令牌恢复界面：填入正确令牌点击登录，等待页面加载完成并确认弹窗消失。
+  await dialog.getByPlaceholder('adm_... 或自定义管理令牌').fill('e2e-admin-secret')
   await Promise.all([
     page.waitForEvent('load'),
-    dialog.getByRole('button', { name: '保存并重新加载' }).click(),
-  ])
-  const dialogAfterWrong = page.getByRole('dialog')
-  await expect(dialogAfterWrong).toContainText('需要管理令牌', { timeout: 15_000 })
-
-  // 正确令牌恢复界面：填入正确令牌点击重载，等待页面加载完成并确认弹窗消失。
-  await dialogAfterWrong.getByPlaceholder('管理令牌').fill('e2e-admin-secret')
-  await Promise.all([
-    page.waitForEvent('load'),
-    dialogAfterWrong.getByRole('button', { name: '保存并重新加载' }).click(),
+    dialog.getByRole('button', { name: '登录并进入系统' }).click(),
   ])
   await expect(page.getByRole('heading', { name: '设置' })).toBeVisible()
   await expect(page.getByRole('dialog')).toBeHidden()
-
   // 收尾：关闭管理鉴权，让剩余用例回到开放状态。
   await page.goto('/settings')
   await page.getByRole('button', { name: '关闭管理鉴权' }).click()

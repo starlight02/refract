@@ -217,11 +217,193 @@ fn crypto(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         })
         .boxed()
 }
+#[derive(Debug, Deserialize)]
+struct LoginBody {
+    token: String,
+}
+
+/// 认证路由：包含登录、登出与会话探针，无需外部鉴权拦截。
+fn auth_routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
+    let base = warp::path("auth");
+
+    // POST /api/auth/login
+    let login = base
+        .and(warp::path("login"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(json_body(state.clone()))
+        .and(warp::filters::addr::remote())
+        .and(with_state(state.clone()))
+        .and_then(
+            |body: LoginBody, remote_addr: Option<std::net::SocketAddr>, state: AppState| async move {
+                let client_ip = remote_addr
+                    .map(|a| a.ip())
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+                if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
+                    let err = GatewayError::new(
+                        refract_core::ErrorKind::PermissionDenied,
+                        format!("too many failed login attempts, locked for {wait_secs}s"),
+                    )
+                    .with_retry_after(std::time::Duration::from_secs(wait_secs));
+                    return Err(warp::reject::custom(ApiError(err)));
+                }
+
+                let repo = state.settings_repo();
+                let expected: Option<String> = repo
+                    .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
+                    .await
+                    .map_err(reject)?;
+
+                let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
+                    // 未设置管理令牌时直接允许登录并放行
+                    return ok(serde_json::json!({
+                        "authenticated": true,
+                        "username": "admin@localhost"
+                    }));
+                };
+
+                let token_clean = body.token.trim();
+                let token_hash = refract_store::ApiKeyRepo::hash(token_clean);
+                if crate::auth::constant_time_eq(token_hash.as_bytes(), expected_hash.as_bytes()) {
+                    state.admin_guard().record_success(client_ip);
+                    let ticket = crate::auth::create_session_ticket(
+                        state.session_secret(),
+                        &expected_hash,
+                        crate::auth::SESSION_MAX_AGE_SECS,
+                    );
+                    let cookie = format!(
+                        "{}={ticket}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                        crate::auth::SESSION_COOKIE_NAME,
+                        crate::auth::SESSION_MAX_AGE_SECS
+                    );
+                    let res = warp::reply::with_header(
+                        warp::reply::json(&Envelope {
+                            data: serde_json::json!({
+                                "authenticated": true,
+                                "username": "admin@localhost"
+                            }),
+                        }),
+                        warp::http::header::SET_COOKIE,
+                        cookie,
+                    );
+                    Ok::<warp::reply::Response, Rejection>(res.into_response())
+                } else {
+                    let _locked = state.admin_guard().record_failure(client_ip);
+                    if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
+                        let err = GatewayError::new(
+                            refract_core::ErrorKind::PermissionDenied,
+                            format!("too many failed login attempts, locked for {wait_secs}s"),
+                        )
+                        .with_retry_after(std::time::Duration::from_secs(wait_secs));
+                        Err(warp::reject::custom(ApiError(err)))
+                    } else {
+                        Err(warp::reject::custom(ApiError(GatewayError::new(
+                            refract_core::ErrorKind::Unauthenticated,
+                            "invalid admin token",
+                        ))))
+                    }
+                }
+            },
+        );
+
+    // POST /api/auth/logout
+    let logout = base
+        .and(warp::path("logout"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .map(|| {
+            let cookie = format!(
+                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+                crate::auth::SESSION_COOKIE_NAME
+            );
+            warp::reply::with_header(
+                warp::reply::json(&Envelope {
+                    data: serde_json::json!({ "authenticated": false }),
+                }),
+                warp::http::header::SET_COOKIE,
+                cookie,
+            )
+            .into_response()
+        });
+
+    // GET /api/auth/session
+    let session = base
+        .and(warp::path("session"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::header::optional::<String>("x-admin-token"))
+        .and(warp::header::optional::<String>("cookie"))
+        .and(with_state(state))
+        .and_then(
+            |auth: Option<String>,
+             x_admin: Option<String>,
+             cookie: Option<String>,
+             state: AppState| async move {
+                let repo = state.settings_repo();
+                let expected: Option<String> = repo
+                    .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
+                    .await
+                    .map_err(reject)?;
+
+                let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
+                    return ok(serde_json::json!({
+                        "authenticated": true,
+                        "configured": false,
+                        "username": "admin@localhost"
+                    }));
+                };
+
+                // 1. 检查请求头
+                if let Some(token) = crate::auth::extract_token(auth, x_admin, None, None, None)
+                    && crate::auth::constant_time_eq(
+                        refract_store::ApiKeyRepo::hash(&token).as_bytes(),
+                        expected_hash.as_bytes(),
+                    )
+                {
+                    return ok(serde_json::json!({
+                        "authenticated": true,
+                        "configured": true,
+                        "username": "admin@localhost"
+                    }));
+                }
+
+                // 2. 检查 Cookie
+                if let Some(cookie_str) = cookie
+                    && let Some(ticket) = crate::auth::extract_cookie_value(
+                        &cookie_str,
+                        crate::auth::SESSION_COOKIE_NAME,
+                    )
+                    && crate::auth::verify_session_ticket(
+                        &ticket,
+                        state.session_secret(),
+                        &expected_hash,
+                    )
+                {
+                    return ok(serde_json::json!({
+                        "authenticated": true,
+                        "configured": true,
+                        "username": "admin@localhost"
+                    }));
+                }
+
+                ok(serde_json::json!({
+                    "authenticated": false,
+                    "configured": true,
+                    "username": null
+                }))
+            },
+        );
+
+    routes![login, logout, session].boxed()
+}
 
 /// 装配管理路由。
 pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let auth = admin_auth(state.clone());
     let crypto_route = crypto(state.clone());
+    let auth_route = auth_routes(state.clone());
 
     let authenticated = auth.and(routes![
         channels(state.clone()),
@@ -238,7 +420,13 @@ pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     ]);
 
     warp::path("api")
-        .and(crypto_route.or(authenticated).unify())
+        .and(
+            crypto_route
+                .or(auth_route)
+                .unify()
+                .or(authenticated)
+                .unify(),
+        )
         .boxed()
 }
 
@@ -1542,14 +1730,42 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                     repo.set(refract_store::settings_repo::KEY_AUTH_INITIALIZED, &true)
                         .await
                         .map_err(reject)?;
-                    ok(serde_json::json!({ "configured": true }))
+                    let ticket = crate::auth::create_session_ticket(
+                        state.session_secret(),
+                        &hash,
+                        crate::auth::SESSION_MAX_AGE_SECS,
+                    );
+                    let cookie = format!(
+                        "{}={ticket}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                        crate::auth::SESSION_COOKIE_NAME,
+                        crate::auth::SESSION_MAX_AGE_SECS
+                    );
+                    let res = warp::reply::with_header(
+                        warp::reply::json(&Envelope {
+                            data: serde_json::json!({ "configured": true }),
+                        }),
+                        warp::http::header::SET_COOKIE,
+                        cookie,
+                    );
+                    Ok::<warp::reply::Response, Rejection>(res.into_response())
                 }
                 // 传 null 表示「关掉管理鉴权」，个人本机部署的常见需求。
                 None => {
                     repo.remove(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
                         .await
                         .map_err(reject)?;
-                    ok(serde_json::json!({ "configured": false }))
+                    let cookie = format!(
+                        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+                        crate::auth::SESSION_COOKIE_NAME
+                    );
+                    let res = warp::reply::with_header(
+                        warp::reply::json(&Envelope {
+                            data: serde_json::json!({ "configured": false }),
+                        }),
+                        warp::http::header::SET_COOKIE,
+                        cookie,
+                    );
+                    Ok::<warp::reply::Response, Rejection>(res.into_response())
                 }
             }
         });
@@ -3338,5 +3554,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.credential.expose(), "sk-secret-from-browser-e2e");
+    }
+
+    #[tokio::test]
+    async fn auth_session_and_cookie_login_logout_flow() {
+        let state = test_state().await;
+        let routes = crate::routes(state.clone());
+
+        // 1. 未配置令牌时：/api/auth/session 返回 configured: false, authenticated: true
+        let res = warp::test::request()
+            .method("GET")
+            .path("/api/auth/session")
+            .reply(&routes)
+            .await;
+        assert_eq!(res.status(), 200);
+        let val: serde_json::Value = serde_json::from_slice(res.body()).unwrap();
+        assert_eq!(val["data"]["configured"], false);
+        assert_eq!(val["data"]["authenticated"], true);
+
+        // 2. 配置管理令牌
+        let set_res = warp::test::request()
+            .method("PUT")
+            .path("/api/settings/admin-token")
+            .json(&serde_json::json!({ "token": "admin-secret-pwd" }))
+            .reply(&routes)
+            .await;
+        assert_eq!(set_res.status(), 200);
+        let cookie_header = set_res
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie_header.contains("refract_session="));
+        assert!(cookie_header.contains("HttpOnly"));
+        assert!(cookie_header.contains("SameSite=Strict"));
+
+        // 3. 无 Cookie 访问受保护接口返回 401
+        let blocked = warp::test::request()
+            .method("GET")
+            .path("/api/settings/ip-limits")
+            .reply(&routes)
+            .await;
+        assert_eq!(blocked.status(), 401);
+
+        // 4. 携带生成的 Cookie 访问受保护接口成功
+        let session_val = cookie_header.split(';').next().unwrap();
+        let authed = warp::test::request()
+            .method("GET")
+            .path("/api/settings/ip-limits")
+            .header("cookie", session_val)
+            .reply(&routes)
+            .await;
+        assert_eq!(authed.status(), 200);
+
+        // 5. 错误 Token 登录被拒绝
+        let wrong_login = warp::test::request()
+            .method("POST")
+            .path("/api/auth/login")
+            .json(&serde_json::json!({ "token": "wrong-token" }))
+            .reply(&routes)
+            .await;
+        assert_eq!(wrong_login.status(), 401);
+
+        // 6. 正确 Token 登录成功并获取新 Cookie
+        let login_res = warp::test::request()
+            .method("POST")
+            .path("/api/auth/login")
+            .json(&serde_json::json!({ "token": "admin-secret-pwd" }))
+            .reply(&routes)
+            .await;
+        assert_eq!(login_res.status(), 200);
+        let new_cookie = login_res
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(new_cookie.contains("refract_session="));
+
+        // 7. 登出清除 Cookie
+        let logout_res = warp::test::request()
+            .method("POST")
+            .path("/api/auth/logout")
+            .reply(&routes)
+            .await;
+        assert_eq!(logout_res.status(), 200);
+        let clear_cookie = logout_res
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(clear_cookie.contains("refract_session="));
+        assert!(clear_cookie.contains("Max-Age=0"));
     }
 }

@@ -72,9 +72,6 @@ export class ApiError extends Error {
   }
 }
 
-/** 管理令牌存放的 localStorage 键。 */
-const TOKEN_KEY = 'refract.admin_token'
-
 /**
  * 管理 API 返回 401/403 时派发的事件名。
  *
@@ -99,17 +96,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/** 读取已保存的管理令牌。 */
-export function getAdminToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY)
-}
-
-/** 保存管理令牌；传 null 清除。 */
-export function setAdminToken(token: string | null): void {
-  if (token) localStorage.setItem(TOKEN_KEY, token)
-  else localStorage.removeItem(TOKEN_KEY)
-}
-
 /**
  * 管理 API 的成功响应统一被 `{ data: ... }` 包裹。
  *
@@ -123,9 +109,6 @@ interface Envelope<T> {
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {}
   if (body !== undefined) headers['content-type'] = 'application/json'
-
-  const token = getAdminToken()
-  if (token) headers['x-admin-token'] = token
 
   // 端到端传输加密：对所有向后端发送的写操作 Payload 自动走 Web Crypto 信封加密
   let finalBody = body
@@ -143,6 +126,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       response = await fetch(path, {
         method,
         headers,
+        credentials: 'same-origin',
         body: finalBody === undefined ? undefined : JSON.stringify(finalBody),
       })
     } catch (e) {
@@ -214,12 +198,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
  */
 export async function download(path: string, fallbackName: string): Promise<void> {
   const headers: Record<string, string> = {}
-  const token = getAdminToken()
-  if (token) headers['x-admin-token'] = token
 
   let response: Response
   try {
-    response = await fetch(path, { headers })
+    response = await fetch(path, { headers, credentials: 'same-origin' })
   } catch (e) {
     window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
     throw new ApiError(0, 'backend_unavailable', '后端不可达，请稍后重试', String(e))
@@ -384,6 +366,22 @@ export const settings = {
   setAdminToken: (token: string | null) =>
     request<{ configured: boolean }>('PUT', '/api/settings/admin-token', { token }),
 }
+
+/**
+ * 管理身份与会话认证。
+ *
+ * 采用 HttpOnly Session Cookie 进行会话保持，前端 JS 不在本地持久化明文令牌。
+ */
+export const auth = {
+  session: () =>
+    request<{ authenticated: boolean; configured: boolean; username: string | null }>(
+      'GET',
+      '/api/auth/session',
+    ),
+  login: (token: string) =>
+    request<{ authenticated: boolean; username: string }>('POST', '/api/auth/login', { token }),
+  logout: () => request<{ authenticated: boolean }>('POST', '/api/auth/logout'),
+}
 /**
  * 备份文件管理（自动备份与手动备份的产物）。
  *
@@ -434,11 +432,10 @@ export const models = {
 export const playground = {
   chat: (body: Record<string, unknown>): Promise<Response> => {
     const headers: Record<string, string> = { 'content-type': 'application/json' }
-    const token = getAdminToken()
-    if (token) headers['x-admin-token'] = token
     return fetch('/api/playground/chat', {
       method: 'POST',
       headers,
+      credentials: 'same-origin',
       body: JSON.stringify(body),
     })
   },

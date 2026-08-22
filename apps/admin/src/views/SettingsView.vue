@@ -18,10 +18,9 @@ import AppIcon from '@/components/AppIcon.vue'
 import {
   backup,
   type ImportResult,
+  auth as authApi,
   backups as backupsApi,
   data as dataApi,
-  getAdminToken,
-  setAdminToken as storeLocalToken,
   settings,
 } from '@/api/client'
 import type {
@@ -1017,22 +1016,26 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
 
 // ── 管理令牌 ──
 
-/** 本浏览器是否保存了令牌 —— 决定提示文案，也方便排查「为什么弹令牌框」。 */
-const hasLocalToken = ref(false)
+/** 当前会话状态 */
+const sessionActive = ref(true)
 const tokenDraft = ref('')
 const showTokenDraft = ref(false)
 const tokenBusy = ref(false)
 const tokenNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
 
-onMounted(() => {
-  hasLocalToken.value = getAdminToken() !== null
+onMounted(async () => {
+  try {
+    const s = await authApi.session()
+    sessionActive.value = s.authenticated
+  } catch {
+    /* 忽略探测错误 */
+  }
 })
 
 /**
  * 启用或更换服务端令牌。
  *
- * 成功后立刻把新令牌写入本地存储：设置令牌的响应本身不需要令牌，但**下一个**
- * 请求就需要了 —— 不存下来的话用户会被自己刚设置的鉴权立刻锁出去。
+ * 服务端在设置成功后会直接下发最新 Session Cookie，当前浏览器自动保持登录。
  */
 async function applyToken() {
   const token = tokenDraft.value.trim()
@@ -1041,11 +1044,10 @@ async function applyToken() {
   tokenNotice.value = null
   try {
     await settings.setAdminToken(token)
-    storeLocalToken(token)
-    hasLocalToken.value = true
+    sessionActive.value = true
     tokenDraft.value = ''
-    tokenNotice.value = { tone: 'success', text: '令牌已生效，本浏览器已保存。' }
-    toastStore.success('令牌已生效，本浏览器已保存。')
+    tokenNotice.value = { tone: 'success', text: '令牌已生效，会话已更新。' }
+    toastStore.success('令牌已生效，会话已更新。')
   } catch (e) {
     tokenNotice.value = {
       tone: 'danger',
@@ -1057,15 +1059,14 @@ async function applyToken() {
   }
 }
 
-/** 关闭管理鉴权：服务端清除令牌哈希，本地也一并清掉。 */
+/** 关闭管理鉴权：服务端清除令牌哈希与 Cookie。 */
 async function clearToken() {
   if (tokenBusy.value) return
   tokenBusy.value = true
   tokenNotice.value = null
   try {
     await settings.setAdminToken(null)
-    storeLocalToken(null)
-    hasLocalToken.value = false
+    sessionActive.value = true
     tokenNotice.value = { tone: 'success', text: '管理鉴权已关闭。' }
     toastStore.success('管理鉴权已关闭。')
   } catch (e) {
@@ -1074,6 +1075,20 @@ async function clearToken() {
       text: e instanceof Error ? e.message : '关闭失败',
     }
     toastStore.danger(tokenNotice.value.text)
+  } finally {
+    tokenBusy.value = false
+  }
+}
+
+/** 登出当前控制台会话 */
+async function logout() {
+  if (tokenBusy.value) return
+  tokenBusy.value = true
+  try {
+    await authApi.logout()
+    window.location.reload()
+  } catch (e) {
+    toastStore.danger(e instanceof Error ? e.message : '退出失败')
   } finally {
     tokenBusy.value = false
   }
@@ -2247,11 +2262,9 @@ async function runImport(payload: unknown) {
             <code class="font-mono text-ink-soft">refract-server --reset-admin</code> 重启实例。
           </p>
         </div>
-        <p class="text-xs">
-          <span v-if="hasLocalToken" class="text-success">本浏览器已保存令牌。</span>
-          <span v-else class="text-ink-faint">本浏览器未保存令牌。</span>
+        <p class="text-xs text-ink-faint">
+          会话通过安全 HttpOnly Cookie 维护，浏览器不持久化任何明文令牌。
         </p>
-
         <div class="relative">
           <input
             v-model="tokenDraft"
@@ -2290,6 +2303,14 @@ async function runImport(payload: unknown) {
           >
             <AppIcon v-if="tokenBusy" name="spinner" class="animate-spin mr-1" :size="14" />
             {{ tokenBusy ? '关闭中…' : '关闭管理鉴权' }}
+          </button>
+          <button
+            type="button"
+            class="glass-button-ghost px-4 py-2 text-sm text-ink-soft hover:text-ink"
+            :disabled="tokenBusy"
+            @click="logout"
+          >
+            退出登录
           </button>
         </div>
       </section>
