@@ -23,10 +23,10 @@ export const useDashboardStore = defineStore('dashboard', () => {
   const hours = ref(24)
 
   /** 各数据源的请求序号：快速切换时间窗口时，只让最新一次的结果落地。 */
-  let summarySeq = 0
-  let modelSeq = 0
-  let channelSeq = 0
-  let seriesSeq = 0
+  const summarySeq = { n: 0 }
+  const modelSeq = { n: 0 }
+  const channelSeq = { n: 0 }
+  const seriesSeq = { n: 0 }
 
   /** 成功率 0..1；无请求时视为 1，避免仪表盘出现 NaN。 */
   const successRate = computed(() => {
@@ -38,66 +38,68 @@ export const useDashboardStore = defineStore('dashboard', () => {
     () => (summary.value?.input_tokens ?? 0) + (summary.value?.output_tokens ?? 0),
   )
 
-  async function fetchSummary(windowHours?: number) {
-    if (windowHours !== undefined) hours.value = windowHours
-    const seq = ++summarySeq
+  async function fetchLatest<T>(
+    seq: { n: number },
+    task: () => Promise<T>,
+    apply: (data: T) => void,
+  ) {
+    const token = ++seq.n
     inflight.value += 1
     error.value = null
     try {
-      const data = await logs.summary(hours.value)
-      if (seq === summarySeq) summary.value = data
+      const data = await task()
+      if (token === seq.n) apply(data)
     } catch (e) {
-      if (seq === summarySeq) error.value = toErrorMessage(e)
+      if (token === seq.n) error.value = toErrorMessage(e)
     } finally {
       inflight.value -= 1
     }
+  }
+
+  async function fetchSummary(windowHours?: number) {
+    if (windowHours !== undefined) hours.value = windowHours
+    await fetchLatest(
+      summarySeq,
+      () => logs.summary(hours.value),
+      (data) => {
+        summary.value = data
+      },
+    )
   }
 
   async function fetchByModel(windowHours?: number) {
     if (windowHours !== undefined) hours.value = windowHours
-    const seq = ++modelSeq
-    inflight.value += 1
-    error.value = null
-    try {
-      const data = await logs.byModel(hours.value)
-      if (seq === modelSeq) byModel.value = data
-    } catch (e) {
-      if (seq === modelSeq) error.value = toErrorMessage(e)
-    } finally {
-      inflight.value -= 1
-    }
+    await fetchLatest(
+      modelSeq,
+      () => logs.byModel(hours.value),
+      (data) => {
+        byModel.value = data
+      },
+    )
   }
 
   async function fetchByChannel(windowHours?: number) {
     if (windowHours !== undefined) hours.value = windowHours
-    const seq = ++channelSeq
-    inflight.value += 1
-    error.value = null
-    try {
-      const data = await logs.byChannel(hours.value)
-      if (seq === channelSeq) byChannel.value = data
-    } catch (e) {
-      if (seq === channelSeq) error.value = toErrorMessage(e)
-    } finally {
-      inflight.value -= 1
-    }
+    await fetchLatest(
+      channelSeq,
+      () => logs.byChannel(hours.value),
+      (data) => {
+        byChannel.value = data
+      },
+    )
   }
 
   async function fetchTimeseries(windowHours?: number) {
     if (windowHours !== undefined) hours.value = windowHours
-    const seq = ++seriesSeq
-    inflight.value += 1
-    error.value = null
-    try {
-      // 窗口超过 48h 按天分桶，否则按小时 —— 桶数保持在可读范围。
-      const bucket = hours.value > 48 ? 'day' : 'hour'
-      const data = await logs.timeseries(hours.value, bucket)
-      if (seq === seriesSeq) timeseries.value = data
-    } catch (e) {
-      if (seq === seriesSeq) error.value = toErrorMessage(e)
-    } finally {
-      inflight.value -= 1
-    }
+    // 窗口超过 48h 按天分桶，否则按小时 —— 桶数保持在可读范围。
+    const bucket = hours.value > 48 ? 'day' : 'hour'
+    await fetchLatest(
+      seriesSeq,
+      () => logs.timeseries(hours.value, bucket),
+      (data) => {
+        timeseries.value = data
+      },
+    )
   }
 
   /** 页面挂载时调用：全部维度并行刷新。 */

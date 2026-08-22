@@ -20,6 +20,8 @@ import {
 } from 'reka-ui'
 import { useKeysStore } from '@/stores/keys'
 import { logs as logsApi } from '@/api/client'
+import { settle } from '@/utils/async'
+import { toErrorMessage } from '@/utils/error'
 import { numOr } from '@/utils/num'
 import type { ApiKey, KeyUsageStat, NewApiKey } from '@refract/contracts'
 
@@ -29,12 +31,8 @@ const store = useKeysStore()
 const usageByKey = ref<Map<number, KeyUsageStat>>(new Map())
 
 async function refreshUsage() {
-  try {
-    const stats = await logsApi.byKey(24)
-    usageByKey.value = new Map(stats.map((s) => [s.api_key_id, s]))
-  } catch {
-    usageByKey.value = new Map()
-  }
+  const stats = await settle(logsApi.byKey(24))
+  usageByKey.value = new Map((stats ?? []).map((s) => [s.api_key_id, s]))
 }
 
 /** 弹窗状态机：关闭 → 填表 → 展示明文。 */
@@ -161,7 +159,7 @@ async function submit() {
       dialog.value = 'created'
     }
   } catch (e) {
-    createError.value = e instanceof Error ? e.message : '保存失败'
+    createError.value = toErrorMessage(e, '保存失败')
   } finally {
     creating.value = false
   }
@@ -174,30 +172,19 @@ const deletingId = ref<number | null>(null)
 async function resetUsage(id: number) {
   if (resettingId.value !== null) return
   resettingId.value = id
-  try {
-    await store.resetUsage(id)
-  } catch {
-    // store.error 已记录，卡片上方会显示。
-  } finally {
-    resettingId.value = null
-  }
+  await settle(store.resetUsage(id))
+  resettingId.value = null
 }
 
 async function copyPlaintext() {
-  try {
-    await navigator.clipboard.writeText(plaintext.value)
-    copied.value = true
-  } catch {
-    // 剪贴板可能被浏览器策略拒绝（非 HTTPS 场景）。这时保持明文可见让用户手抄。
-    copied.value = false
-  }
+  copied.value = (await settle(navigator.clipboard.writeText(plaintext.value))) !== undefined
 }
 
 async function destroy(id: number) {
   if (deletingId.value !== null) return
   deletingId.value = id
   try {
-    await store.remove(id)
+    await settle(store.remove(id))
   } finally {
     deletingId.value = null
     pendingDelete.value = null
@@ -394,7 +381,7 @@ function isExpired(key: ApiKey): boolean {
               :model-value="key.enabled"
               :label="key.enabled ? `禁用 ${key.name}` : `启用 ${key.name}`"
               tone="success"
-              @update:model-value="store.toggleEnabled(key.id, $event).catch(() => {})"
+              @update:model-value="store.toggleEnabled(key.id, $event)"
             />
 
             <button

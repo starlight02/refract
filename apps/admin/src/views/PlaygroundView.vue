@@ -9,6 +9,8 @@
 import { computed, nextTick, onMounted, ref } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { models as modelsApi, playground } from '@/api/client'
+import { settle, tryParseJson } from '@/utils/async'
+import { toErrorMessage } from '@/utils/error'
 
 interface ChatTurn {
   role: 'user' | 'assistant'
@@ -28,12 +30,8 @@ const scroller = ref<HTMLElement | null>(null)
 let controller: AbortController | null = null
 
 onMounted(async () => {
-  try {
-    modelList.value = await modelsApi.list()
-    if (!model.value && modelList.value.length > 0) model.value = modelList.value[0]!
-  } catch {
-    modelList.value = []
-  }
+  modelList.value = (await settle(modelsApi.list())) ?? []
+  if (!model.value && modelList.value.length > 0) model.value = modelList.value[0]!
 })
 
 const canSend = computed(() => !busy.value && model.value !== '' && draft.value.trim() !== '')
@@ -52,15 +50,11 @@ function consumeSse(buffer: string, onDelta: (text: string) => void): string {
       if (!line.startsWith('data:')) continue
       const payload = line.slice(5).trim()
       if (payload === '' || payload === '[DONE]') continue
-      try {
-        const parsed = JSON.parse(payload) as {
-          choices?: { delta?: { content?: string | null } }[]
-        }
-        const delta = parsed.choices?.[0]?.delta?.content
-        if (delta) onDelta(delta)
-      } catch {
-        // 非 JSON 的注释帧（keep-alive）直接忽略。
-      }
+      const parsed = tryParseJson<{
+        choices?: { delta?: { content?: string | null } }[]
+      }>(payload)
+      const delta = parsed?.choices?.[0]?.delta?.content
+      if (delta) onDelta(delta)
     }
   }
   return rest
@@ -95,14 +89,8 @@ async function send() {
     })
     if (!response.ok) {
       const text = await response.text()
-      let message = `${response.status} ${response.statusText}`
-      try {
-        const parsed = JSON.parse(text) as { error?: { message?: string } }
-        if (parsed.error?.message) message = parsed.error.message
-      } catch {
-        if (text) message = text
-      }
-      reply.error = message
+      const parsed = tryParseJson<{ error?: { message?: string } }>(text)
+      reply.error = parsed?.error?.message || text || `${response.status} ${response.statusText}`
       return
     }
 
@@ -124,7 +112,7 @@ async function send() {
     }
   } catch (e) {
     if (!(e instanceof DOMException && e.name === 'AbortError')) {
-      reply.error = e instanceof Error ? e.message : '请求失败'
+      reply.error = toErrorMessage(e, '请求失败')
     }
   } finally {
     busy.value = false

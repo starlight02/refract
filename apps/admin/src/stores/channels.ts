@@ -8,7 +8,7 @@ import type {
   ChannelTestResult,
   UpstreamAddress,
 } from '@refract/contracts'
-import { toErrorMessage } from './shared'
+import { toErrorMessage, withLoading, withStoreError } from './shared'
 
 /**
  * 渠道列表及其全部增删改查动作。
@@ -27,52 +27,27 @@ export const useChannelsStore = defineStore('channels', () => {
   const options = computed(() => items.value.map((ch) => ({ id: ch.id, name: ch.name })))
 
   async function fetch() {
-    loading.value = true
-    error.value = null
-    try {
-      items.value = await channels.list()
-    } catch (e) {
-      error.value = toErrorMessage(e)
-    } finally {
-      loading.value = false
-    }
+    const rows = await withLoading(loading, error, () => channels.list())
+    if (rows) items.value = rows
   }
 
   async function create(ch: Channel): Promise<Channel> {
-    error.value = null
-    try {
-      const created = await channels.create(ch)
-      // 新建后直接并入列表：列表页不必再整页刷新，编辑页也能立即跳回。
-      items.value.push(created)
-      return created
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+    const created = await withStoreError(error, () => channels.create(ch))
+    // 新建后直接并入列表：列表页不必再整页刷新，编辑页也能立即跳回。
+    items.value.push(created)
+    return created
   }
 
   async function update(ch: Channel): Promise<Channel> {
-    error.value = null
-    try {
-      const updated = await channels.update(ch)
-      const i = items.value.findIndex((item) => item.id === updated.id)
-      if (i !== -1) items.value[i] = updated
-      return updated
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+    const updated = await withStoreError(error, () => channels.update(ch))
+    const i = items.value.findIndex((item) => item.id === updated.id)
+    if (i !== -1) items.value[i] = updated
+    return updated
   }
 
   async function remove(id: number) {
-    error.value = null
-    try {
-      await channels.remove(id)
-      items.value = items.value.filter((ch) => ch.id !== id)
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+    await withStoreError(error, () => channels.remove(id))
+    items.value = items.value.filter((ch) => ch.id !== id)
   }
 
   /**
@@ -94,67 +69,37 @@ export const useChannelsStore = defineStore('channels', () => {
   }
 
   /** 探测上游真实模型列表。返回结果让调用方决定是否一键同步。 */
-  async function probe(id: number, protocol?: Protocol): Promise<ProbeResult> {
-    error.value = null
-    try {
-      return await channels.probe(id, protocol)
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+  function probe(id: number, protocol?: Protocol): Promise<ProbeResult> {
+    return withStoreError(error, () => channels.probe(id, protocol))
   }
 
   /** 在未保存时直接按草稿参数探测上游真实模型列表。 */
-  async function probeDirect(spec: {
+  function probeDirect(spec: {
     protocol: Protocol
     address?: UpstreamAddress
     credential?: string | null
     proxy?: string | null
   }): Promise<ProbeResult> {
-    error.value = null
-    try {
-      return await channels.probeDirect(spec)
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+    return withStoreError(error, () => channels.probeDirect(spec))
   }
 
   /** 发最小真实请求验证渠道连通性。 */
-  async function test(id: number, protocol?: Protocol, model?: string): Promise<ChannelTestResult> {
-    error.value = null
-    try {
-      return await channels.test(id, protocol, model)
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+  function test(id: number, protocol?: Protocol, model?: string): Promise<ChannelTestResult> {
+    return withStoreError(error, () => channels.test(id, protocol, model))
   }
 
   /** 复制渠道。副本以禁用状态并入列表，等用户改完再启用。 */
   async function duplicate(id: number): Promise<Channel> {
-    error.value = null
-    try {
-      const copy = await channels.duplicate(id)
-      items.value.push(copy)
-      return copy
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+    const copy = await withStoreError(error, () => channels.duplicate(id))
+    items.value.push(copy)
+    return copy
   }
 
   /** 批量启用/禁用/删除。完成后整表重拉 —— 批量操作后的部分成功状态太多，重拉最可靠。 */
   async function bulk(ids: number[], action: 'enable' | 'disable' | 'delete'): Promise<number> {
-    error.value = null
-    try {
-      const { affected } = await channels.bulk(ids, action)
-      await fetch()
-      return affected
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+    const { affected } = await withStoreError(error, () => channels.bulk(ids, action))
+    await fetch()
+    return affected
   }
 
   return {

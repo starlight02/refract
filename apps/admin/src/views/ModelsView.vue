@@ -8,6 +8,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { settings as settingsApi } from '@/api/client'
 import { useChannelsStore } from '@/stores/channels'
+import { toErrorMessage } from '@/utils/error'
 import type { ModelPrice, Protocol } from '@refract/contracts'
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
@@ -26,7 +27,7 @@ onMounted(async () => {
       error.value = channelsStore.error
     }
   } catch (e) {
-    error.value = e instanceof Error ? e.message : '加载失败'
+    error.value = toErrorMessage(e, '加载失败')
   } finally {
     loading.value = false
   }

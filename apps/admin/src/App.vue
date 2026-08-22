@@ -12,6 +12,8 @@ import {
 import { AUTH_REQUIRED_EVENT, BACKEND_DOWN_EVENT, BACKEND_RESTORED_EVENT, auth } from '@/api/client'
 import AppIcon from '@/components/AppIcon.vue'
 import GlassToastContainer from '@/components/GlassToastContainer.vue'
+import { settle } from '@/utils/async'
+import { toErrorMessage } from '@/utils/error'
 import { initLiquidGlass } from '@/utils/liquidGlass'
 
 /** 深色模式偏好的存储键。 */
@@ -39,13 +41,9 @@ onMounted(async () => {
     (saved === null && window.matchMedia('(prefers-color-scheme: dark)').matches)
   applyTheme(dark)
 
-  try {
-    const sess = await auth.session()
-    if (sess.configured && !sess.authenticated) {
-      tokenDialogOpen.value = true
-    }
-  } catch {
-    /* 忽略初始化探测失败 */
+  const sess = await settle(auth.session())
+  if (sess?.configured && !sess.authenticated) {
+    tokenDialogOpen.value = true
   }
 })
 
@@ -53,7 +51,7 @@ onMounted(async () => {
  * 管理令牌失效弹窗。
  *
  * 任何一个管理 API 撞见 401/403 都会派发 AUTH_REQUIRED_EVENT。弹窗是唯一
- * 的恢复入口：填入令牌 → 存进 localStorage → 重新加载，让所有页面用新令牌
+ * 的恢复入口：填入令牌 → 换发 Session Cookie → 重新加载，让所有页面用新会话
  * 重新拉数据。不尝试「原地重试当前请求」—— 各页面都有自己的加载逻辑，
  * 整页重载最简单也最不容易留下半更新的状态。
  */
@@ -82,7 +80,7 @@ async function saveTokenAndReload() {
     tokenDialogOpen.value = false
     window.location.reload()
   } catch (e) {
-    tokenError.value = e instanceof Error ? e.message : '登录失败，请检查管理令牌'
+    tokenError.value = toErrorMessage(e, '登录失败，请检查管理令牌')
   } finally {
     tokenBusy.value = false
   }
@@ -114,14 +112,11 @@ function onBackendDown() {
   if (backendDown.value) return
   backendDown.value = true
   healthTimer = setInterval(async () => {
-    try {
-      const response = await fetch('/health/live')
-      if (response.ok) {
-        onBackendRestored()
-      }
-    } catch {
-      // 还没起来，下一轮再探。
-    }
+    const live = await fetch('/health/live').then(
+      (response) => response.ok,
+      () => false,
+    )
+    if (live) onBackendRestored()
   }, 1_500)
 }
 

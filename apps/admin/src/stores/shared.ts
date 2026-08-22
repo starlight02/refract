@@ -1,12 +1,52 @@
-import { ApiError } from '@/api/client'
+import type { Ref } from 'vue'
+import { toErrorMessage } from '@/utils/error'
+
+export { toErrorMessage }
+
+type CaptureOptions = { rethrow?: boolean }
 
 /**
- * 把任意异常转成适合展示的文案。
- * ApiError 自带后端语义化消息，直接透出；未知异常给出兜底文案。
- * 各 store 统一走这里，保证错误提示的语气一致。
+ * 把一次异步动作的失败写入 store.error。
+ *
+ * - 默认再抛出：表单/弹窗需要失败原因做内联提示。
+ * - `{ rethrow: false }`：查询类动作吞掉错误，只让横幅显示。
  */
-export function toErrorMessage(e: unknown): string {
-  if (e instanceof ApiError) return e.message
-  if (e instanceof Error) return e.message
-  return '发生未知错误'
+export async function withStoreError<T>(
+  error: Ref<string | null>,
+  task: () => Promise<T>,
+  options: { rethrow: false },
+): Promise<T | undefined>
+export async function withStoreError<T>(
+  error: Ref<string | null>,
+  task: () => Promise<T>,
+  options?: { rethrow?: true },
+): Promise<T>
+export async function withStoreError<T>(
+  error: Ref<string | null>,
+  task: () => Promise<T>,
+  options: CaptureOptions = {},
+): Promise<T | undefined> {
+  const rethrow = options.rethrow !== false
+  error.value = null
+  try {
+    return await task()
+  } catch (e) {
+    error.value = toErrorMessage(e)
+    if (rethrow) throw e
+    return undefined
+  }
+}
+
+/** 查询类动作：loading 包一层，失败只写 error、不抛。 */
+export async function withLoading<T>(
+  loading: Ref<boolean>,
+  error: Ref<string | null>,
+  task: () => Promise<T>,
+): Promise<T | undefined> {
+  loading.value = true
+  try {
+    return await withStoreError(error, task, { rethrow: false })
+  } finally {
+    loading.value = false
+  }
 }

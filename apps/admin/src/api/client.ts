@@ -41,6 +41,7 @@ import type {
   UpstreamAddress,
 } from '@refract/contracts'
 import { encryptPayload } from './crypto'
+import { tryParseJson } from '@/utils/async'
 
 /** 后端返回的错误信封。 */
 export interface ErrorEnvelope {
@@ -148,14 +149,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
       // 后端总是回 ErrorEnvelope，但网络层故障（502 网关页、连接重置）
       // 可能给出 HTML。解析失败时退回状态码文本，不能让 UI 崩在这里。
-      let envelope: ErrorEnvelope
-      try {
-        envelope = (await response.json()) as ErrorEnvelope
-      } catch {
-        envelope = {
-          code: 'network_error',
-          message: `${response.status} ${response.statusText}`,
-        }
+      const envelope: ErrorEnvelope = tryParseJson<ErrorEnvelope>(await response.text()) ?? {
+        code: 'network_error',
+        message: `${response.status} ${response.statusText}`,
       }
 
       // dev 代理在后端编译期间回结构化 503（见 vite.config.ts）。
@@ -211,12 +207,8 @@ export async function download(path: string, fallbackName: string): Promise<void
     if (response.status === 401 || response.status === 403) {
       window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
     }
-    let message = `${response.status} ${response.statusText}`
-    try {
-      message = ((await response.json()) as ErrorEnvelope).message ?? message
-    } catch {
-      /* 非 JSON 错误体：保留状态行 */
-    }
+    const body = tryParseJson<ErrorEnvelope>(await response.text())
+    const message = body?.message ?? `${response.status} ${response.statusText}`
     throw new ApiError(response.status, 'download_failed', message)
   }
 

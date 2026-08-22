@@ -32,6 +32,7 @@ import {
 import { useChannelsStore } from '@/stores/channels'
 import { channels as channelsApi } from '@/api/client'
 import { numOrNull, numOr } from '@/utils/num'
+import { toErrorMessage } from '@/utils/error'
 import type {
   Channel,
   ChannelEndpoint,
@@ -213,7 +214,7 @@ const paramOverrideError = computed(() => {
     }
     return null
   } catch (e) {
-    return e instanceof Error ? `JSON 解析失败：${e.message}` : 'JSON 解析失败'
+    return `JSON 解析失败：${toErrorMessage(e, '无效 JSON')}`
   }
 })
 
@@ -291,7 +292,7 @@ onMounted(async () => {
     }
     savedProbeConfig.value = probeConfigOf(ch, allCreds)
   } catch (e) {
-    saveError.value = e instanceof Error ? e.message : '加载渠道失败'
+    saveError.value = toErrorMessage(e, '加载渠道失败')
   } finally {
     loading.value = false
   }
@@ -517,8 +518,10 @@ async function openProbeDialog(ep: ChannelEndpoint) {
     probeDialog.value.selected = all
   } catch (e) {
     probeDialog.value.loading = false
-    probeDialog.value.error =
-      e instanceof Error ? e.message : '探测上游模型列表失败，请检查 Base URL 和密钥是否正确'
+    probeDialog.value.error = toErrorMessage(
+      e,
+      '探测上游模型列表失败，请检查 Base URL 和密钥是否正确',
+    )
   }
 }
 
@@ -659,7 +662,7 @@ async function save() {
     toastStore.success('渠道已保存')
     router.push('/channels')
   } catch (e) {
-    saveError.value = e instanceof Error ? e.message : '保存失败'
+    saveError.value = toErrorMessage(e, '保存失败')
     toastStore.danger(saveError.value)
     isSubmitting.value = false
   } finally {
@@ -676,7 +679,7 @@ async function destroy() {
     toastStore.success('渠道已删除')
     router.push('/channels')
   } catch (e) {
-    saveError.value = e instanceof Error ? e.message : '删除失败'
+    saveError.value = toErrorMessage(e, '删除失败')
     toastStore.danger(saveError.value)
     isSubmitting.value = false
   } finally {

@@ -13,6 +13,8 @@ import GlassSwitch from '@/components/GlassSwitch.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { useChannelsStore } from '@/stores/channels'
 import { channels as channelsApi, health as healthApi, settings } from '@/api/client'
+import { settle } from '@/utils/async'
+import { toErrorMessage } from '@/utils/error'
 import type {
   Channel,
   ChannelTestResult,
@@ -63,20 +65,13 @@ const sorted = computed(() =>
 
 onMounted(async () => {
   await Promise.all([store.fetch(), refreshHealth()])
-  try {
-    policy.value = await settings.routingPolicy()
-  } catch {
-    // 策略读不到不影响列表使用，静默降级。
-  }
+  const loaded = await settle(settings.routingPolicy())
+  if (loaded) policy.value = loaded
 })
 
 /** 拉取全量端点健康快照。失败静默 —— 健康是辅助信息，不该挡住渠道列表。 */
 async function refreshHealth() {
-  try {
-    healthItems.value = await healthApi.channels()
-  } catch {
-    healthItems.value = []
-  }
+  healthItems.value = (await settle(healthApi.channels())) ?? []
 }
 
 /** 健康快照此刻是否处于熔断中（到期时刻在未来才算）。 */
@@ -110,12 +105,9 @@ async function resetBreaker(h: EndpointHealth) {
   const key = `${h.channel_id}:${h.protocol}`
   resetting.value.add(key)
   try {
-    await healthApi.reset(h.channel_id, h.protocol)
-    await refreshHealth()
-  } catch {
-    // 解除失败时刷新一次快照，让界面与服务端保持一致再重试。
-    await refreshHealth()
+    await settle(healthApi.reset(h.channel_id, h.protocol))
   } finally {
+    await refreshHealth()
     resetting.value.delete(key)
   }
 }
@@ -128,7 +120,7 @@ async function setNativeFirst(nativeFirst: boolean) {
   try {
     policy.value = await settings.setRoutingPolicy(next)
   } catch (e) {
-    policyError.value = e instanceof Error ? e.message : '保存路由策略失败'
+    policyError.value = toErrorMessage(e, '保存路由策略失败')
   } finally {
     policySaving.value = false
   }
@@ -155,7 +147,7 @@ async function refreshBalance(ch: Channel) {
   } catch (e) {
     testResults.value[ch.id] = {
       success: false,
-      message: e instanceof Error ? `余额查询失败：${e.message}` : '余额查询失败',
+      message: toErrorMessage(e, '余额查询失败'),
     }
   } finally {
     balanceBusy.value[ch.id] = false
@@ -169,7 +161,7 @@ async function runTest(ch: Channel) {
   } catch (e) {
     testResults.value[ch.id] = {
       success: false,
-      message: e instanceof Error ? e.message : '测试失败',
+      message: toErrorMessage(e, '测试失败'),
     }
   }
 }
@@ -195,7 +187,7 @@ async function confirmDelete(id: number) {
   if (deletingId.value !== null) return
   deletingId.value = id
   try {
-    await store.remove(id)
+    await settle(store.remove(id))
     pendingDelete.value = null
   } finally {
     deletingId.value = null
@@ -207,8 +199,8 @@ async function duplicateChannel(id: number) {
   if (copyingId.value !== null) return
   copyingId.value = id
   try {
-    const copy = await store.duplicate(id)
-    router.push(`/channels/${copy.id}/edit`)
+    const copy = await settle(store.duplicate(id))
+    if (copy) router.push(`/channels/${copy.id}/edit`)
   } finally {
     copyingId.value = null
   }
@@ -253,12 +245,11 @@ async function runBulk(action: 'enable' | 'disable' | 'delete') {
   }
   bulkBusy.value = true
   try {
-    await store.bulk([...selected.value], action)
+    const affected = await settle(store.bulk([...selected.value], action))
+    if (affected === undefined) return
     selected.value = new Set()
     bulkConfirmDelete.value = false
     if (action === 'delete') selecting.value = false
-  } catch {
-    // store 已把错误写进 store.error，横幅会显示。
   } finally {
     bulkBusy.value = false
   }

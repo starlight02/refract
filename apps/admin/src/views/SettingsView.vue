@@ -6,8 +6,8 @@
  * 1. 路由策略 —— 是否原生优先、选择模式、最大重试次数。
  *    设计成「先调到满意再保存」，而不是「改一行就存一次」。
  * 2. 日志保留 —— 后台定时清理请求日志的周期。
- * 3. 管理令牌 —— 管理 API 的鉴权。启用后所有 /api 请求都要带令牌，
- *    所以设置成功的同时必须把令牌存进本浏览器，否则下一步请求就 401。
+ * 3. 管理令牌 —— 管理 API 的鉴权。启用后所有 /api 请求都要带会话，
+ *    设置成功时服务端会下发最新 Session Cookie，当前浏览器保持登录。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
@@ -23,6 +23,8 @@ import {
   data as dataApi,
   settings,
 } from '@/api/client'
+import { settle, tryParseJson } from '@/utils/async'
+import { toErrorMessage } from '@/utils/error'
 import type {
   AffinityKeySource,
   AffinityRule,
@@ -442,7 +444,7 @@ async function clearAffinityBindings() {
     toastStore.success(`已清除 ${res.cleared} 条绑定。`)
     await refreshAffinityStats()
   } catch (e) {
-    affinityNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '清除失败' }
+    affinityNotice.value = { tone: 'danger', text: toErrorMessage(e, '清除失败') }
     toastStore.danger(affinityNotice.value.text)
   } finally {
     affinityClearing.value = false
@@ -450,11 +452,16 @@ async function clearAffinityBindings() {
 }
 
 async function refreshAffinityStats() {
-  try {
-    affinityStats.value = await settings.affinityStats()
-  } catch {
-    affinityStats.value = null
-  }
+  affinityStats.value = (await settle(settings.affinityStats())) ?? null
+}
+
+function applySettled<T>(
+  result: PromiseSettledResult<T>,
+  section: string,
+  apply: (value: T) => void,
+) {
+  if (result.status === 'fulfilled') apply(result.value)
+  else sectionErrors.value[section] = toErrorMessage(result.reason, '加载失败')
 }
 
 async function reloadSection(section: string) {
@@ -512,7 +519,7 @@ async function reloadSection(section: string) {
         affinity.value = aff
         affinityRules.value = aff.rules.map(ruleToDraft)
         affinitySnapshot = JSON.stringify(affinityCurrent())
-        refreshAffinityStats().catch(() => {})
+        void refreshAffinityStats()
         break
       }
       case 'backup': {
@@ -533,7 +540,7 @@ async function reloadSection(section: string) {
       }
     }
   } catch (e) {
-    sectionErrors.value[section] = e instanceof Error ? e.message : '加载失败'
+    sectionErrors.value[section] = toErrorMessage(e, '加载失败')
   }
 }
 
@@ -584,109 +591,62 @@ onMounted(async () => {
       settings.masterKey(),
     ])
 
-    if (pRes.status === 'fulfilled') {
-      policy.value = pRes.value
-      policySnapshot = JSON.stringify(pRes.value)
-    } else {
-      sectionErrors.value.policy = pRes.reason instanceof Error ? pRes.reason.message : '加载失败'
-    }
-
-    if (retentionRes.status === 'fulfilled') {
-      retentionDays.value = retentionRes.value.days
-      retentionSnapshot = retentionRes.value.days
-    } else {
-      sectionErrors.value.retention =
-        retentionRes.reason instanceof Error ? retentionRes.reason.message : '加载失败'
-    }
-
-    if (bRes.status === 'fulfilled') {
-      breaker.value = bRes.value
-      breakerSnapshot = JSON.stringify(bRes.value)
-    } else {
-      sectionErrors.value.breaker = bRes.reason instanceof Error ? bRes.reason.message : '加载失败'
-    }
-
-    if (pricesRes.status === 'fulfilled') {
-      pricing.value = pricesRes.value
-      pricingSnapshot = JSON.stringify(pricesRes.value)
-    } else {
-      sectionErrors.value.pricing =
-        pricesRes.reason instanceof Error ? pricesRes.reason.message : '加载失败'
-    }
-
+    applySettled(pRes, 'policy', (p) => {
+      policy.value = p
+      policySnapshot = JSON.stringify(p)
+    })
+    applySettled(retentionRes, 'retention', (r) => {
+      retentionDays.value = r.days
+      retentionSnapshot = r.days
+    })
+    applySettled(bRes, 'breaker', (b) => {
+      breaker.value = b
+      breakerSnapshot = JSON.stringify(b)
+    })
+    applySettled(pricesRes, 'pricing', (pr) => {
+      pricing.value = pr
+      pricingSnapshot = JSON.stringify(pr)
+    })
     if (bodiesRes.status === 'fulfilled') {
       logBodies.value = bodiesRes.value.enabled
       logBodiesSnapshot = bodiesRes.value.enabled
     } else {
-      sectionErrors.value.retention =
-        sectionErrors.value.retention ||
-        (bodiesRes.reason instanceof Error ? bodiesRes.reason.message : '加载失败')
+      sectionErrors.value.retention ??= toErrorMessage(bodiesRes.reason, '加载失败')
     }
-
-    if (notifyRes.status === 'fulfilled') {
-      notify.value = { ...notifyRes.value, webhook_url: notifyRes.value.webhook_url ?? '' }
+    applySettled(notifyRes, 'notify', (n) => {
+      notify.value = { ...n, webhook_url: n.webhook_url ?? '' }
       notifySnapshot = JSON.stringify(notify.value)
-    } else {
-      sectionErrors.value.notify =
-        notifyRes.reason instanceof Error ? notifyRes.reason.message : '加载失败'
-    }
-
-    if (limitsRes.status === 'fulfilled') {
-      limits.value = limitsRes.value
-      limitsSnapshot = JSON.stringify(limitsRes.value)
-    } else {
-      sectionErrors.value.limits =
-        limitsRes.reason instanceof Error ? limitsRes.reason.message : '加载失败'
-    }
-
-    if (emptyRetryRes.status === 'fulfilled') {
-      emptyResponseRetry.value = emptyRetryRes.value
-      emptyResponseRetrySnapshot = JSON.stringify(emptyRetryRes.value)
-    } else {
-      sectionErrors.value.emptyRetry =
-        emptyRetryRes.reason instanceof Error ? emptyRetryRes.reason.message : '加载失败'
-    }
-
-    if (affRes.status === 'fulfilled') {
-      affinity.value = affRes.value
-      affinityRules.value = affRes.value.rules.map(ruleToDraft)
+    })
+    applySettled(limitsRes, 'limits', (l) => {
+      limits.value = l
+      limitsSnapshot = JSON.stringify(l)
+    })
+    applySettled(emptyRetryRes, 'emptyRetry', (er) => {
+      emptyResponseRetry.value = er
+      emptyResponseRetrySnapshot = JSON.stringify(er)
+    })
+    applySettled(affRes, 'affinity', (aff) => {
+      affinity.value = aff
+      affinityRules.value = aff.rules.map(ruleToDraft)
       affinitySnapshot = JSON.stringify(affinityCurrent())
-      refreshAffinityStats().catch(() => {})
-    } else {
-      sectionErrors.value.affinity =
-        affRes.reason instanceof Error ? affRes.reason.message : '加载失败'
-    }
-
+      void refreshAffinityStats()
+    })
     if (ipLimitsRes.status === 'fulfilled') {
       ipLimits.value = ipLimitsRes.value
       ipLimitsSnapshot = JSON.stringify(ipLimitsRes.value)
     } else {
-      sectionErrors.value.limits =
-        sectionErrors.value.limits ||
-        (ipLimitsRes.reason instanceof Error ? ipLimitsRes.reason.message : '加载失败')
+      sectionErrors.value.limits ??= toErrorMessage(ipLimitsRes.reason, '加载失败')
     }
-
-    if (backupRes.status === 'fulfilled') {
-      backupCfg.value = backupRes.value
-      backupSnapshot = JSON.stringify(backupRes.value)
-    } else {
-      sectionErrors.value.backup =
-        backupRes.reason instanceof Error ? backupRes.reason.message : '加载失败'
-    }
-
-    if (webhookSecretRes.status === 'fulfilled') {
-      webhookSecretConfigured.value = webhookSecretRes.value.configured
-    } else {
-      sectionErrors.value.webhookSecret =
-        webhookSecretRes.reason instanceof Error ? webhookSecretRes.reason.message : '加载失败'
-    }
-
-    if (masterKeyRes.status === 'fulfilled') {
-      masterKeyConfigured.value = masterKeyRes.value.configured
-    } else {
-      sectionErrors.value.masterKey =
-        masterKeyRes.reason instanceof Error ? masterKeyRes.reason.message : '加载失败'
-    }
+    applySettled(backupRes, 'backup', (b) => {
+      backupCfg.value = b
+      backupSnapshot = JSON.stringify(b)
+    })
+    applySettled(webhookSecretRes, 'webhookSecret', (ws) => {
+      webhookSecretConfigured.value = ws.configured
+    })
+    applySettled(masterKeyRes, 'masterKey', (mk) => {
+      masterKeyConfigured.value = mk.configured
+    })
 
     const allSettledList = [
       pRes,
@@ -707,12 +667,10 @@ onMounted(async () => {
       loadError.value = '全部设置项加载失败，请检查网络或后端状态'
     }
 
-    dataApi
-      .stats()
-      .then((stats) => (dbStats.value = stats))
-      .catch(() => {})
+    const stats = await settle(dataApi.stats())
+    if (stats) dbStats.value = stats
   } catch (e) {
-    loadError.value = e instanceof Error ? e.message : '加载失败'
+    loadError.value = toErrorMessage(e, '加载失败')
   } finally {
     loading.value = false
   }
@@ -831,12 +789,12 @@ async function save() {
       affinity.value = saved_
       affinityRules.value = saved_.rules.map(ruleToDraft)
       affinitySnapshot = JSON.stringify(affinityCurrent())
-      refreshAffinityStats().catch(() => {})
+      void refreshAffinityStats()
     }
     saved.value = true
     toastStore.success('已保存')
   } catch (e) {
-    saveError.value = e instanceof Error ? e.message : '保存失败'
+    saveError.value = toErrorMessage(e, '保存失败')
     toastStore.danger(saveError.value)
   } finally {
     saving.value = false
@@ -854,7 +812,7 @@ async function sendTestNotification() {
     await settings.testNotify()
     notifyTestResult.value = '已发送 —— 去通知渠道确认收到'
   } catch (e) {
-    notifyTestResult.value = e instanceof Error ? e.message : '发送失败'
+    notifyTestResult.value = toErrorMessage(e, '发送失败')
   } finally {
     notifyTesting.value = false
   }
@@ -886,7 +844,7 @@ async function applyWebhookSecret() {
   } catch (e) {
     webhookSecretNotice.value = {
       tone: 'danger',
-      text: e instanceof Error ? e.message : '保存失败',
+      text: toErrorMessage(e, '保存失败'),
     }
     toastStore.danger(webhookSecretNotice.value.text)
   } finally {
@@ -920,7 +878,7 @@ async function applyMasterKey() {
   } catch (e) {
     masterKeyNotice.value = {
       tone: 'danger',
-      text: e instanceof Error ? e.message : '保存失败',
+      text: toErrorMessage(e, '保存失败'),
     }
     toastStore.danger(masterKeyNotice.value.text)
   } finally {
@@ -941,10 +899,7 @@ const backupFileNotice = ref<{ tone: 'success' | 'danger'; text: string } | null
 async function refreshBackupFiles() {
   backupListLoading.value = true
   try {
-    backupFiles.value = await backupsApi.list()
-  } catch {
-    // 列表失败不阻塞整页：备份目录可能尚未创建。
-    backupFiles.value = []
+    backupFiles.value = (await settle(backupsApi.list())) ?? []
   } finally {
     backupListLoading.value = false
   }
@@ -961,8 +916,9 @@ async function createBackupFile() {
     toastStore.success(backupFileNotice.value.text)
     await refreshBackupFiles()
   } catch (e) {
-    backupFileNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '备份失败' }
+    backupFileNotice.value = { tone: 'danger', text: toErrorMessage(e, '备份失败') }
     toastStore.danger(backupFileNotice.value.text)
+  } finally {
     backupFileBusy.value = false
   }
 }
@@ -977,8 +933,9 @@ async function downloadBackupFile(name: string) {
     backupFileNotice.value = { tone: 'success', text: `已下载：${name}` }
     toastStore.success(backupFileNotice.value.text)
   } catch (e) {
-    backupFileNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '下载失败' }
+    backupFileNotice.value = { tone: 'danger', text: toErrorMessage(e, '下载失败') }
     toastStore.danger(backupFileNotice.value.text)
+  } finally {
     downloadingBackupName.value = null
   }
 }
@@ -994,14 +951,15 @@ async function deleteBackupFile(name: string) {
     toastStore.success(backupFileNotice.value.text)
     await refreshBackupFiles()
   } catch (e) {
-    backupFileNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '删除失败' }
+    backupFileNotice.value = { tone: 'danger', text: toErrorMessage(e, '删除失败') }
     toastStore.danger(backupFileNotice.value.text)
+  } finally {
     deletingBackupName.value = null
   }
 }
 
 onMounted(() => {
-  refreshBackupFiles().catch(() => {})
+  void refreshBackupFiles()
 })
 
 const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[] = [
@@ -1024,12 +982,8 @@ const tokenBusy = ref(false)
 const tokenNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
 
 onMounted(async () => {
-  try {
-    const s = await authApi.session()
-    sessionActive.value = s.authenticated
-  } catch {
-    /* 忽略探测错误 */
-  }
+  const s = await settle(authApi.session())
+  if (s) sessionActive.value = s.authenticated
 })
 
 /**
@@ -1051,7 +1005,7 @@ async function applyToken() {
   } catch (e) {
     tokenNotice.value = {
       tone: 'danger',
-      text: e instanceof Error ? e.message : '设置失败',
+      text: toErrorMessage(e, '设置失败'),
     }
     toastStore.danger(tokenNotice.value.text)
   } finally {
@@ -1072,7 +1026,7 @@ async function clearToken() {
   } catch (e) {
     tokenNotice.value = {
       tone: 'danger',
-      text: e instanceof Error ? e.message : '关闭失败',
+      text: toErrorMessage(e, '关闭失败'),
     }
     toastStore.danger(tokenNotice.value.text)
   } finally {
@@ -1088,7 +1042,7 @@ async function logout() {
     await authApi.logout()
     window.location.reload()
   } catch (e) {
-    toastStore.danger(e instanceof Error ? e.message : '退出失败')
+    toastStore.danger(toErrorMessage(e, '退出失败'))
   } finally {
     tokenBusy.value = false
   }
@@ -1125,8 +1079,9 @@ async function exportBackup() {
     }
     toastStore.success('备份已下载')
   } catch (e) {
-    backupNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '导出失败' }
+    backupNotice.value = { tone: 'danger', text: toErrorMessage(e, '导出失败') }
     toastStore.danger(backupNotice.value.text)
+  } finally {
     exportBusy.value = false
   }
 }
@@ -1146,8 +1101,9 @@ async function downloadDatabaseBackup() {
     }
     toastStore.success('数据库备份已下载')
   } catch (e) {
-    backupNotice.value = { tone: 'danger', text: e instanceof Error ? e.message : '备份失败' }
+    backupNotice.value = { tone: 'danger', text: toErrorMessage(e, '备份失败') }
     toastStore.danger(backupNotice.value.text)
+  } finally {
     dbBackupBusy.value = false
   }
 }
@@ -1165,10 +1121,8 @@ async function importBackup(event: Event) {
 
   backupNotice.value = null
   pendingReplace.value = null
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(await file.text())
-  } catch {
+  const parsed = tryParseJson(await file.text())
+  if (parsed === undefined) {
     backupNotice.value = { tone: 'danger', text: '文件不是有效的 JSON' }
     return
   }
@@ -1218,9 +1172,10 @@ async function runImport(payload: unknown) {
   } catch (e) {
     backupNotice.value = {
       tone: 'danger',
-      text: e instanceof Error ? e.message : '导入失败',
+      text: toErrorMessage(e, '导入失败'),
     }
     toastStore.danger(backupNotice.value.text)
+  } finally {
     importBusy.value = false
   }
 }

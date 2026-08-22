@@ -15,6 +15,8 @@ import AppIcon from '@/components/AppIcon.vue'
 import { useLogsStore } from '@/stores/logs'
 import { useChannelsStore } from '@/stores/channels'
 import { numOr } from '@/utils/num'
+import { tryParseJson } from '@/utils/async'
+import { toErrorMessage } from '@/utils/error'
 import { useToastStore } from '@/stores/toast'
 import { logs as logsApi } from '@/api/client'
 import {
@@ -152,7 +154,7 @@ async function exportAll() {
     await logsApi.export(store.filter)
     toastStore.success('日志导出已开始')
   } catch (e) {
-    exportNotice.value = e instanceof Error ? `导出失败：${e.message}` : '导出失败'
+    exportNotice.value = toErrorMessage(e, '导出失败')
     toastStore.danger(exportNotice.value)
   } finally {
     exportingAll.value = false
@@ -177,7 +179,7 @@ async function openDetail(id: number) {
   try {
     detail.value = await logsApi.get(id)
   } catch (e) {
-    detailError.value = e instanceof Error ? e.message : '加载失败'
+    detailError.value = toErrorMessage(e, '加载失败')
   } finally {
     detailLoading.value = false
     detailLoadingId.value = null
@@ -193,11 +195,8 @@ function closeDetail() {
 /** 尽力美化 JSON；不是 JSON（流式聚合文本）就原样展示。 */
 function pretty(raw?: string | null): string {
   if (!raw) return ''
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2)
-  } catch {
-    return raw
-  }
+  const parsed = tryParseJson(raw)
+  return parsed === undefined ? raw : JSON.stringify(parsed, null, 2)
 }
 
 function toggleRow(id: number) {
@@ -214,8 +213,8 @@ async function prune() {
     const removed = await store.prune(numOr(pruneDays.value, 30))
     pruneNotice.value = `已清理 ${removed} 条`
     toastStore.success(pruneNotice.value)
-  } catch {
-    pruneNotice.value = '清理失败'
+  } catch (e) {
+    pruneNotice.value = toErrorMessage(e, '清理失败')
     toastStore.danger(pruneNotice.value)
   } finally {
     pruning.value = false

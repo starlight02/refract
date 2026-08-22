@@ -2,7 +2,7 @@ import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import { logs } from '@/api/client'
 import type { RequestLog, LogFilter } from '@refract/contracts'
-import { toErrorMessage } from './shared'
+import { toErrorMessage, withStoreError } from './shared'
 
 /** 日志页默认一次取 100 条：再多滚动会卡，再少又不够一屏扫读。 */
 const DEFAULT_LIMIT = 100
@@ -44,15 +44,9 @@ export const useLogsStore = defineStore('logs', () => {
 
   /** 清理 N 天前的日志，返回删除条数，并按当前条件刷新列表。 */
   async function prune(days: number): Promise<number> {
-    error.value = null
-    try {
-      const { removed } = await logs.prune(days)
-      await fetch()
-      return removed
-    } catch (e) {
-      error.value = toErrorMessage(e)
-      throw e
-    }
+    const { removed } = await withStoreError(error, () => logs.prune(days))
+    await fetch()
+    return removed
   }
 
   return { items, loading, error, filter, fetch, prune }
