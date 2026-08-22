@@ -40,6 +40,7 @@ import type {
   StatsSummary,
   UpstreamAddress,
 } from '@refract/contracts'
+import { encryptPayload } from './crypto'
 
 /** 后端返回的错误信封。 */
 export interface ErrorEnvelope {
@@ -126,6 +127,12 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   const token = getAdminToken()
   if (token) headers['x-admin-token'] = token
 
+  // 端到端传输加密：对所有向后端发送的写操作 Payload 自动走 Web Crypto 信封加密
+  let finalBody = body
+  if (body !== undefined && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+    finalBody = await encryptPayload(body)
+  }
+
   // 后端不可达（dev 的 cargo 编译窗口、生产的服务重启）时，GET 自动重试
   // 到后端恢复为止 —— 打开着的页面不需要手动刷新。只重试 GET：这类失败
   // 意味着请求从未送达（连接被拒），但写操作仍交给用户显式重试更稳妥。
@@ -136,7 +143,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       response = await fetch(path, {
         method,
         headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body: finalBody === undefined ? undefined : JSON.stringify(finalBody),
       })
     } catch (e) {
       // fetch 本身抛错 = 连 vite/网关都没够到。与 503 同等对待。
@@ -377,7 +384,6 @@ export const settings = {
   setAdminToken: (token: string | null) =>
     request<{ configured: boolean }>('PUT', '/api/settings/admin-token', { token }),
 }
-
 /**
  * 备份文件管理（自动备份与手动备份的产物）。
  *

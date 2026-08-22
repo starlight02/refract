@@ -12,6 +12,10 @@ refract-router = { workspace = true }
 refract-store = { workspace = true }
 refract-upstream = { workspace = true }
 arc-swap = { workspace = true }
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+p256 = { workspace = true }
+hkdf = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }

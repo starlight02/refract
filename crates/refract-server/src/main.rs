@@ -8,9 +8,11 @@
 #![recursion_limit = "256"]
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use refract_api::AppState;
@@ -50,6 +52,8 @@ struct Config {
     proxy: Option<String>,
     /// 静态加密主密钥（32 字节 base64）。未设置时使用数据库 settings 表记录，或保持明文。
     master_key: Option<String>,
+    /// 是否强制重置管理员账号并重新生成初始凭据文件。
+    reset_admin: bool,
 }
 
 impl Default for Config {
@@ -64,19 +68,26 @@ impl Default for Config {
             shutdown_grace_secs: 30,
             proxy: None,
             master_key: None,
+            reset_admin: false,
         }
     }
 }
 
 impl Config {
     fn load() -> Result<Self> {
-        Figment::new()
+        let mut config: Self = Figment::new()
             .merge(Toml::file("refract.toml"))
             .merge(Env::prefixed("REFRACT_"))
             .extract()
-            .context("failed to load configuration")
-    }
+            .context("failed to load configuration")?;
 
+        // 命令行参数显式指定 `--reset-admin` 优先
+        let cli_reset = std::env::args().any(|arg| arg == "--reset-admin");
+        if cli_reset {
+            config.reset_admin = true;
+        }
+        Ok(config)
+    }
     fn upstream(&self) -> UpstreamClientConfig {
         UpstreamClientConfig {
             timeout: Duration::from_secs(self.upstream_timeout_secs),
@@ -194,23 +205,150 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// 把显式提供的启动令牌写成哈希，支持容器首次启动与声明式轮换。
+#[cfg(unix)]
+fn write_owner_only_file(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    let mut file = options.open(path)?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only_file(path: &Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(path, content)
+}
+
+/// 把显式提供的启动令牌或首次自生成的默认管理员凭据落库。
+///
+/// 首次启动且未显式指定管理令牌时：
+/// 1. 自动生成默认管理员账号 `admin@localhost` 与高熵随机 Token。
+/// 2. 将 SHA-256 哈希持久化至 settings 表，并置 `auth.initialized = true`。
+/// 3. 将明文写入数据目录下的 `.admin_token` 隐藏文件（权限限制为 0600）。
+/// 4. 启动后台异步任务，10 分钟后（TTL）自动删除 `.admin_token`。
+/// 5. 非首次启动绝不重新生成，且会自动清理遗留的 `.admin_token`。
 async fn apply_bootstrap_admin_token(config: &Config, state: &AppState) -> Result<()> {
-    let Some(token) = config
+    let settings = state.settings_repo();
+    let data_dir = Path::new(&config.database)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let token_file_path = data_dir.join(".admin_token");
+
+    let is_initialized = settings
+        .get::<bool>(refract_store::settings_repo::KEY_AUTH_INITIALIZED)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(false);
+
+    let force_reset = config.reset_admin;
+
+    if is_initialized && !force_reset {
+        // 非首次启动：检查并清理可能残留的 .admin_token 临时隐藏文件
+        if token_file_path.exists() {
+            let _ = tokio::fs::remove_file(&token_file_path).await;
+        }
+        return Ok(());
+    }
+
+    let generate_token = || {
+        use rand::RngExt as _;
+        let random_bytes: [u8; 32] = rand::rng().random();
+        format!(
+            "adm_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes)
+        )
+    };
+    let (admin_token, is_generated) = if force_reset {
+        (generate_token(), true)
+    } else if let Some(explicit) = config
         .admin_token
         .as_deref()
         .map(str::trim)
         .filter(|token| !token.is_empty())
-    else {
-        return Ok(());
+    {
+        (explicit.to_owned(), false)
+    } else {
+        (generate_token(), true)
     };
 
-    let hash = refract_store::ApiKeyRepo::hash(token);
-    state
-        .settings_repo()
+    let hash = refract_store::ApiKeyRepo::hash(&admin_token);
+    settings
         .set(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH, &hash)
         .await
-        .context("failed to persist the bootstrap admin token")
+        .context("failed to persist admin token hash")?;
+    settings
+        .set(
+            refract_store::settings_repo::KEY_ADMIN_USERNAME,
+            &"admin@localhost",
+        )
+        .await
+        .context("failed to persist admin username")?;
+    settings
+        .set(refract_store::settings_repo::KEY_AUTH_INITIALIZED, &true)
+        .await
+        .context("failed to mark auth as initialized")?;
+
+    if is_generated {
+        let now = chrono::Utc::now();
+        let expires_at = now + chrono::Duration::minutes(10);
+        let content = format!(
+            "# Refract Initial Bootstrap Admin Credentials\n\
+             # Generated at: {}\n\
+             # Expires at:   {}\n\
+             # NOTICE: This file is restricted to 0600 permissions and will be automatically deleted in 10 minutes (TTL).\n\n\
+             username=admin@localhost\n\
+             admin_token={}\n",
+            now.to_rfc3339(),
+            expires_at.to_rfc3339(),
+            admin_token
+        );
+
+        write_owner_only_file(&token_file_path, &content).with_context(|| {
+            format!(
+                "failed to write bootstrap token file to `{}`",
+                token_file_path.display()
+            )
+        })?;
+
+        println!(
+            "\n\
+            ╔══════════════════════════════════════════════════════════════════════════════════════╗\n\
+            ║ Refract Initial Bootstrap Admin Credentials Generated                                ║\n\
+            ║                                                                                      ║\n\
+            ║   Default Account: admin@localhost                                                   ║\n\
+            ║   Token File:      {:<69} ║\n\
+            ║   File Mode:       0600 (Owner read/write only)                                      ║\n\
+            ║   Valid For:       10 minutes (file will self-destruct after timeout)                ║\n\
+            ╚══════════════════════════════════════════════════════════════════════════════════════╝\n",
+            token_file_path.display()
+        );
+        tracing::info!(
+            account = "admin@localhost",
+            path = %token_file_path.display(),
+            ttl_minutes = 10,
+            "bootstrap admin credentials generated and written to hidden file (0600 permissions)"
+        );
+
+        let cleanup_path = token_file_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            if let Err(e) = tokio::fs::remove_file(&cleanup_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %cleanup_path.display(), %e, "failed to delete expired .admin_token file");
+                }
+            } else {
+                tracing::info!(path = %cleanup_path.display(), "bootstrap .admin_token file has been automatically removed (10m TTL expired)");
+            }
+        });
+    } else {
+        tracing::info!("admin token explicitly configured via environment/config");
+    }
+
+    Ok(())
 }
 
 async fn log_retention_loop(state: AppState) {
@@ -413,6 +551,11 @@ mod tests {
             )
             .await
             .unwrap();
+        state
+            .settings_repo()
+            .set(refract_store::settings_repo::KEY_AUTH_INITIALIZED, &true)
+            .await
+            .unwrap();
 
         apply_bootstrap_admin_token(&Config::default(), &state)
             .await
@@ -425,5 +568,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored, "existing-hash");
+    }
+
+    #[tokio::test]
+    async fn first_run_generates_admin_localhost_and_hidden_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("refract.db");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let client = UpstreamClient::new(Default::default()).unwrap();
+        let state = AppState::bootstrap(db, client, false).await.unwrap();
+
+        let config = Config {
+            database: db_path.to_str().unwrap().to_owned(),
+            ..Config::default()
+        };
+
+        // 首次运行：自动生成默认账号与 .admin_token 隐藏文件
+        apply_bootstrap_admin_token(&config, &state).await.unwrap();
+
+        let token_file = temp_dir.path().join(".admin_token");
+        assert!(
+            token_file.exists(),
+            ".admin_token hidden file must be created on first run"
+        );
+
+        let content = std::fs::read_to_string(&token_file).unwrap();
+        assert!(content.contains("username=admin@localhost"));
+        assert!(content.contains("admin_token=adm_"));
+
+        let username: String = state
+            .settings_repo()
+            .get(refract_store::settings_repo::KEY_ADMIN_USERNAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(username, "admin@localhost");
+
+        let is_init: bool = state
+            .settings_repo()
+            .get(refract_store::settings_repo::KEY_AUTH_INITIALIZED)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(is_init);
+
+        // 二次运行：不应重新生成，且遗留文件被清理
+        apply_bootstrap_admin_token(&config, &state).await.unwrap();
+        assert!(
+            !token_file.exists(),
+            "subsequent run must clean up any remaining .admin_token file"
+        );
+
+        // 强制 --reset-admin：应重新生成新 token
+        let reset_config = Config {
+            database: db_path.to_str().unwrap().to_owned(),
+            reset_admin: true,
+            ..Config::default()
+        };
+        apply_bootstrap_admin_token(&reset_config, &state)
+            .await
+            .unwrap();
+        assert!(
+            token_file.exists(),
+            "reset_admin must recreate .admin_token"
+        );
     }
 }

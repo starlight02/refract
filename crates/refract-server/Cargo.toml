@@ -11,8 +11,11 @@ refract-core = { workspace = true }
 refract-store = { workspace = true }
 refract-upstream = { workspace = true }
 anyhow = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
 figment = { workspace = true }
 mimalloc = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -20,5 +23,7 @@ tracing-subscriber = { workspace = true }
 # warp 0.4 的 `default = []`，`warp::serve` / `warp::Server` 在 `server` feature 后面。
 warp = { workspace = true, features = ["server"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
 [lints]
 workspace = true

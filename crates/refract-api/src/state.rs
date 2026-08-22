@@ -71,6 +71,7 @@ struct Inner {
     backup_settings: ArcSwap<refract_store::BackupSettings>,
     master_key: ArcSwap<Option<[u8; 32]>>,
     admin_guard: crate::auth::AdminGuard,
+    transport_crypto: crate::crypto::TransportCrypto,
 }
 
 /// 由限制值构造并发信号量。0 = 不限（None）。
@@ -172,10 +173,16 @@ impl AppState {
                 backup_settings: ArcSwap::from_pointee(backup_settings),
                 master_key: ArcSwap::from_pointee(master_key),
                 admin_guard: crate::auth::AdminGuard::new(),
+                transport_crypto: crate::crypto::TransportCrypto::new_random(),
             }),
         };
         crate::notify::spawn_event_worker(state.clone(), receiver);
         Ok(state)
+    }
+
+    /// 传输层端到端加密管理器。
+    pub fn transport_crypto(&self) -> &crate::crypto::TransportCrypto {
+        &self.inner.transport_crypto
     }
 
     /// 当前全局限制快照。

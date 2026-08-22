@@ -18,6 +18,10 @@ pub const KEY_ROUTING_POLICY: &str = "routing.policy";
 pub const KEY_BREAKER_POLICY: &str = "routing.breaker";
 /// 管理端令牌的设置键。
 pub const KEY_ADMIN_TOKEN_HASH: &str = "auth.admin_token_hash";
+/// 是否已完成初次初始化认证凭据。
+pub const KEY_AUTH_INITIALIZED: &str = "auth.initialized";
+/// 默认管理员账号名。
+pub const KEY_ADMIN_USERNAME: &str = "auth.admin_username";
 /// 日志保留天数。
 pub const KEY_LOG_RETENTION_DAYS: &str = "logs.retention_days";
 /// 上游请求默认超时（秒）。

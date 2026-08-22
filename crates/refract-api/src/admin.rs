@@ -38,12 +38,47 @@ struct Envelope<T> {
 /// 恶意耗尽内存，必须在 `warp::body::json` 聚合前拒绝。
 const ADMIN_BODY_LIMIT: u64 = 2 * 1024 * 1024;
 
-/// 带大小上限的管理 API JSON body。
-fn json_body<T>() -> impl Filter<Extract = (T,), Error = Rejection> + Copy
+/// 带大小上限与端到端解密支持的管理 API JSON body。
+///
+/// 若收到前端 Web Crypto 发送的加密信封（`EncryptedEnvelope`），
+/// 会在反序列化前自动使用服务端私钥通过 ECDH + AES-256-GCM 完成解密；
+/// 若收到普通未加密 JSON 则按原样解析，保证开发调试与测试脚本的兼容性。
+fn json_body<T>(state: AppState) -> impl Filter<Extract = (T,), Error = Rejection> + Clone
 where
-    T: DeserializeOwned + Send,
+    T: DeserializeOwned + Send + 'static,
 {
-    warp::body::content_length_limit(ADMIN_BODY_LIMIT).and(warp::body::json())
+    warp::body::content_length_limit(ADMIN_BODY_LIMIT)
+        .and(warp::body::bytes())
+        .and(with_state(state))
+        .and_then(|bytes: bytes::Bytes, state: AppState| async move {
+            if let Ok(envelope) = serde_json::from_slice::<crate::crypto::EncryptedEnvelope>(&bytes)
+                && envelope.__encrypted
+            {
+                let decrypted = state
+                    .transport_crypto()
+                    .decrypt_envelope(&envelope)
+                    .map_err(|e| {
+                        warp::reject::custom(ApiError(refract_core::GatewayError::new(
+                            refract_core::ErrorKind::InvalidRequest,
+                            format!("failed to decrypt transport payload: {e}"),
+                        )))
+                    })?;
+                let val = serde_json::from_slice::<T>(&decrypted).map_err(|e| {
+                    warp::reject::custom(ApiError(refract_core::GatewayError::new(
+                        refract_core::ErrorKind::InvalidRequest,
+                        format!("failed to parse decrypted JSON payload: {e}"),
+                    )))
+                })?;
+                return Ok(val);
+            }
+
+            serde_json::from_slice::<T>(&bytes).map_err(|e| {
+                warp::reject::custom(ApiError(refract_core::GatewayError::new(
+                    refract_core::ErrorKind::InvalidRequest,
+                    format!("invalid JSON payload: {e}"),
+                )))
+            })
+        })
 }
 
 /// 把仓储结果渲染成 JSON 响应。
@@ -169,25 +204,41 @@ fn restore_unchanged_credentials(existing: &Channel, incoming: &mut Channel) {
     }
 }
 
+/// 公开公钥端点：无需管理鉴权，供客户端协商传输层加密密钥。
+fn crypto(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
+    warp::path("crypto")
+        .and(warp::path("public-key"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(state))
+        .and_then(|state: AppState| async move {
+            let resp = state.transport_crypto().public_key_response();
+            ok(resp)
+        })
+        .boxed()
+}
+
 /// 装配管理路由。
 pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let auth = admin_auth(state.clone());
+    let crypto_route = crypto(state.clone());
+
+    let authenticated = auth.and(routes![
+        channels(state.clone()),
+        keys(state.clone()),
+        logs(state.clone()),
+        stats(state.clone()),
+        settings(state.clone()),
+        health(state.clone()),
+        backup(state.clone()),
+        backups(state.clone()),
+        playground(state.clone()),
+        data(state.clone()),
+        models(state),
+    ]);
 
     warp::path("api")
-        .and(auth)
-        .and(routes![
-            channels(state.clone()),
-            keys(state.clone()),
-            logs(state.clone()),
-            stats(state.clone()),
-            settings(state.clone()),
-            health(state.clone()),
-            backup(state.clone()),
-            backups(state.clone()),
-            playground(state.clone()),
-            data(state.clone()),
-            models(state),
-        ])
+        .and(crypto_route.or(authenticated).unify())
         .boxed()
 }
 
@@ -285,8 +336,7 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     // POST /api/channels
     let create = base
         .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|mut channel: Channel, state: AppState| async move {
             // 客户端传什么 owner_id 都无所谓 —— 服务端定。
@@ -323,7 +373,7 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path::param::<ChannelId>())
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |id: ChannelId, mut channel: Channel, state: AppState| async move {
@@ -373,7 +423,7 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("enabled"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |id: ChannelId, body: EnabledBody, state: AppState| async move {
@@ -391,7 +441,7 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("probe-direct"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|body: DirectProbeRequest, state: AppState| async move {
             let address = body.address.unwrap_or_default();
@@ -414,7 +464,7 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("probe"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(probe_state.clone()))
         .and(with_state(probe_state))
         .and_then(
             |id: ChannelId, body: EndpointRef, state: AppState| async move {
@@ -443,7 +493,7 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("test"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(test_state.clone()))
         .and(with_state(test_state))
         .and_then(
             |id: ChannelId, body: TestRequest, state: AppState| async move {
@@ -486,7 +536,7 @@ fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("bulk"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|body: BulkRequest, state: AppState| async move {
             let repo = state.channel_repo();
@@ -788,7 +838,7 @@ fn keys(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let create = base
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|spec: NewApiKey, state: AppState| async move {
             let (key, plaintext) = state
@@ -805,7 +855,7 @@ fn keys(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("enabled"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|id: i64, body: EnabledBody, state: AppState| async move {
             state
@@ -821,7 +871,7 @@ fn keys(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path::param::<i64>())
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |id: i64, spec: refract_store::NewApiKey, state: AppState| async move {
@@ -969,7 +1019,7 @@ fn logs(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("prune"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|body: PruneBody, state: AppState| async move {
             let removed = state.log_repo().prune(body.days).await.map_err(reject)?;
@@ -1166,7 +1216,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("routing"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|policy: RoutingPolicy, state: AppState| async move {
             state
@@ -1194,7 +1244,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("log-retention"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|body: LogRetentionBody, state: AppState| async move {
             state
@@ -1223,7 +1273,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("breaker"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |policy: refract_store::BreakerPolicy, state: AppState| async move {
@@ -1256,7 +1306,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("limits"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |limits: refract_store::GlobalLimits, state: AppState| async move {
@@ -1281,7 +1331,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("empty-response-retry"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |policy: refract_core::EmptyResponseRetryPolicy, state: AppState| async move {
@@ -1313,7 +1363,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("notify"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|body: NotifyBody, state: AppState| async move {
             state
@@ -1374,7 +1424,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("log-bodies"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|body: LogBodiesBody, state: AppState| async move {
             state
@@ -1400,7 +1450,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("pricing"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |prices: Vec<refract_store::ModelPrice>, state: AppState| async move {
@@ -1431,7 +1481,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("affinity"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |settings: refract_core::AffinitySettings, state: AppState| async move {
@@ -1474,11 +1524,12 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
 
     // 管理令牌只能写、不能读 —— 读接口等于把令牌泄漏给任何已经进来的人，
     // 而设置它的前提恰恰是「还没有令牌」。
+    // 管理令牌设置端点：PUT /api/settings/admin-token
     let set_token = base
         .and(warp::path("admin-token"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|body: AdminTokenBody, state: AppState| async move {
             let repo = state.settings_repo();
@@ -1486,6 +1537,9 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                 Some(token) => {
                     let hash = refract_store::ApiKeyRepo::hash(&token);
                     repo.set(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH, &hash)
+                        .await
+                        .map_err(reject)?;
+                    repo.set(refract_store::settings_repo::KEY_AUTH_INITIALIZED, &true)
                         .await
                         .map_err(reject)?;
                     ok(serde_json::json!({ "configured": true }))
@@ -1514,7 +1568,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("ip-limits"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |limits: refract_store::IpLimits, state: AppState| async move {
@@ -1546,7 +1600,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("webhook-secret"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(|body: WebhookSecretBody, state: AppState| async move {
             state
@@ -1577,7 +1631,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("backup"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state.clone()))
         .and_then(
             |settings: refract_store::BackupSettings, state: AppState| async move {
@@ -1605,7 +1659,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and(warp::path("master-key"))
         .and(warp::path::end())
         .and(warp::put())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state))
         .and_then(|body: MasterKeyBody, state: AppState| async move {
             match body.key.filter(|k| !k.trim().is_empty()) {
@@ -1899,7 +1953,7 @@ fn backup(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
     let import = warp::path("import")
         .and(warp::path::end())
         .and(warp::post())
-        .and(json_body())
+        .and(json_body(state.clone()))
         .and(with_state(state))
         .and_then(|req: ImportRequest, state: AppState| async move {
             import_document(req, &state).await
@@ -3191,5 +3245,98 @@ mod tests {
             .reply(&crate::routes(state))
             .await;
         assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn public_key_endpoint_is_public_and_enables_e2e_envelope_decryption() {
+        use aes_gcm::aead::{Aead as _, KeyInit as _};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        use base64::Engine as _;
+        use p256::elliptic_curve::rand_core::OsRng;
+        use p256::elliptic_curve::sec1::{FromEncodedPoint as _, ToEncodedPoint as _};
+        use p256::{EncodedPoint, PublicKey, SecretKey};
+
+        let state = test_state().await;
+
+        // 1. GET /api/crypto/public-key 无需鉴权即可访问
+        let pk_res = warp::test::request()
+            .method("GET")
+            .path("/api/crypto/public-key")
+            .reply(&crate::routes(state.clone()))
+            .await;
+        assert_eq!(pk_res.status(), 200);
+
+        let pk_json: serde_json::Value = serde_json::from_slice(pk_res.body()).unwrap();
+        let server_pub_raw_b64 = pk_json["data"]["public_key_raw"].as_str().unwrap();
+
+        // 2. 模拟前端 Web Crypto: 生成客户端临时密钥对并协商共享密钥
+        let client_secret = SecretKey::random(&mut OsRng);
+        let client_pub = client_secret.public_key();
+        let client_pub_b64 = base64::engine::general_purpose::STANDARD
+            .encode(client_pub.to_encoded_point(false).as_bytes());
+
+        let server_pub_bytes = base64::engine::general_purpose::STANDARD
+            .decode(server_pub_raw_b64)
+            .unwrap();
+        let server_point = EncodedPoint::from_bytes(&server_pub_bytes).unwrap();
+        let server_pub = PublicKey::from_encoded_point(&server_point).unwrap();
+
+        let client_shared =
+            p256::ecdh::diffie_hellman(client_secret.to_nonzero_scalar(), server_pub.as_affine());
+        let client_shared_bytes = client_shared.raw_secret_bytes();
+
+        let channel_payload = serde_json::json!({
+            "name": "encrypted-e2e-channel",
+            "kind": "chat",
+            "credential": "sk-secret-from-browser-e2e",
+            "endpoints": [{ "protocol": "chat", "models": [{"name": "gpt-4o"}] }]
+        });
+        let plaintext = serde_json::to_vec(&channel_payload).unwrap();
+        let iv_bytes = [42u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(client_shared_bytes.as_ref()).unwrap();
+        let ciphertext_bytes = cipher
+            .encrypt(&Nonce::from(iv_bytes), plaintext.as_slice())
+            .unwrap();
+
+        let envelope = serde_json::json!({
+            "__encrypted": true,
+            "ephemeral_pub": client_pub_b64,
+            "iv": base64::engine::general_purpose::STANDARD.encode(iv_bytes),
+            "ciphertext": base64::engine::general_purpose::STANDARD.encode(ciphertext_bytes),
+        });
+
+        // 4. POST /api/channels 发送加密信封
+        let create_res = warp::test::request()
+            .method("POST")
+            .path("/api/channels")
+            .json(&envelope)
+            .reply(&crate::routes(state.clone()))
+            .await;
+        if create_res.status() != 200 {
+            panic!(
+                "create failed with status {}: {}",
+                create_res.status(),
+                String::from_utf8_lossy(create_res.body())
+            );
+        }
+
+        let created_json: serde_json::Value = serde_json::from_slice(create_res.body()).unwrap();
+        assert_eq!(created_json["data"]["name"], "encrypted-e2e-channel");
+        // 返回数据已被脱敏
+        assert!(
+            created_json["data"]["credential"]
+                .as_str()
+                .unwrap()
+                .contains('…')
+        );
+
+        // 5. 校验数据库中实际存入了真实的明文（在内存中透明解密）
+        let channel_id = created_json["data"]["id"].as_i64().unwrap();
+        let stored = state
+            .channel_repo()
+            .get(refract_core::DEFAULT_OWNER_ID, channel_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.credential.expose(), "sk-secret-from-browser-e2e");
     }
 }

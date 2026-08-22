@@ -305,33 +305,50 @@ const version = __APP_VERSION__
         <DialogContent
           class="glass-thick glass-specular fixed top-1/2 left-1/2 z-50 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 p-6 outline-none"
         >
-          <DialogTitle class="text-lg font-semibold">需要管理令牌</DialogTitle>
+          <DialogTitle class="text-lg font-semibold">管理端身份验证</DialogTitle>
           <DialogDescription class="mt-1 text-xs text-ink-faint">
-            服务端开启了管理鉴权，当前保存的令牌缺失或无效。填入令牌后页面将重新加载。
+            服务端已开启管理鉴权。首次启动可在数据目录下的
+            <code class="font-mono text-ink-soft">.admin_token</code>
+            隐藏文件查看初始凭据（10分钟有效）。
           </DialogDescription>
 
           <form class="mt-5 flex flex-col gap-4" @submit.prevent="saveTokenAndReload">
-            <div class="relative">
+            <div>
+              <label class="mb-1 block text-xs font-medium text-ink-soft">管理员账号</label>
               <input
-                v-model="tokenDraft"
-                :type="showToken ? 'text' : 'password'"
-                placeholder="管理令牌"
-                autocomplete="current-password"
-                autofocus
-                aria-label="管理令牌"
-                class="glass-field w-full px-3 py-2 pr-16 font-mono text-sm outline-none"
+                type="text"
+                value="admin@localhost"
+                readonly
+                disabled
+                class="glass-field w-full cursor-not-allowed bg-ink/5 px-3 py-2 text-sm text-ink-faint outline-none"
               />
-              <button
-                type="button"
-                class="absolute top-1/2 right-2 -translate-y-1/2 rounded-md px-2 py-1 text-xs text-ink-faint hover:text-ink"
-                :aria-label="showToken ? '隐藏管理令牌' : '显示管理令牌'"
-                :aria-pressed="showToken"
-                @click="showToken = !showToken"
-              >
-                {{ showToken ? '隐藏' : '显示' }}
-              </button>
             </div>
 
+            <div>
+              <label class="mb-1 block text-xs font-medium text-ink-soft"
+                >管理令牌 (Admin Token)</label
+              >
+              <div class="relative">
+                <input
+                  v-model="tokenDraft"
+                  :type="showToken ? 'text' : 'password'"
+                  placeholder="adm_... 或自定义管理令牌"
+                  autocomplete="current-password"
+                  autofocus
+                  aria-label="管理令牌"
+                  class="glass-field w-full px-3 py-2 pr-16 font-mono text-sm outline-none"
+                />
+                <button
+                  type="button"
+                  class="absolute top-1/2 right-2 -translate-y-1/2 rounded-md px-2 py-1 text-xs text-ink-faint hover:text-ink"
+                  :aria-label="showToken ? '隐藏管理令牌' : '显示管理令牌'"
+                  :aria-pressed="showToken"
+                  @click="showToken = !showToken"
+                >
+                  {{ showToken ? '隐藏' : '显示' }}
+                </button>
+              </div>
+            </div>
             <div class="flex items-center gap-3">
               <button
                 type="submit"
@@ -348,6 +365,17 @@ const version = __APP_VERSION__
               >
                 取消
               </button>
+            </div>
+
+            <div class="mt-2 rounded-lg border border-ink/8 bg-ink/5 p-3 text-xs text-ink-faint">
+              <div class="font-medium text-ink-soft mb-1 flex items-center gap-1.5">
+                <AppIcon name="info" :size="13" />
+                <span>超时或丢失令牌？如何重新初始化：</span>
+              </div>
+              <p class="leading-relaxed">
+                在服务器或 Docker 容器中执行：<br />
+                <code class="font-mono text-ink-soft select-all">refract-server --reset-admin</code>
+              </p>
             </div>
           </form>
         </DialogContent>

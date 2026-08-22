@@ -2236,12 +2236,17 @@ async function runImport(payload: unknown) {
             重试
           </button>
         </div>
-        <h2 class="text-sm font-semibold text-ink-soft uppercase">管理令牌</h2>
-        <p class="text-xs text-ink-faint">
-          启用后，管理界面与 /api 的所有请求都需要携带该令牌。服务端只保存哈希， 令牌本身无法读回 ——
-          忘记或丢失时只能在此重新设置覆盖。
-        </p>
-
+        <div>
+          <h2 class="text-sm font-semibold text-ink-soft uppercase">管理身份与令牌</h2>
+          <p class="mt-1 text-xs text-ink-faint">
+            默认管理员账号为
+            <code class="font-mono text-ink-soft">admin@localhost</code>。启用后管理界面与 /api
+            的所有请求都需要携带该令牌。服务端只保存哈希，令牌本身无法读回。首次凭据保存在数据目录的
+            <code class="font-mono text-ink-soft">.admin_token</code> 文件中，10 分钟后自动删除；
+            若令牌丢失或文件过期，必须在宿主机或容器内使用
+            <code class="font-mono text-ink-soft">refract-server --reset-admin</code> 重启实例。
+          </p>
+        </div>
         <p class="text-xs">
           <span v-if="hasLocalToken" class="text-success">本浏览器已保存令牌。</span>
           <span v-else class="text-ink-faint">本浏览器未保存令牌。</span>
