@@ -24,7 +24,7 @@ Aggregate channels can express things new-api cannot: *"My relay offers both Ope
 
 ## Core features
 
-- **Protocol transcoding**: all four protocols convert through a unified IR (hub-and-spoke, not pairwise). Native requests only decode the `model`/`stream` routing fields; the full IR is built only for transcoding. With no alias or parameter override, request, response, and SSE bytes pass through unchanged. Each endpoint explicitly declares accepted inbound protocols.
+- **Protocol transcoding**: all four protocols convert through a unified IR (hub-and-spoke, not pairwise). Native requests only decode the `model`/`stream` routing fields; the full IR is built only for transcoding. With no alias or parameter override, request, response, and SSE bytes pass through unchanged. Each endpoint explicitly declares accepted inbound protocols. Transcoding is lossy for Anthropic block-level `cache_control` (same-protocol passthrough keeps it) and does not preserve `logprobs`.
 - **Flexible address construction**: each channel/endpoint can toggle "unofficial address" (custom base URL + version prefix + path, joined in three segments) and "full address" (the final URL is used verbatim — no joining, no validation).
 - **Per-endpoint configuration**: each protocol endpoint of an aggregate channel has its own address, credential, model set (with `alias=upstream_name` mapping), transcode policy, and priority order.
 - **Native-first routing**: a global switch. Off: routing semantics match new-api (pure priority). On: native protocol endpoints always outrank transcoded ones.
@@ -40,7 +40,7 @@ Aggregate channels can express things new-api cannot: *"My relay offers both Ope
 - **Operational probes & metrics**: public `/health/live`, `/health/ready`; Prometheus text-format `/metrics` requires the management token when one is configured.
 - **Configuration and database backup**: export/import channels, gateway keys and settings as one JSON document; restored keys keep working across instances. Merge and replace import modes. Settings also exposes database size statistics and an online SQLite backup.
 - **Single-binary deployment**: the built frontend is embedded into the binary; deploying is copying one file.
-- **Designed for one user, not hard-wired to one user**: every business table carries `owner_id`, authentication is a trait — adding multi-user later doesn't touch business logic.
+- **Designed for one user, not hard-wired to one user**: every business table carries `owner_id`, authentication is a trait — adding multi-user later doesn't touch business logic. Out of scope on purpose: multi-user accounts, payments, vendor-specific channel enums, Redis/multi-instance coordination, OpenAI files/batches/assistants, and a public homepage login.
 
 ## Quick start
 
@@ -103,7 +103,7 @@ Compose binds the host port to loopback only, runs as a non-root user with a rea
 | `POST /v1/rerank` | Cohere/Jina-shaped rerank (passthrough) |
 | `POST /v1/messages/count_tokens` | Anthropic token counting (passthrough to messages endpoints) |
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting (passthrough to gemini endpoints) |
-| `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` | OpenAI and Gemini model discovery (derived from enabled channels) |
+| `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` · `/v1beta/models/{id}` | OpenAI and Gemini model discovery (derived from enabled channels) |
 | `GET /v1/realtime?model=...` (WebSocket) | OpenAI Realtime native WebSocket bridge |
 | `GET /metrics` | Prometheus metrics (management-token protected when configured; health probes stay public) |
 

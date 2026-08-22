@@ -171,7 +171,7 @@ trait StreamCodec {
 
 ### 4.2 统一 IR 设计要点
 
-IR 必须是四种协议的**并集**而非交集，否则转换必然有损。无法映射的字段进 `extensions: Map<String, Value>`，由目标编码器决定丢弃还是尽力还原。
+IR 必须是四种协议的**并集**而非交集，否则转换必然有损。无法映射的字段进 `extensions: Map<String, Value>`，由目标编码器决定丢弃还是尽力还原。已知例外：Anthropic `cache_control` 只在 messages→messages 用原文 extension 保真，跨协议会丢失 block 级缓存断点；转码路径不保证 `logprobs`（Responses 流式编码器会写空数组）。
 
 ```rust
 struct UnifiedRequest {
@@ -265,11 +265,11 @@ Chat 端点的 `{base}{prefix}` 推导为 `/realtime`；完整地址只接受明
 ## 5. Crate 划分
 
 ```
-refract-core      领域模型、配置、错误、ID、时间。无 IO 依赖。
+refract-core      领域模型、错误、ID、时间。无 IO 依赖。进程配置由 refract-server 用 figment 加载。
 refract-protocol  IR + 四协议 codec + 流式转码器。依赖 core。纯函数，易测。
-refract-store     SQLite 持久化 + 仓储 trait。依赖 core。
+refract-store     SQLite 持久化 + 具体仓储类型（ChannelRepo 等）。依赖 core。
 refract-upstream  HTTP 客户端、地址解析、凭据注入、SSE 解析。依赖 core+protocol。
-refract-router    候选收集、排序、加权随机、重试、熔断、健康度。依赖 core+store。
+refract-router    候选收集、排序、加权随机、重试、熔断、健康度、执行器。依赖 core+protocol+store+upstream。
 refract-api       warp filter：网关端点 + 管理 REST。依赖全部。
 refract-server    二进制：配置加载、装配、嵌入前端、优雅关闭。
 ```
@@ -283,7 +283,7 @@ refract-server    二进制：配置加载、装配、嵌入前端、优雅关�
 - 所有业务表**预留 `owner_id INTEGER NOT NULL DEFAULT 1`** 列，当前恒为 1。
 - 网关鉴权抽象为 `Authenticator`，产出 `Principal { owner_id, scopes, api_key }`。当前 `SingleUserAuthenticator` 校验网关 API key；管理令牌是独立的管理面凭据，避免推理密钥获得配置权限。未来可替换认证器而不改 Warp 路由与授权判断。
 - 仓储层所有查询方法**都带 `owner_id` 参数**，当前传常量。
-- 配额字段在 schema 中就位（`quota`, `used_quota`），鉴权时强制检查，成功请求按实际用量累计。
+- 配额字段在 schema 中就位（`quota`, `used_quota`），鉴权时强制检查，成功请求按实际用量累计。`auth.admin_username` 会在 bootstrap 写入，当前会话响应仍硬编码 `admin@localhost`，该键尚未参与鉴权。
 
 这样加多用户 = 加一张 users 表 + 换一个 Authenticator 实现 + 放开 owner_id 来源，不动业务逻辑。
 
@@ -294,7 +294,7 @@ refract-server    二进制：配置加载、装配、嵌入前端、优雅关�
 - **网关单 IP 速率限制**：在各协议入口前按客户端 IP 维持自然分钟窗口，支持独立的 RPM 上限约束。
 - **单请求上游调用总预算**：`RoutingPolicy` 配置 `max_upstream_calls`，由执行器在所有重试、密钥轮换与空回复重发点统一计数，防止请求产生无界扇出。
 - **数据库与备份权限收紧**：新创建的 SQLite 库文件与目录强制设为 `0600`/`0700` 权限；定时自动备份与手动备份产物统一受此约束。
-- **Webhook HMAC 签名**：配置 `notify.webhook_secret` 时，所有告警推送请求附带 `X-Refract-Signature: sha256=<hex>` 标头。
+- **Webhook HMAC 签名**：配置 `notify.webhook_secret` 时，所有告警推送请求附带 `X-Refract-Signature: sha256=<hex>` 标头。管理面 JSON 写操作走信封加密；Playground 为消费 SSE 走原始字节，不经该信封。
 
 ## 7. 前端
 

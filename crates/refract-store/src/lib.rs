@@ -1,6 +1,6 @@
 //! 持久化层。
 //!
-//! SQLite 存储 + 仓储接口。所有查询方法都带 `owner_id` 参数（当前恒为
+//! SQLite 存储 + 具体仓储类型。所有查询方法都带 `owner_id` 参数（当前恒为
 //! [`refract_core::DEFAULT_OWNER_ID`]），为将来的多用户预留。
 
 // lint 配置统一在 workspace `Cargo.toml` 的 [workspace.lints] 里维护。

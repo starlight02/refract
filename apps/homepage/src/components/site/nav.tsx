@@ -1,11 +1,7 @@
-import { Link } from '@tanstack/react-router'
 import { Menu, X } from 'lucide-react'
 import { useState } from 'react'
-import { signOut } from '@/lib/auth/client'
-import { useCurrentUserState } from '@/lib/auth/use-current-user'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
-import { Button } from '@/components/ui/button'
 import { Wordmark } from './logo'
 
 const GITHUB = 'https://github.com/starlight02/refract'
@@ -51,7 +47,6 @@ export function SiteNav() {
           >
             GitHub
           </a>
-          <AuthSlot signIn={t.nav.signIn} signOutLabel={t.nav.signOut} />
           <button
             type="button"
             className="inline-flex size-11 items-center justify-center rounded-full text-fg lg:hidden"
@@ -123,41 +118,5 @@ function LangSwitch({
         中文
       </button>
     </div>
-  )
-}
-
-function AuthSlot({ signIn, signOutLabel }: { signIn: string; signOutLabel: string }) {
-  const { user, isPending } = useCurrentUserState()
-
-  if (isPending) {
-    return <div className="h-9 w-16 rounded-full bg-fg/8" aria-hidden="true" />
-  }
-
-  if (user) {
-    const label = user.displayName ?? user.primaryEmail ?? 'Account'
-    return (
-      <div className="flex items-center gap-2">
-        {user.profileImageUrl ? (
-          <img src={user.profileImageUrl} alt="" className="size-8 rounded-full object-cover" />
-        ) : (
-          <span className="grid size-8 place-items-center rounded-full bg-fg/10 font-mono text-xs">
-            {label.charAt(0).toUpperCase()}
-          </span>
-        )}
-        <button
-          type="button"
-          onClick={() => void signOut()}
-          className="hidden h-9 text-sm text-muted transition-colors hover:text-fg sm:inline"
-        >
-          {signOutLabel}
-        </button>
-      </div>
-    )
-  }
-
-  return (
-    <Button asChild variant="outline" size="sm">
-      <Link to="/login">{signIn}</Link>
-    </Button>
   )
 }

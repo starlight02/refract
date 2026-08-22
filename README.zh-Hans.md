@@ -24,7 +24,7 @@ Refract 的模型是：**渠道类型 = 协议**。只有五种：
 
 ## 核心特性
 
-- **协议转换**：四协议经统一 IR 互转（中枢辐射，非点对点）。原生请求只读取 `model`/`stream` 路由字段，完整 IR 仅在转换时构造；无别名和参数覆盖时，请求、响应与 SSE 原始字节直通。每个端点单独声明接受哪些协议的转换，未授权的转换直接报错。
+- **协议转换**：四协议经统一 IR 互转（中枢辐射，非点对点）。原生请求只读取 `model`/`stream` 路由字段，完整 IR 仅在转换时构造；无别名和参数覆盖时，请求、响应与 SSE 原始字节直通。每个端点单独声明接受哪些协议的转换，未授权的转换直接报错。转码会丢失 Anthropic 的 block 级 `cache_control`（同协议直通保留），也不保证 `logprobs`。
 - **灵活的地址构造**：每个渠道/端点可开关「非官方地址」（自定义 base URL + 版本前缀 + 路径三段拼接）与「完整地址」（最终 URL 原样使用，不拼接不校验）。
 - **端点级配置**：聚合渠道的每个协议端点有独立的地址、密钥、模型集（支持 `别名=上游名` 映射）、协议转换策略和优先顺序。
 - **原生优先路由**：全局开关。关闭时路由语义与 new-api 一致（纯优先级）；打开时原生协议端点始终压过转换端点。
@@ -40,7 +40,7 @@ Refract 的模型是：**渠道类型 = 协议**。只有五种：
 - **运维探针与指标**：公开的 `/health/live`、`/health/ready`；Prometheus 文本格式的 `/metrics` 在配置管理令牌后需凭证访问。
 - **配置与数据库备份**：一个 JSON 文件导出/导入全部渠道、网关密钥与设置，跨实例迁移后原密钥继续可用；支持合并与替换。设置页还能查看数据库体积并在线生成 SQLite 备份。
 - **单二进制部署**：前端编译产物内嵌进二进制，部署只需拷贝一个文件。
-- **为单用户设计，不为单用户焊死**：所有业务表预留 `owner_id`，鉴权是 trait，将来加多用户不需要动业务逻辑。
+- **为单用户设计，不为单用户焊死**：所有业务表预留 `owner_id`，鉴权是 trait，将来加多用户不需要动业务逻辑。刻意不做：多用户账号、支付、按厂商枚举渠道、Redis/多实例、OpenAI files/batches/assistants、公开首页登录。
 
 ## 快速开始
 
@@ -103,7 +103,7 @@ Compose 默认仅把端口映射到宿主机回环地址，容器内以非 root�
 | `POST /v1/rerank` | Cohere/Jina 形状的重排序（透传） |
 | `POST /v1/messages/count_tokens` | Anthropic token 计数（透传到 messages 端点） |
 | `POST /v1beta/models/{model}:countTokens` | Gemini token 计数（透传到 gemini 端点） |
-| `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` | OpenAI 与 Gemini 模型发现（由启用渠道派生） |
+| `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` · `/v1beta/models/{id}` | OpenAI 与 Gemini 模型发现（由启用渠道派生） |
 | `GET /v1/realtime?model=...`（WebSocket） | OpenAI Realtime 原生 WebSocket 桥接 |
 | `GET /metrics` | Prometheus 指标（配置管理令牌后需凭证；健康探针保持公开） |
 

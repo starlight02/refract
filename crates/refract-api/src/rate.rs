@@ -18,6 +18,9 @@ use std::sync::Mutex;
 /// 0 永远不会被占用 —— 全局 RPM/TPM 与每密钥限速因此共用一张表、共用一把锁。
 pub const GLOBAL_WINDOW_KEY: i64 = 0;
 
+/// 进程内窗口表上限。超出后丢掉非当前分钟的条目，避免删掉的密钥 ID 永驻。
+const MAX_WINDOWS: usize = 10_000;
+
 /// 每密钥的分钟窗口计数器。
 ///
 /// 锁而非无锁结构：限流检查在鉴权之后、路由之前，每请求一次，个人网关的
@@ -83,6 +86,7 @@ impl RateLimiter {
         let minute = now / 60;
         let retry_after_secs = 60 - (now % 60);
         let mut windows = self.windows.lock().expect("rate windows lock");
+        prune_stale_windows(&mut windows, minute);
         let window = windows.entry(key_id).or_insert(Window {
             minute,
             requests: 0,
@@ -111,6 +115,11 @@ impl RateLimiter {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn window_count(&self) -> usize {
+        self.windows.lock().expect("rate windows lock").len()
+    }
+
     /// 请求完成后把 token 用量计入当前窗口。
     pub fn add_tokens(&self, key_id: i64, tokens: u64) {
         if tokens == 0 {
@@ -122,6 +131,7 @@ impl RateLimiter {
     fn add_tokens_at(&self, key_id: i64, tokens: u64, now: u64) {
         let minute = now / 60;
         let mut windows = self.windows.lock().expect("rate windows lock");
+        prune_stale_windows(&mut windows, minute);
         let window = windows.entry(key_id).or_insert(Window {
             minute,
             requests: 0,
@@ -189,6 +199,12 @@ impl IpRateLimiter {
     }
 }
 
+fn prune_stale_windows(windows: &mut HashMap<i64, Window>, minute: u64) {
+    if windows.len() > MAX_WINDOWS {
+        windows.retain(|_, window| window.minute == minute);
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -253,5 +269,17 @@ mod tests {
         limiter.add_tokens_at(1, 7, 120);
         // 120s 窗口里只有 7 个 token，tpm=10 仍应放行。
         limiter.admit_at(1, 0, 10, 121).unwrap();
+    }
+
+    #[test]
+    fn stale_key_windows_are_pruned_when_the_table_grows() {
+        let limiter = RateLimiter::new();
+        for key in 1..=MAX_WINDOWS as i64 + 1 {
+            limiter.admit_at(key, 1, 0, 60).unwrap();
+        }
+        assert!(limiter.window_count() > MAX_WINDOWS);
+
+        limiter.admit_at(i64::MAX, 1, 0, 120).unwrap();
+        assert!(limiter.window_count() <= MAX_WINDOWS);
     }
 }

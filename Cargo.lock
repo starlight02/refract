@@ -2031,7 +2031,6 @@ name = "refract-core"
 version = "0.3.0"
 dependencies = [
  "chrono",
- "figment",
  "pretty_assertions",
  "rand 0.10.2",
  "rstest",
@@ -2116,7 +2115,6 @@ version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
- "async-trait",
  "base64 0.23.1",
  "chrono",
  "pretty_assertions",

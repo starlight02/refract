@@ -10,8 +10,6 @@ use sqlx::Row;
 use crate::db::{Database, StoreError};
 use crate::health_repo::BreakerPolicy;
 
-/// 「原生优先」开关的设置键（需求 6）。
-pub const KEY_NATIVE_FIRST: &str = "routing.native_first";
 /// 路由策略的设置键。
 pub const KEY_ROUTING_POLICY: &str = "routing.policy";
 /// 熔断策略的设置键。
@@ -24,8 +22,6 @@ pub const KEY_AUTH_INITIALIZED: &str = "auth.initialized";
 pub const KEY_ADMIN_USERNAME: &str = "auth.admin_username";
 /// 日志保留天数。
 pub const KEY_LOG_RETENTION_DAYS: &str = "logs.retention_days";
-/// 上游请求默认超时（秒）。
-pub const KEY_DEFAULT_TIMEOUT_SECS: &str = "upstream.default_timeout_secs";
 /// 模型价表。
 pub const KEY_PRICING: &str = "billing.pricing";
 /// 是否把请求/响应正文快照写进请求日志。
@@ -545,19 +541,13 @@ mod tests {
     #[tokio::test]
     async fn set_then_get_roundtrips_a_bool() {
         let repo = repo().await;
-        assert_eq!(repo.get::<bool>(KEY_NATIVE_FIRST).await.unwrap(), None);
+        assert_eq!(repo.get::<bool>(KEY_LOG_BODIES).await.unwrap(), None);
 
-        repo.set(KEY_NATIVE_FIRST, &true).await.unwrap();
-        assert_eq!(
-            repo.get::<bool>(KEY_NATIVE_FIRST).await.unwrap(),
-            Some(true)
-        );
+        repo.set(KEY_LOG_BODIES, &true).await.unwrap();
+        assert_eq!(repo.get::<bool>(KEY_LOG_BODIES).await.unwrap(), Some(true));
 
-        repo.set(KEY_NATIVE_FIRST, &false).await.unwrap();
-        assert_eq!(
-            repo.get::<bool>(KEY_NATIVE_FIRST).await.unwrap(),
-            Some(false)
-        );
+        repo.set(KEY_LOG_BODIES, &false).await.unwrap();
+        assert_eq!(repo.get::<bool>(KEY_LOG_BODIES).await.unwrap(), Some(false));
     }
 
     #[tokio::test]
@@ -813,18 +803,18 @@ mod tests {
     #[tokio::test]
     async fn all_returns_sorted_keys() {
         let repo = repo().await;
-        repo.set(KEY_NATIVE_FIRST, &true).await.unwrap();
-        repo.set(KEY_DEFAULT_TIMEOUT_SECS, &120_u32).await.unwrap();
+        repo.set(KEY_LOG_BODIES, &true).await.unwrap();
+        repo.set(KEY_LOG_RETENTION_DAYS, &30_u32).await.unwrap();
 
         let all = repo.all().await.unwrap();
         let keys: Vec<&str> = all.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
-            vec![KEY_NATIVE_FIRST, KEY_DEFAULT_TIMEOUT_SECS]
+            vec![KEY_LOG_BODIES, KEY_LOG_RETENTION_DAYS]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         );
     }
 

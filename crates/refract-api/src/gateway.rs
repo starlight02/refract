@@ -116,9 +116,10 @@ pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         gemini(state.clone()),
         json_pass,
         multipart_pass,
-        get_model(state.clone()),
+        list_models(state.clone()),
         list_models_gemini(state.clone()),
-        list_models(state),
+        get_model(state.clone()),
+        get_model_gemini(state),
     ]
 }
 
@@ -701,6 +702,40 @@ fn list_models_gemini(state: AppState) -> BoxedFilter<(warp::reply::Response,)> 
                 warp::reply::json(&serde_json::json!({ "models": models })).into_response(),
             )
         })
+        .boxed()
+}
+
+/// `GET /v1beta/models/{model}` —— Gemini 单模型查询。
+///
+/// 官方 SDK 启动时会打这个端点；只实现清单会让单模型探测落到 POST 路由上吃 405。
+fn get_model_gemini(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
+    // 必须先匹配 GET：同一路径前缀还承载 POST :generateContent。
+    // 若先吃路径再 protocol_method(GET)，自定义 405 不会落到后面的 POST 路由。
+    warp::get()
+        .and(warp::path!("v1beta" / "models" / ..))
+        .and(warp::path::tail())
+        .and(authenticate(state.authenticator(), Protocol::Gemini))
+        .and(with_state(state))
+        .and_then(
+            |tail: warp::path::Tail, principal: Principal, state: AppState| async move {
+                let raw = tail.as_str().trim_matches('/');
+                let model = raw.strip_prefix("models/").unwrap_or(raw).to_owned();
+                if model.is_empty() || !visible_model_names(&state, &principal).contains(&model) {
+                    return Err(ProtocolRejection::reject(
+                        GatewayError::not_found(format!("model `{model}` does not exist")),
+                        Protocol::Gemini,
+                    ));
+                }
+                Ok::<_, Rejection>(
+                    warp::reply::json(&serde_json::json!({
+                        "name": format!("models/{model}"),
+                        "displayName": model,
+                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+                    }))
+                    .into_response(),
+                )
+            },
+        )
         .boxed()
 }
 
@@ -2535,6 +2570,39 @@ mod tests {
         assert_eq!(gemini.status(), 200);
         let body: Value = serde_json::from_slice(gemini.body()).unwrap();
         assert_eq!(body["models"][0]["name"], "models/gpt-4o");
+
+        let listed = warp::test::request()
+            .method("GET")
+            .path("/v1/models")
+            .reply(&api)
+            .await;
+        assert_eq!(listed.status(), 200);
+        let body: Value = serde_json::from_slice(listed.body()).unwrap();
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["data"][0]["id"], "gpt-4o");
+
+        let gemini_one = warp::test::request()
+            .method("GET")
+            .path("/v1beta/models/gpt-4o")
+            .reply(&api)
+            .await;
+        assert_eq!(gemini_one.status(), 200);
+        let body: Value = serde_json::from_slice(gemini_one.body()).unwrap();
+        assert_eq!(body["name"], "models/gpt-4o");
+
+        let gemini_prefixed = warp::test::request()
+            .method("GET")
+            .path("/v1beta/models/models/gpt-4o")
+            .reply(&api)
+            .await;
+        assert_eq!(gemini_prefixed.status(), 200);
+
+        let gemini_missing = warp::test::request()
+            .method("GET")
+            .path("/v1beta/models/ghost")
+            .reply(&api)
+            .await;
+        assert_eq!(gemini_missing.status(), 404);
     }
 
     #[tokio::test]

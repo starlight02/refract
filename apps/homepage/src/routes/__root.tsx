@@ -1,5 +1,4 @@
 import { createRootRoute, Outlet } from '@tanstack/react-router'
-import { AuthProvider } from '@/lib/auth/provider'
 import { Atmosphere } from '@/components/site/atmosphere'
 import { I18nProvider } from '@/lib/i18n'
 import '@/styles.css'
@@ -10,11 +9,9 @@ export const Route = createRootRoute({
 
 function RootDocument() {
   return (
-    <AuthProvider>
-      <I18nProvider>
-        <Atmosphere />
-        <Outlet />
-      </I18nProvider>
-    </AuthProvider>
+    <I18nProvider>
+      <Atmosphere />
+      <Outlet />
+    </I18nProvider>
   )
 }
