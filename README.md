@@ -79,7 +79,7 @@ Or run the production container with Compose:
 
 ```sh
 cp .env.example .env
-# Replace REFRACT_ADMIN_TOKEN in .env
+# First boot writes /data/.admin_token inside the container (10 minutes).
 docker compose up -d --build
 curl --fail http://127.0.0.1:3939/health/ready
 ```
@@ -105,7 +105,7 @@ Compose binds the host port to loopback only, runs as a non-root user with a rea
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting (passthrough to gemini endpoints) |
 | `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` · `/v1beta/models/{id}` | OpenAI and Gemini model discovery (derived from enabled channels) |
 | `GET /v1/realtime?model=...` (WebSocket) | OpenAI Realtime native WebSocket bridge |
-| `GET /metrics` | Prometheus metrics (management-token protected when configured; health probes stay public) |
+| `GET /metrics` | Prometheus metrics (management-token protected; health probes stay public) |
 
 Both streaming and non-streaming are supported. Gateway endpoints send permissive CORS headers so browser-based clients can call them directly. The admin UI lives under `/api/...`, uses a separate credential system from the gateway endpoints, and deliberately sends **no** CORS headers — the management surface is same-origin only.
 
@@ -122,7 +122,6 @@ Realtime is likewise native-only: it selects a healthy Chat endpoint, applies mo
 | `listen` | `127.0.0.1:3939` | Listen address. Localhost-only by default |
 | `database` | `refract.db` | SQLite file path |
 | `require_auth` | `false` | Whether gateway endpoints require an API key |
-| `admin_token` | none | Set or rotate the admin token at startup; inject it with `REFRACT_ADMIN_TOKEN` |
 | `upstream_timeout_secs` | `300` | Overall upstream request timeout (non-streaming) |
 | `stream_idle_timeout_secs` | `120` | Streaming: max wait for response headers, then max gap between frames |
 | `shutdown_grace_secs` | `30` | Graceful shutdown window before in-flight connections are aborted |
@@ -132,7 +131,9 @@ Realtime is likewise native-only: it selects a healthy Chat endpoint, applies mo
 
 Routing policy (`max_attempts`, `max_upstream_calls`, native-first, selection) is runtime-tunable in the admin UI, not a `refract.toml` key.
 
-**Security note**: the service refuses a non-loopback listener unless an admin token is configured and `require_auth=true`. `REFRACT_ADMIN_TOKEN` declaratively sets that token on every start; never commit its plaintext value.
+**First boot**: the server always issues a random `adm_…` management token and writes it to `<data-dir>/.admin_token` (mode 0600, deleted after 10 minutes). The admin UI requires that token. Compose: `docker compose exec refract cat /data/.admin_token`. Lost the file? Restart with `--reset-admin`.
+
+**Security note**: the service refuses a non-loopback listener unless a management token is present and `require_auth=true`. Never commit the plaintext token.
 
 ## Development
 

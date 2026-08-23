@@ -40,8 +40,6 @@ struct Config {
     database: String,
     /// 是否要求客户端携带网关密钥。
     require_auth: bool,
-    /// 启动时设置或轮换管理令牌。只保存哈希，明文不进入日志或数据库。
-    admin_token: Option<String>,
     /// 上游请求整体超时（秒）。
     upstream_timeout_secs: u64,
     /// 流式请求的空闲超时（秒）。
@@ -62,7 +60,6 @@ impl Default for Config {
             listen: SocketAddr::from(([127, 0, 0, 1], 3939)),
             database: "refract.db".to_owned(),
             require_auth: false,
-            admin_token: None,
             upstream_timeout_secs: 300,
             stream_idle_timeout_secs: 120,
             shutdown_grace_secs: 30,
@@ -222,14 +219,15 @@ fn write_owner_only_file(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
-/// 把显式提供的启动令牌或首次自生成的默认管理员凭据落库。
+/// 首次启动或 `--reset-admin` 时签发管理令牌。
 ///
-/// 首次启动且未显式指定管理令牌时：
-/// 1. 自动生成默认管理员账号 `admin@localhost` 与高熵随机 Token。
-/// 2. 将 SHA-256 哈希持久化至 settings 表，并置 `auth.initialized = true`。
-/// 3. 将明文写入数据目录下的 `.admin_token` 隐藏文件（权限限制为 0600）。
-/// 4. 启动后台异步任务，10 分钟后（TTL）自动删除 `.admin_token`。
-/// 5. 非首次启动绝不重新生成，且会自动清理遗留的 `.admin_token`。
+/// 1. 生成 `admin@localhost` 与高熵随机 `adm_…`。
+/// 2. 哈希写入 settings，并置 `auth.initialized = true`。
+/// 3. 明文写入数据目录 `.admin_token`（0600）。
+/// 4. 10 分钟后删除该文件。
+/// 5. 已初始化且未 `--reset-admin` 时不改库，只清残留文件。
+///
+/// 不接受环境变量或 toml 覆盖：能改启动配置的人已经能读库。
 async fn apply_bootstrap_admin_token(config: &Config, state: &AppState) -> Result<()> {
     let settings = state.settings_repo();
     let data_dir = Path::new(&config.database)
@@ -244,36 +242,21 @@ async fn apply_bootstrap_admin_token(config: &Config, state: &AppState) -> Resul
         .unwrap_or(None)
         .unwrap_or(false);
 
-    let force_reset = config.reset_admin;
-
-    if is_initialized && !force_reset {
-        // 非首次启动：检查并清理可能残留的 .admin_token 临时隐藏文件
+    if is_initialized && !config.reset_admin {
         if token_file_path.exists() {
             let _ = tokio::fs::remove_file(&token_file_path).await;
         }
         return Ok(());
     }
 
-    let generate_token = || {
+    let random_bytes: [u8; 32] = {
         use rand::RngExt as _;
-        let random_bytes: [u8; 32] = rand::rng().random();
-        format!(
-            "adm_{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes)
-        )
+        rand::rng().random()
     };
-    let (admin_token, is_generated) = if force_reset {
-        (generate_token(), true)
-    } else if let Some(explicit) = config
-        .admin_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        (explicit.to_owned(), false)
-    } else {
-        (generate_token(), true)
-    };
+    let admin_token = format!(
+        "adm_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes)
+    );
 
     let hash = refract_store::ApiKeyRepo::hash(&admin_token);
     settings
@@ -281,61 +264,57 @@ async fn apply_bootstrap_admin_token(config: &Config, state: &AppState) -> Resul
         .await
         .context("failed to persist bootstrap admin credentials")?;
 
-    if is_generated {
-        let now = chrono::Utc::now();
-        let expires_at = now + chrono::Duration::minutes(10);
-        let content = format!(
-            "# Refract Initial Bootstrap Admin Credentials\n\
-             # Generated at: {}\n\
-             # Expires at:   {}\n\
-             # NOTICE: This file is restricted to 0600 permissions and will be automatically deleted in 10 minutes (TTL).\n\n\
-             username=admin@localhost\n\
-             admin_token={}\n",
-            now.to_rfc3339(),
-            expires_at.to_rfc3339(),
-            admin_token
-        );
+    let now = chrono::Utc::now();
+    let expires_at = now + chrono::Duration::minutes(10);
+    let content = format!(
+        "# Refract Initial Bootstrap Admin Credentials\n\
+         # Generated at: {}\n\
+         # Expires at:   {}\n\
+         # NOTICE: This file is restricted to 0600 permissions and will be automatically deleted in 10 minutes (TTL).\n\n\
+         username=admin@localhost\n\
+         admin_token={}\n",
+        now.to_rfc3339(),
+        expires_at.to_rfc3339(),
+        admin_token
+    );
 
-        write_owner_only_file(&token_file_path, &content).with_context(|| {
-            format!(
-                "failed to write bootstrap token file to `{}`",
-                token_file_path.display()
-            )
-        })?;
-
-        println!(
-            "\n\
-            ╔══════════════════════════════════════════════════════════════════════════════════════╗\n\
-            ║ Refract Initial Bootstrap Admin Credentials Generated                                ║\n\
-            ║                                                                                      ║\n\
-            ║   Default Account: admin@localhost                                                   ║\n\
-            ║   Token File:      {:<69} ║\n\
-            ║   File Mode:       0600 (Owner read/write only)                                      ║\n\
-            ║   Valid For:       10 minutes (file will self-destruct after timeout)                ║\n\
-            ╚══════════════════════════════════════════════════════════════════════════════════════╝\n",
+    write_owner_only_file(&token_file_path, &content).with_context(|| {
+        format!(
+            "failed to write bootstrap token file to `{}`",
             token_file_path.display()
-        );
-        tracing::info!(
-            account = "admin@localhost",
-            path = %token_file_path.display(),
-            ttl_minutes = 10,
-            "bootstrap admin credentials generated and written to hidden file (0600 permissions)"
-        );
+        )
+    })?;
 
-        let cleanup_path = token_file_path.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(600)).await;
-            if let Err(e) = tokio::fs::remove_file(&cleanup_path).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %cleanup_path.display(), %e, "failed to delete expired .admin_token file");
-                }
-            } else {
-                tracing::info!(path = %cleanup_path.display(), "bootstrap .admin_token file has been automatically removed (10m TTL expired)");
+    println!(
+        "\n\
+        ╔══════════════════════════════════════════════════════════════════════════════════════╗\n\
+        ║ Refract Initial Bootstrap Admin Credentials Generated                                ║\n\
+        ║                                                                                      ║\n\
+        ║   Default Account: admin@localhost                                                   ║\n\
+        ║   Token File:      {:<69} ║\n\
+        ║   File Mode:       0600 (Owner read/write only)                                      ║\n\
+        ║   Valid For:       10 minutes (file will self-destruct after timeout)                ║\n\
+        ╚══════════════════════════════════════════════════════════════════════════════════════╝\n",
+        token_file_path.display()
+    );
+    tracing::info!(
+        account = "admin@localhost",
+        path = %token_file_path.display(),
+        ttl_minutes = 10,
+        "bootstrap admin credentials generated and written to hidden file (0600 permissions)"
+    );
+
+    let cleanup_path = token_file_path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        if let Err(e) = tokio::fs::remove_file(&cleanup_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %cleanup_path.display(), %e, "failed to delete expired .admin_token file");
             }
-        });
-    } else {
-        tracing::info!("admin token explicitly configured via environment/config");
-    }
+        } else {
+            tracing::info!(path = %cleanup_path.display(), "bootstrap .admin_token file has been automatically removed (10m TTL expired)");
+        }
+    });
 
     Ok(())
 }
@@ -357,7 +336,7 @@ async fn log_retention_loop(state: AppState) {
 /// 拒绝把无保护的管理面和推理面暴露到非回环地址。
 ///
 /// 这个服务持有全部上游密钥；`0.0.0.0` 配错一次就可能把管理 API 暴露给整
-/// 个局域网。用户仍可远程部署，但必须先设置管理令牌并开启网关 API key。
+/// 个局域网。远程部署必须保留首次签发的管理令牌，并打开网关 API key。
 async fn enforce_exposure_policy(config: &Config, state: &AppState) -> Result<()> {
     if config.listen.ip().is_loopback() {
         return Ok(());
@@ -372,7 +351,7 @@ async fn enforce_exposure_policy(config: &Config, state: &AppState) -> Result<()
 
     anyhow::ensure!(
         admin_token_configured && config.require_auth,
-        "refusing to listen on non-loopback address {} without both an admin token and require_auth=true; start on 127.0.0.1, configure an admin token, and enable gateway authentication first",
+        "refusing to listen on non-loopback address {} without both a management token and require_auth=true; start on 127.0.0.1 first and do not clear the issued admin token",
         config.listen
     );
     Ok(())
@@ -504,12 +483,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_admin_token_enables_a_safe_first_remote_start() {
-        let state = test_state(true).await;
+    async fn issued_token_allows_non_loopback_when_require_auth() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("refract.db");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let client = UpstreamClient::new(Default::default()).unwrap();
+        let state = AppState::bootstrap(db, client, true).await.unwrap();
         let config = Config {
             listen: SocketAddr::from(([0, 0, 0, 0], 3939)),
             require_auth: true,
-            admin_token: Some("declarative-admin-secret".into()),
+            database: db_path.to_str().unwrap().to_owned(),
             ..Config::default()
         };
 
@@ -521,11 +504,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            stored,
-            refract_store::ApiKeyRepo::hash("declarative-admin-secret")
+        assert!(!stored.is_empty());
+        assert!(
+            !stored.starts_with("adm_"),
+            "store must keep the hash, not the plaintext"
         );
-        assert!(!stored.contains("declarative-admin-secret"));
+        let content = std::fs::read_to_string(temp_dir.path().join(".admin_token")).unwrap();
+        assert!(content.contains("admin_token=adm_"));
         assert!(enforce_exposure_policy(&config, &state).await.is_ok());
     }
 

@@ -256,7 +256,7 @@ fn auth_routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                     .map_err(reject)?;
 
                 let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
-                    // 未设置管理令牌时直接允许登录并放行
+                    // 用户关掉了管理鉴权：登录接口仍成功，不发会话票。
                     return ok(serde_json::json!({
                         "authenticated": true,
                         "username": "admin@localhost"
@@ -1705,8 +1705,8 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
             ok(serde_json::json!({ "active": active, "stats": stats }))
         });
 
-    // 管理令牌只能写、不能读 —— 读接口等于把令牌泄漏给任何已经进来的人，
-    // 而设置它的前提恰恰是「还没有令牌」。
+    // 管理令牌只能写、不能读 —— 读接口等于把令牌泄漏给任何已经进来的人。
+    // 首次启动由 bootstrap 签发；这里只负责轮换或显式关闭。
     // 管理令牌设置端点：PUT /api/settings/admin-token
     let set_token = base
         .and(warp::path("admin-token"))

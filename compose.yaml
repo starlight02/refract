@@ -14,7 +14,6 @@ services:
       REFRACT_LISTEN: 0.0.0.0:3939
       REFRACT_DATABASE: /data/refract.db
       REFRACT_REQUIRE_AUTH: "true"
-      REFRACT_ADMIN_TOKEN: ${REFRACT_ADMIN_TOKEN:?set REFRACT_ADMIN_TOKEN in .env}
       REFRACT_LOG: ${REFRACT_LOG:-info}
       # 32 字节静态加密主密钥（base64）。配置后渠道密钥在库内 AES-256-GCM 加密存储；
       # 不配置则兼容旧行为（明文）。轮换需重加密全部渠道密钥，谨慎变更。

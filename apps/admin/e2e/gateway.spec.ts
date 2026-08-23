@@ -3,6 +3,8 @@ import net from 'node:net'
 
 import { expect, test } from '@playwright/test'
 
+import { loginAsAdmin, readIssuedAdminToken } from './auth.js'
+
 /**
  * 端到端测试：对着真实的生产形态跑。
  *
@@ -14,6 +16,10 @@ import { expect, test } from '@playwright/test'
  * 用例之间有状态依赖（先建渠道才能路由），因此整个文件串行执行。
  */
 test.describe.configure({ mode: 'serial' })
+
+test.beforeEach(async ({ page }) => {
+  await loginAsAdmin(page)
+})
 
 /** 固定应答的上游。 */
 const UPSTREAM_ANSWER = {
@@ -533,35 +539,22 @@ test('390px 视口使用移动导航且核心内容可见', async ({ page }) => 
   await expect(page.getByRole('link', { name: /渠道/ })).toBeVisible()
 })
 
-test('管理令牌保护整个管理界面', async ({ page, context }) => {
-  await page.goto('/settings')
-  await page.getByPlaceholder('新令牌（启用或更换）').fill('e2e-admin-secret')
-  await page.getByRole('button', { name: '启用或更换' }).click()
-  await expect(page.getByText('令牌已生效，会话已更新。')).toBeVisible()
-
-  // 模拟「换了浏览器」：清除 Session Cookie，管理界面必须被挡住。
+test('未登录时管理界面被挡住，正确令牌可进入', async ({ page, context }) => {
   await context.clearCookies()
-  await page.reload()
-  const dialog = page.getByRole('dialog')
-  await expect(dialog).toContainText('管理端身份验证')
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: '管理端身份验证' })).toBeVisible()
 
-  // 错误令牌不能放行：填错令牌点击登录，弹窗显示错误且依然拦截。
-  await dialog.getByPlaceholder('adm_... 或自定义管理令牌').fill('wrong-token')
-  await dialog.getByRole('button', { name: '登录并进入系统' }).click()
-  await expect(dialog.getByText('invalid admin token')).toBeVisible()
+  const tokenInput = page.getByPlaceholder('adm_... 或自定义管理令牌')
+  const submit = page.locator('form button[type="submit"]')
+  await tokenInput.fill('wrong-token')
+  await expect(submit).toBeEnabled()
+  await submit.click()
+  await expect(page.getByText('invalid admin token')).toBeVisible()
 
-  // 正确令牌恢复界面：填入正确令牌点击登录，等待页面加载完成并确认弹窗消失。
-  await dialog.getByPlaceholder('adm_... 或自定义管理令牌').fill('e2e-admin-secret')
-  await Promise.all([
-    page.waitForEvent('load'),
-    dialog.getByRole('button', { name: '登录并进入系统' }).click(),
-  ])
-  await expect(page.getByRole('heading', { name: '设置' })).toBeVisible()
-  await expect(page.getByRole('dialog')).toBeHidden()
-  // 收尾：关闭管理鉴权，让剩余用例回到开放状态。
-  await page.goto('/settings')
-  await page.getByRole('button', { name: '关闭管理鉴权' }).click()
-  await expect(page.getByText('管理鉴权已关闭。')).toBeVisible()
+  await tokenInput.fill(await readIssuedAdminToken())
+  await Promise.all([page.waitForEvent('load'), submit.click()])
+  await expect(page.getByRole('heading', { name: '仪表盘' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '管理端身份验证' })).toBeHidden()
 })
 
 test('连续失败触发熔断，界面可见且可手动解除', async ({ page, baseURL }) => {

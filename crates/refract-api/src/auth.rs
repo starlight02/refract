@@ -366,7 +366,8 @@ impl AdminGuard {
 
 /// 管理接口鉴权。
 ///
-/// 未设置管理令牌时放行 —— 首次启动必须能进去设置它，否则用户被自己锁在外面。
+/// 首次启动由 bootstrap 签发令牌，默认必须带会话。无哈希时放行只留给
+/// 设置页「关闭管理鉴权」这条显式退出路径。
 pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("authorization")
         .and(warp::header::optional::<String>("x-admin-token"))
@@ -391,7 +392,7 @@ pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Re
                         })?;
 
                     let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
-                        // 尚未设置管理令牌：放行，让用户能完成初始配置。
+                        // 用户在设置里关掉了管理鉴权。
                         return Ok(());
                     };
 

@@ -5,7 +5,7 @@
 #   REFRACT_LISTEN=0.0.0.0:3939 REFRACT_DATABASE=/data/refract.db ./refract-server
 
 # 监听地址。默认只听本机 —— 网关持有全部上游密钥，把它直接暴露到
-# 局域网/公网之前请先想清楚，并务必设置管理令牌。
+# 局域网/公网之前请先想清楚，并打开 require_auth。
 listen = "127.0.0.1:3939"
 
 # SQLite 数据库文件路径（相对运行目录）。
@@ -15,10 +15,8 @@ database = "refract.db"
 # 个人本机使用可以关掉；只要端口不是只听 127.0.0.1，就强烈建议打开。
 require_auth = false
 
-# 可选：启动时设置或轮换管理 API 令牌。服务只保存 SHA-256 哈希。
-# 容器首次以 0.0.0.0 监听时，必须同时设置此项与 require_auth=true。
-# 更推荐通过 REFRACT_ADMIN_TOKEN 环境变量注入，避免明文写入配置文件。
-# admin_token = "replace-with-a-long-random-secret"
+# 管理令牌由首次启动签发，写入数据目录 `.admin_token`（0600，10 分钟后删除）。
+# 不提供配置项或环境变量覆盖。丢失后用 `--reset-admin` 重新签发。
 
 # 可选：渠道凭据静态加密主密钥（32 字节随机值的 base64 编码，如 `openssl rand -base64 32`）。
 # 配置后新保存的渠道密钥在 SQLite 内以 AES-256-GCM 密文存储；留空则保持明文。

@@ -17,7 +17,7 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   // 所有用例共享同一个服务端实例与数据库，必须串行。
   workers: 1,
-  reporter: 'list',
+  reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
   use: {
     actionTimeout: 10_000,
     baseURL: 'http://127.0.0.1:4539',

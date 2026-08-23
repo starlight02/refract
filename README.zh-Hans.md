@@ -79,7 +79,7 @@ curl http://127.0.0.1:3939/v1/messages \
 
 ```sh
 cp .env.example .env
-# 编辑 .env，替换 REFRACT_ADMIN_TOKEN
+# 首次启动会在容器内写入 /data/.admin_token（10 分钟有效）
 docker compose up -d --build
 curl --fail http://127.0.0.1:3939/health/ready
 ```
@@ -105,7 +105,7 @@ Compose 默认仅把端口映射到宿主机回环地址，容器内以非 root�
 | `POST /v1beta/models/{model}:countTokens` | Gemini token 计数（透传到 gemini 端点） |
 | `GET /v1/models` · `/v1/models/{id}` · `/v1beta/models` · `/v1beta/models/{id}` | OpenAI 与 Gemini 模型发现（由启用渠道派生） |
 | `GET /v1/realtime?model=...`（WebSocket） | OpenAI Realtime 原生 WebSocket 桥接 |
-| `GET /metrics` | Prometheus 指标（配置管理令牌后需凭证；健康探针保持公开） |
+| `GET /metrics` | Prometheus 指标（管理令牌保护；健康探针保持公开） |
 
 流式与非流式都支持。网关端点带宽松的 CORS 头，浏览器里运行的客户端可以直接跨源调用。管理界面走 `/api/...`，与网关端点使用不同的鉴权体系，并且**不发** CORS 头 —— 管理面只允许同源访问。
 
@@ -122,7 +122,6 @@ Realtime 同样只走原生 Chat 端点：先按健康度选路由并应用模�
 | `listen` | `127.0.0.1:3939` | 监听地址。默认只听本机 |
 | `database` | `refract.db` | SQLite 文件路径 |
 | `require_auth` | `false` | 调用网关端点是否必须携带网关 API 密钥 |
-| `admin_token` | 无 | 启动时设置/轮换管理令牌；推荐通过 `REFRACT_ADMIN_TOKEN` 注入 |
 | `upstream_timeout_secs` | `300` | 上游请求整体超时（非流式） |
 | `stream_idle_timeout_secs` | `120` | 流式：等待响应头的上限，以及两帧之间的最大间隔 |
 | `shutdown_grace_secs` | `30` | 优雅关闭窗口，超时后强制断开存量连接 |
@@ -132,7 +131,9 @@ Realtime 同样只走原生 Chat 端点：先按健康度选路由并应用模�
 
 路由策略（`max_attempts`、`max_upstream_calls`、原生优先、选择算法）在管理界面运行时可调，不是 `refract.toml` 键。
 
-**安全提示**：网关持有全部上游密钥。服务会拒绝在非回环地址启动，除非管理令牌已经配置且 `require_auth=true`。`REFRACT_ADMIN_TOKEN` 每次启动都会声明式地设置该令牌；不要把明文提交进仓库。
+**首次启动**：服务端签发随机 `adm_…` 管理令牌，写入数据目录 `.admin_token`（权限 0600，10 分钟后删除）。管理界面必须用这把钥匙登录。Compose：`docker compose exec refract cat /data/.admin_token`。文件丢了就 `--reset-admin` 重启。
+
+**安全提示**：网关持有全部上游密钥。服务会拒绝在非回环地址启动，除非管理令牌已存在且 `require_auth=true`。不要把明文提交进仓库。
 
 ## 开发
 

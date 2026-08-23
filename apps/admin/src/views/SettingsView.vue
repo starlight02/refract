@@ -6,8 +6,8 @@
  * 1. 路由策略 —— 是否原生优先、选择模式、最大重试次数。
  *    设计成「先调到满意再保存」，而不是「改一行就存一次」。
  * 2. 日志保留 —— 后台定时清理请求日志的周期。
- * 3. 管理令牌 —— 管理 API 的鉴权。启用后所有 /api 请求都要带会话，
- *    设置成功时服务端会下发最新 Session Cookie，当前浏览器保持登录。
+ * 3. 管理令牌 —— 首次启动由服务端签发。设置页只负责轮换或显式关闭；
+ *    轮换成功时服务端会下发最新 Session Cookie，当前浏览器保持登录。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'

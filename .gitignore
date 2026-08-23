@@ -24,6 +24,8 @@ pnpm-debug.log*
 # Playwright
 test-results/
 playwright-report/
+apps/admin/e2e/.issued-admin-token
+.admin_token
 
 # ---- 环境变量与本地密钥 ----
 .env

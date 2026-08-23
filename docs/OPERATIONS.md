@@ -2,14 +2,12 @@
 
 ## Deployment modes
 
-For a local desktop-only service, run the release binary with the defaults. It listens on `127.0.0.1:3939`, stores SQLite in `refract.db`, and permits gateway calls without a Refract API key.
+For a local desktop-only service, run the release binary with the defaults. It listens on `127.0.0.1:3939`, stores SQLite in `refract.db`, and permits gateway calls without a Refract API key. The first start always issues a random `adm_…` management token to `<data-dir>/.admin_token` (mode 0600, deleted after 10 minutes). Open the admin UI and sign in with that token. Restart with `--reset-admin` if the file is gone.
 
 For a container or remote listener, Refract requires both controls before binding:
 
 - `REFRACT_REQUIRE_AUTH=true` protects `/v1` and `/v1beta` with Refract API keys.
-- A management token protects `/api`. Set it declaratively with `REFRACT_ADMIN_TOKEN` or configure it in the UI before changing from a loopback listener.
-
-`REFRACT_ADMIN_TOKEN` is hashed before persistence and is never logged. When it remains present, every restart resets the management token to that value. This makes container configuration deterministic and also means an in-UI token change will not survive the next restart until the environment is updated.
+- A management token protects `/api`. First boot issues one automatically. Read it with `docker compose exec refract cat /data/.admin_token` (or the process log banner). There is no environment-variable override.
 
 Failed management logins are throttled per client IP: five consecutive failures lock that IP out for 60 seconds (HTTP 403 with `Retry-After`), even with the correct token — a guard against brute-force attempts on the admin surface.
 
@@ -17,7 +15,7 @@ Failed management logins are throttled per client IP: five consecutive failures 
 
 ```sh
 cp .env.example .env
-# Put a long random secret in REFRACT_ADMIN_TOKEN.
+# Optional: set REFRACT_MASTER_KEY. The admin token is issued into /data/.admin_token.
 docker compose up -d --build
 docker compose ps
 curl --fail http://127.0.0.1:3939/health/ready
