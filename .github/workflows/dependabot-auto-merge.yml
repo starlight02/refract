@@ -1,0 +1,27 @@
+name: Dependabot Auto-Merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    name: Enable Auto-Merge
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+      # 本组 Dependabot 全是 grouped PR，`update-type` 经常是空的，挡不住 major。
+      # cargo/npm/docker 已在 dependabot.yml 忽略 major；github-actions 保留 major，不自动合。
+      - name: Enable auto-merge for Dependabot PRs
+        if: steps.metadata.outputs.package-ecosystem != 'github_actions'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

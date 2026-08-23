@@ -27,7 +27,7 @@ jobs:
       - run: cargo test --workspace --all-targets --all-features --locked
 
   frontend:
-    name: Frontend quality gate
+    name: Web quality gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
