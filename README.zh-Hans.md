@@ -129,6 +129,9 @@ Realtime 同样只走原生 Chat 端点：先按健康度选路由并应用模�
 | `proxy` | 无 | 出站代理（http/socks5） |
 | `master_key` | 无 | 渠道凭据静态加密主密钥（32 字节 base64）；推荐通过 `REFRACT_MASTER_KEY` 注入 |
 
+
+路由策略（`max_attempts`、`max_upstream_calls`、原生优先、选择算法）在管理界面运行时可调，不是 `refract.toml` 键。
+
 **安全提示**：网关持有全部上游密钥。服务会拒绝在非回环地址启动，除非管理令牌已经配置且 `require_auth=true`。`REFRACT_ADMIN_TOKEN` 每次启动都会声明式地设置该令牌；不要把明文提交进仓库。
 
 ## 开发

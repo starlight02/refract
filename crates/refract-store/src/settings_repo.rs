@@ -233,6 +233,23 @@ pub fn price_for<'a>(prices: &'a [ModelPrice], model: &str) -> Option<&'a ModelP
     best
 }
 
+/// 一条设置变更：写入已序列化的 JSON，或删除该键。
+#[derive(Debug, Clone)]
+pub enum SettingWrite<'a> {
+    /// 写入 JSON 字符串。
+    Set {
+        /// 设置键。
+        key: &'a str,
+        /// 已序列化的 JSON 值。
+        value: String,
+    },
+    /// 删除该键。
+    Remove {
+        /// 设置键。
+        key: &'a str,
+    },
+}
+
 /// 设置仓储。
 #[derive(Debug, Clone)]
 pub struct SettingsRepo {
@@ -287,6 +304,160 @@ impl SettingsRepo {
         .execute(self.db.pool())
         .await?;
         Ok(())
+    }
+
+    /// 在同一事务里应用多条设置变更。空列表是 no-op。
+    pub async fn apply(&self, writes: &[SettingWrite<'_>]) -> Result<(), StoreError> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.pool().begin().await?;
+        for write in writes {
+            match write {
+                SettingWrite::Set { key, value } => {
+                    sqlx::query(
+                        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) \
+                         ON CONFLICT (key) DO UPDATE SET value = excluded.value, \
+                         updated_at = excluded.updated_at",
+                    )
+                    .bind(*key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                SettingWrite::Remove { key } => {
+                    sqlx::query("DELETE FROM settings WHERE key = ?")
+                        .bind(*key)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    fn encode<T: Serialize>(value: &T) -> Result<String, StoreError> {
+        serde_json::to_string(value).map_err(StoreError::json("settings.value"))
+    }
+
+    /// 同时写入 webhook 与重测间隔。任一校验失败则两条都不落库。
+    pub async fn set_notify(&self, url: Option<&str>, minutes: u32) -> Result<(), StoreError> {
+        if minutes > 1440 {
+            return Err(StoreError::Invalid(
+                "retest interval must be at most 1440 minutes".into(),
+            ));
+        }
+        let url_write = match url.map(str::trim).filter(|u| !u.is_empty()) {
+            Some(url) => {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(StoreError::Invalid(
+                        "webhook url must start with http:// or https://".into(),
+                    ));
+                }
+                SettingWrite::Set {
+                    key: KEY_WEBHOOK_URL,
+                    value: Self::encode(&url)?,
+                }
+            }
+            None => SettingWrite::Remove {
+                key: KEY_WEBHOOK_URL,
+            },
+        };
+        self.apply(&[
+            url_write,
+            SettingWrite::Set {
+                key: KEY_RETEST_MINUTES,
+                value: Self::encode(&minutes)?,
+            },
+        ])
+        .await
+    }
+
+    /// 写入或清除管理令牌。写入时与 `auth.initialized` 同事务提交。
+    pub async fn set_admin_token(&self, hash: Option<&str>) -> Result<(), StoreError> {
+        match hash.filter(|value| !value.is_empty()) {
+            Some(hash) => {
+                self.apply(&[
+                    SettingWrite::Set {
+                        key: KEY_ADMIN_TOKEN_HASH,
+                        value: Self::encode(&hash)?,
+                    },
+                    SettingWrite::Set {
+                        key: KEY_AUTH_INITIALIZED,
+                        value: Self::encode(&true)?,
+                    },
+                ])
+                .await
+            }
+            None => self.remove(KEY_ADMIN_TOKEN_HASH).await,
+        }
+    }
+
+    /// 首次引导：哈希、用户名、initialized 同事务写入。
+    pub async fn bootstrap_admin(&self, hash: &str, username: &str) -> Result<(), StoreError> {
+        self.apply(&[
+            SettingWrite::Set {
+                key: KEY_ADMIN_TOKEN_HASH,
+                value: Self::encode(&hash)?,
+            },
+            SettingWrite::Set {
+                key: KEY_ADMIN_USERNAME,
+                value: Self::encode(&username)?,
+            },
+            SettingWrite::Set {
+                key: KEY_AUTH_INITIALIZED,
+                value: Self::encode(&true)?,
+            },
+        ])
+        .await
+    }
+
+    /// 导入备份里的可导出设置。先全部校验，再同事务写入。
+    pub async fn import_settings(
+        &self,
+        routing: &RoutingPolicy,
+        log_retention_days: u32,
+        breaker: &BreakerPolicy,
+        pricing: &[ModelPrice],
+        empty_retry: &EmptyResponseRetryPolicy,
+    ) -> Result<(), StoreError> {
+        routing.validate().map_err(StoreError::Invalid)?;
+        if !(1..=MAX_LOG_RETENTION_DAYS).contains(&log_retention_days) {
+            return Err(StoreError::Invalid(format!(
+                "log retention days must be between 1 and {MAX_LOG_RETENTION_DAYS}"
+            )));
+        }
+        breaker.validate().map_err(StoreError::Invalid)?;
+        for price in pricing {
+            price.validate().map_err(StoreError::Invalid)?;
+        }
+        empty_retry
+            .validate()
+            .map_err(|message| StoreError::Invalid(message.into()))?;
+        self.apply(&[
+            SettingWrite::Set {
+                key: KEY_ROUTING_POLICY,
+                value: Self::encode(routing)?,
+            },
+            SettingWrite::Set {
+                key: KEY_LOG_RETENTION_DAYS,
+                value: Self::encode(&log_retention_days)?,
+            },
+            SettingWrite::Set {
+                key: KEY_BREAKER_POLICY,
+                value: Self::encode(breaker)?,
+            },
+            SettingWrite::Set {
+                key: KEY_PRICING,
+                value: Self::encode(&pricing)?,
+            },
+            SettingWrite::Set {
+                key: KEY_EMPTY_RESPONSE_RETRY,
+                value: Self::encode(empty_retry)?,
+            },
+        ])
+        .await
     }
 
     /// 删除一个设置项。
@@ -960,5 +1131,61 @@ mod tests {
         };
         repo.set_routing_policy(&ok).await.unwrap();
         assert_eq!(repo.routing_policy().await.unwrap(), ok);
+    }
+
+    #[tokio::test]
+    async fn set_notify_rejects_bad_minutes_without_writing_url() {
+        let repo = repo().await;
+        let err = repo
+            .set_notify(Some("https://example.com/hook"), 1441)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+        assert_eq!(repo.webhook_url().await.unwrap(), None);
+        assert_eq!(repo.retest_minutes().await, DEFAULT_RETEST_MINUTES);
+    }
+
+    #[tokio::test]
+    async fn set_notify_writes_url_and_minutes_together() {
+        let repo = repo().await;
+        repo.set_notify(Some("https://example.com/hook"), 15)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.webhook_url().await.unwrap().as_deref(),
+            Some("https://example.com/hook")
+        );
+        assert_eq!(repo.retest_minutes().await, 15);
+
+        repo.set_notify(None, 0).await.unwrap();
+        assert_eq!(repo.webhook_url().await.unwrap(), None);
+        assert_eq!(repo.retest_minutes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn set_admin_token_writes_hash_and_initialized_together() {
+        let repo = repo().await;
+        repo.set_admin_token(Some("deadbeef")).await.unwrap();
+        assert_eq!(
+            repo.get::<String>(KEY_ADMIN_TOKEN_HASH)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            repo.get::<bool>(KEY_AUTH_INITIALIZED).await.unwrap(),
+            Some(true)
+        );
+
+        repo.set_admin_token(None).await.unwrap();
+        assert_eq!(
+            repo.get::<String>(KEY_ADMIN_TOKEN_HASH).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.get::<bool>(KEY_AUTH_INITIALIZED).await.unwrap(),
+            Some(true)
+        );
     }
 }

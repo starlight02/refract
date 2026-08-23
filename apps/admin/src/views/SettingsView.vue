@@ -139,11 +139,11 @@ const backupValid = computed(
     backupCfg.value.keep >= 1 &&
     backupCfg.value.keep <= 100,
 )
-/** 路由策略数值校验：重试 1–32，上游调用上限 0–255（u8）。 */
+/** 路由策略数值校验：重试 0–32（0=不限），上游调用上限 0–255（u8）。 */
 const policyValid = computed(
   () =>
     Number.isInteger(policy.value.max_attempts) &&
-    policy.value.max_attempts >= 1 &&
+    policy.value.max_attempts >= 0 &&
     policy.value.max_attempts <= 32 &&
     Number.isInteger(policy.value.max_upstream_calls) &&
     policy.value.max_upstream_calls >= 0 &&
@@ -321,11 +321,17 @@ function draftToRule(draft: AffinityRuleDraft): AffinityRule {
   }
 }
 /** 与后端 AffinitySettings::validate 一致的客户端校验；关闭时不拦截。 */
+const MAX_AFFINITY_TTL_SECS = 7 * 24 * 3600
 const affinityValid = computed(() => {
   if (!affinity.value.enabled) return true
   const a = affinity.value
   if (!Number.isInteger(a.max_entries) || a.max_entries < 1) return false
-  if (!Number.isInteger(a.default_ttl_secs) || a.default_ttl_secs < 1) return false
+  if (
+    !Number.isInteger(a.default_ttl_secs) ||
+    a.default_ttl_secs < 1 ||
+    a.default_ttl_secs > MAX_AFFINITY_TTL_SECS
+  )
+    return false
   const seen = new Set<string>()
   for (const draft of affinityRules.value) {
     const name = draft.name.trim()
@@ -340,7 +346,12 @@ const affinityValid = computed(() => {
         if (path !== '' && !path.startsWith('/')) return false
       }
     }
-    if (draft.ttl_secs !== null && (!Number.isInteger(draft.ttl_secs) || draft.ttl_secs < 1))
+    if (
+      draft.ttl_secs !== null &&
+      (!Number.isInteger(draft.ttl_secs) ||
+        draft.ttl_secs < 1 ||
+        draft.ttl_secs > MAX_AFFINITY_TTL_SECS)
+    )
       return false
   }
   return true
@@ -682,7 +693,7 @@ onBeforeUnmount(() => {
 
 async function save() {
   if (!policyValid.value) {
-    saveError.value = '路由策略不合法：最大重试 1–32 次，单请求上游调用上限 0–255'
+    saveError.value = '路由策略不合法：最大重试 0–32 次（0 = 不限），单请求上游调用上限 0–255'
     return
   }
   if (!retentionValid.value) {
@@ -719,48 +730,56 @@ async function save() {
   }
   if (!affinityValid.value) {
     saveError.value =
-      '亲和规则不合法：名称需非空且唯一、每条规则至少一个来源、header 名不能为空、body 路径需以 / 开头、TTL 需为不小于 1 的整数'
+      '亲和规则不合法：名称需非空且唯一、每条规则至少一个来源、header 名不能为空、body 路径需以 / 开头、TTL 需为 1–604800 的整数'
     return
   }
   isSubmitting.value = true
   saving.value = true
   saveError.value = null
   saved.value = false
+  const savedSections: string[] = []
   try {
     if (policyDirty.value) {
       const p = await settings.setRoutingPolicy(policy.value)
       policy.value = p
       policySnapshot = JSON.stringify(p)
+      savedSections.push('路由策略')
     }
     if (retentionDirty.value) {
       const retention = await settings.setLogRetention(retentionDays.value)
       retentionDays.value = retention.days
       retentionSnapshot = retention.days
+      savedSections.push('日志保留')
     }
     if (breakerDirty.value) {
       const b = await settings.setBreakerPolicy(breaker.value)
       breaker.value = b
       breakerSnapshot = JSON.stringify(b)
+      savedSections.push('熔断')
     }
     if (pricingDirty.value) {
       const prices = await settings.setPricing(pricing.value)
       pricing.value = prices
       pricingSnapshot = JSON.stringify(prices)
+      savedSections.push('价表')
     }
     if (logBodiesDirty.value) {
       const bodies = await settings.setLogBodies(logBodies.value)
       logBodies.value = bodies.enabled
       logBodiesSnapshot = bodies.enabled
+      savedSections.push('正文快照')
     }
     if (limitsDirty.value) {
       const saved_ = await settings.setGlobalLimits(limits.value)
       limits.value = saved_
       limitsSnapshot = JSON.stringify(saved_)
+      savedSections.push('全局限制')
     }
     if (ipLimitsDirty.value) {
       const saved_ = await settings.setIpLimits(ipLimits.value)
       ipLimits.value = saved_
       ipLimitsSnapshot = JSON.stringify(saved_)
+      savedSections.push('IP 限制')
     }
     if (backupDirty.value) {
       // 目录留空归一成 null：后端语义「用内置默认目录」，且与 GET 回显形状一致。
@@ -770,11 +789,13 @@ async function save() {
       })
       backupCfg.value = saved_
       backupSnapshot = JSON.stringify(saved_)
+      savedSections.push('自动备份')
     }
     if (emptyResponseRetryDirty.value) {
       const saved_ = await settings.setEmptyResponseRetry(emptyResponseRetry.value)
       emptyResponseRetry.value = saved_
       emptyResponseRetrySnapshot = JSON.stringify(saved_)
+      savedSections.push('空回复重试')
     }
     if (notifyDirty.value) {
       const saved_ = await settings.setNotify({
@@ -783,6 +804,7 @@ async function save() {
       })
       notify.value = { ...saved_, webhook_url: saved_.webhook_url ?? '' }
       notifySnapshot = JSON.stringify(notify.value)
+      savedSections.push('通知')
     }
     if (affinityDirty.value) {
       const saved_ = await settings.setAffinity(affinityCurrent())
@@ -790,11 +812,13 @@ async function save() {
       affinityRules.value = saved_.rules.map(ruleToDraft)
       affinitySnapshot = JSON.stringify(affinityCurrent())
       void refreshAffinityStats()
+      savedSections.push('亲和性')
     }
     saved.value = true
     toastStore.success('已保存')
   } catch (e) {
-    saveError.value = toErrorMessage(e, '保存失败')
+    const prefix = savedSections.length > 0 ? `部分已保存（${savedSections.join('、')}）。` : ''
+    saveError.value = `${prefix}${toErrorMessage(e, '保存失败')}`
     toastStore.danger(saveError.value)
   } finally {
     saving.value = false
@@ -1259,14 +1283,14 @@ async function runImport(payload: unknown) {
           <span class="text-sm font-medium text-ink-soft">
             最大重试次数
             <span class="ml-2 font-normal text-ink-faint">
-              建议 2–3。过大会拉长超时，1 禁用重试。
+              0 = 不限。建议 2–3。过大会拉长超时。
             </span>
           </span>
           <input
             v-model.number="policy.max_attempts"
             type="number"
-            min="1"
-            max="10"
+            min="0"
+            max="32"
             class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
           />
         </label>
@@ -1291,7 +1315,7 @@ async function runImport(payload: unknown) {
           />
         </label>
         <p v-if="!policyValid" class="text-xs text-danger" role="alert">
-          最大重试 1–32；上游调用上限 0–255。
+          最大重试 0–32（0 = 不限）；上游调用上限 0–255。
         </p>
 
         <!-- 重试同一渠道 -->

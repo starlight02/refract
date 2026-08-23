@@ -35,7 +35,8 @@ pub use error::{ApiError, ErrorEnvelope};
 pub use router::any_of;
 pub use state::AppState;
 
-use warp::{Filter, Reply as _};
+use refract_core::Protocol;
+use warp::{Filter, Rejection, Reply as _};
 
 /// 装配全部路由。
 ///
@@ -52,12 +53,30 @@ pub fn routes(
         warp::reply::with_status(warp::reply(), warp::http::StatusCode::NO_CONTENT).into_response()
     });
 
+    let gateway = gateway::routes(state.clone()).or(realtime::routes(state.clone()));
+    // 前缀过滤器在 recover 之外：/api 的 miss 不能被网关 recover 吃成协议 404。
+    let v1 = gateway_prefix(is_v1)
+        .and(
+            gateway
+                .clone()
+                .recover(|rejection| error::recover_protocol(rejection, Protocol::Chat))
+                .map(warp::Reply::into_response),
+        )
+        .boxed();
+    let v1beta = gateway_prefix(is_v1beta)
+        .and(
+            gateway
+                .recover(|rejection| error::recover_protocol(rejection, Protocol::Gemini))
+                .map(warp::Reply::into_response),
+        )
+        .boxed();
+
     let api = routes![
         preflight,
         ops::routes(state.clone()),
         admin::routes(state.clone()),
-        realtime::routes(state.clone()),
-        gateway::routes(state.clone()),
+        v1,
+        v1beta,
         statics::routes(),
     ];
 
@@ -72,6 +91,26 @@ pub fn routes(
             }
         })
         .with(warp::trace::request())
+}
+
+fn is_v1(path: &str) -> bool {
+    path == "/v1" || path.starts_with("/v1/")
+}
+
+fn is_v1beta(path: &str) -> bool {
+    path == "/v1beta" || path.starts_with("/v1beta/")
+}
+
+fn gateway_prefix(pred: fn(&str) -> bool) -> impl Filter<Extract = (), Error = Rejection> + Clone {
+    warp::path::full()
+        .and_then(move |path: warp::path::FullPath| async move {
+            if pred(path.as_str()) {
+                Ok(())
+            } else {
+                Err(warp::reject::not_found())
+            }
+        })
+        .untuple_one()
 }
 
 /// 哪些路径面向浏览器跨源开放。
@@ -211,5 +250,49 @@ mod tests {
                 .contains_key("access-control-allow-origin"),
             "/metrics must not grant cross-origin access"
         );
+    }
+
+    #[tokio::test]
+    async fn unmatched_v1_path_uses_openai_error_envelope() {
+        let response = warp::test::request()
+            .method("GET")
+            .path("/v1/chat/completion")
+            .reply(&routes(test_state().await))
+            .await;
+        assert_eq!(response.status(), 404);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["error"]["message"], "endpoint not found");
+        assert!(
+            body.get("code").is_none(),
+            "must not use the admin envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmatched_v1beta_path_uses_gemini_error_envelope() {
+        let response = warp::test::request()
+            .method("GET")
+            .path("/v1beta/not-a-real-endpoint")
+            .reply(&routes(test_state().await))
+            .await;
+        assert_eq!(response.status(), 404);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["error"]["message"], "endpoint not found");
+        assert_eq!(body["error"]["status"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn unmatched_admin_path_keeps_admin_envelope() {
+        let response = warp::test::request()
+            .method("GET")
+            .path("/api/does-not-exist")
+            .reply(&routes(test_state().await))
+            .await;
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert!(
+            body.get("code").is_some(),
+            "admin fallback must keep {{code,message}}, got {body}"
+        );
+        assert!(body.get("error").and_then(|e| e.get("message")).is_none());
     }
 }

@@ -419,17 +419,21 @@ export const models = {
  * 模型调试台。
  *
  * 不走统一的 `request()`：流式响应需要调用方直接消费 ReadableStream，
- * JSON 拆包在这里没有意义。鉴权头照常携带。
+ * JSON 拆包在这里没有意义。鉴权失败仍派发全局事件，让令牌弹窗出现。
  */
 export const playground = {
-  chat: (body: Record<string, unknown>): Promise<Response> => {
+  chat: async (body: Record<string, unknown>): Promise<Response> => {
     const headers: Record<string, string> = { 'content-type': 'application/json' }
-    return fetch('/api/playground/chat', {
+    const response = await fetch('/api/playground/chat', {
       method: 'POST',
       headers,
       credentials: 'same-origin',
       body: JSON.stringify(body),
     })
+    if (response.status === 401 || response.status === 403) {
+      window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+    }
+    return response
   },
 }
 

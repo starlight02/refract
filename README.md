@@ -129,6 +129,9 @@ Realtime is likewise native-only: it selects a healthy Chat endpoint, applies mo
 | `proxy` | none | Outbound proxy (http/socks5) |
 | `master_key` | none | Master encryption key for credentials at rest (32-byte base64); inject via `REFRACT_MASTER_KEY` |
 
+
+Routing policy (`max_attempts`, `max_upstream_calls`, native-first, selection) is runtime-tunable in the admin UI, not a `refract.toml` key.
+
 **Security note**: the service refuses a non-loopback listener unless an admin token is configured and `require_auth=true`. `REFRACT_ADMIN_TOKEN` declaratively sets that token on every start; never commit its plaintext value.
 
 ## Development

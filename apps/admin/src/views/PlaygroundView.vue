@@ -89,8 +89,12 @@ async function send() {
     })
     if (!response.ok) {
       const text = await response.text()
-      const parsed = tryParseJson<{ error?: { message?: string } }>(text)
-      reply.error = parsed?.error?.message || text || `${response.status} ${response.statusText}`
+      const parsed = tryParseJson<{ message?: string; error?: { message?: string } }>(text)
+      reply.error =
+        parsed?.error?.message ||
+        parsed?.message ||
+        text ||
+        `${response.status} ${response.statusText}`
       return
     }
 

@@ -277,20 +277,9 @@ async fn apply_bootstrap_admin_token(config: &Config, state: &AppState) -> Resul
 
     let hash = refract_store::ApiKeyRepo::hash(&admin_token);
     settings
-        .set(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH, &hash)
+        .bootstrap_admin(&hash, "admin@localhost")
         .await
-        .context("failed to persist admin token hash")?;
-    settings
-        .set(
-            refract_store::settings_repo::KEY_ADMIN_USERNAME,
-            &"admin@localhost",
-        )
-        .await
-        .context("failed to persist admin username")?;
-    settings
-        .set(refract_store::settings_repo::KEY_AUTH_INITIALIZED, &true)
-        .await
-        .context("failed to mark auth as initialized")?;
+        .context("failed to persist bootstrap admin credentials")?;
 
     if is_generated {
         let now = chrono::Utc::now();

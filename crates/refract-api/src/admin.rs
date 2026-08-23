@@ -1556,12 +1556,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
         .and_then(|body: NotifyBody, state: AppState| async move {
             state
                 .settings_repo()
-                .set_webhook_url(body.webhook_url.as_deref())
-                .await
-                .map_err(reject)?;
-            state
-                .settings_repo()
-                .set_retest_minutes(body.retest_minutes)
+                .set_notify(body.webhook_url.as_deref(), body.retest_minutes)
                 .await
                 .map_err(reject)?;
             state.reload_webhook().await.map_err(reject)?;
@@ -1724,12 +1719,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
             match body.token.filter(|t| !t.trim().is_empty()) {
                 Some(token) => {
                     let hash = refract_store::ApiKeyRepo::hash(&token);
-                    repo.set(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH, &hash)
-                        .await
-                        .map_err(reject)?;
-                    repo.set(refract_store::settings_repo::KEY_AUTH_INITIALIZED, &true)
-                        .await
-                        .map_err(reject)?;
+                    repo.set_admin_token(Some(&hash)).await.map_err(reject)?;
                     let ticket = crate::auth::create_session_ticket(
                         state.session_secret(),
                         &hash,
@@ -1751,9 +1741,7 @@ fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
                 }
                 // 传 null 表示「关掉管理鉴权」，个人本机部署的常见需求。
                 None => {
-                    repo.remove(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
-                        .await
-                        .map_err(reject)?;
+                    repo.set_admin_token(None).await.map_err(reject)?;
                     let cookie = format!(
                         "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
                         crate::auth::SESSION_COOKIE_NAME
@@ -2271,23 +2259,13 @@ async fn import_document(
 
     let settings = state.settings_repo();
     settings
-        .set_routing_policy(&req.data.settings.routing_policy)
-        .await
-        .map_err(reject)?;
-    settings
-        .set_log_retention_days(req.data.settings.log_retention_days)
-        .await
-        .map_err(reject)?;
-    settings
-        .set_breaker_policy(&req.data.settings.breaker_policy)
-        .await
-        .map_err(reject)?;
-    settings
-        .set_pricing(&req.data.settings.pricing)
-        .await
-        .map_err(reject)?;
-    settings
-        .set_empty_response_retry(req.data.settings.empty_response_retry)
+        .import_settings(
+            &req.data.settings.routing_policy,
+            req.data.settings.log_retention_days,
+            &req.data.settings.breaker_policy,
+            &req.data.settings.pricing,
+            &req.data.settings.empty_response_retry,
+        )
         .await
         .map_err(reject)?;
 

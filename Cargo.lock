@@ -1998,7 +1998,6 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf 0.12.4",
- "hmac 0.12.1",
  "http",
  "mime_guess",
  "p256",

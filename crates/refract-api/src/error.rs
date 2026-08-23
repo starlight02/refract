@@ -132,10 +132,30 @@ pub fn admin_error_reply(err: &GatewayError) -> warp::reply::Response {
 /// warp rejection 到 HTTP 响应的兜底转换。
 ///
 /// 请求路径决定错误格式：`/v1` 与 `/v1beta` 下的失败要用协议格式回，
-/// 否则客户端 SDK 解析不了。
-pub async fn recover(rejection: Rejection) -> Result<impl Reply, Infallible> {
+/// 否则客户端 SDK 解析不了。管理面走 [`recover`]，网关面走 [`recover_protocol`]。
+pub async fn recover(rejection: Rejection) -> Result<warp::reply::Response, Infallible> {
+    if let Some(response) = known_rejection_reply(&rejection) {
+        return Ok(response);
+    }
+    let (status, message) = fallback_status(&rejection);
+    Ok(admin_fallback(status, message))
+}
+
+/// 网关未匹配路由的兜底：404/405 也回协议信封，而不是管理面 `{code,message}`。
+pub async fn recover_protocol(
+    rejection: Rejection,
+    protocol: Protocol,
+) -> Result<warp::reply::Response, Infallible> {
+    if let Some(response) = known_rejection_reply(&rejection) {
+        return Ok(response);
+    }
+    let (status, message) = fallback_status(&rejection);
+    Ok(protocol_fallback(status, message, protocol))
+}
+
+fn known_rejection_reply(rejection: &Rejection) -> Option<warp::reply::Response> {
     if let Some(ApiError(err)) = rejection.find::<ApiError>() {
-        return Ok(admin_error_reply(err));
+        return Some(admin_error_reply(err));
     }
     if let Some(ProtocolRejection {
         error,
@@ -160,10 +180,13 @@ pub async fn recover(rejection: Rejection) -> Result<impl Reply, Infallible> {
         {
             response.headers_mut().insert("retry-after", value);
         }
-        return Ok(response);
+        return Some(response);
     }
+    None
+}
 
-    let (status, message) = if rejection.is_not_found() {
+fn fallback_status(rejection: &Rejection) -> (StatusCode, String) {
+    if rejection.is_not_found() {
         (StatusCode::NOT_FOUND, "endpoint not found".to_owned())
     } else if let Some(e) = rejection.find::<warp::filters::body::BodyDeserializeError>() {
         (
@@ -186,8 +209,10 @@ pub async fn recover(rejection: Rejection) -> Result<impl Reply, Infallible> {
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal server error".to_owned(),
         )
-    };
+    }
+}
 
+fn admin_fallback(status: StatusCode, message: String) -> warp::reply::Response {
     let envelope = ErrorEnvelope {
         code: match status {
             StatusCode::NOT_FOUND => "not_found",
@@ -199,7 +224,25 @@ pub async fn recover(rejection: Rejection) -> Result<impl Reply, Infallible> {
         message,
         detail: None,
     };
-    Ok(warp::reply::with_status(warp::reply::json(&envelope), status).into_response())
+    warp::reply::with_status(warp::reply::json(&envelope), status).into_response()
+}
+
+fn protocol_fallback(
+    status: StatusCode,
+    message: String,
+    protocol: Protocol,
+) -> warp::reply::Response {
+    let err = match status {
+        StatusCode::NOT_FOUND => GatewayError::not_found(message),
+        StatusCode::PAYLOAD_TOO_LARGE => GatewayError::new(ErrorKind::PayloadTooLarge, message),
+        StatusCode::INTERNAL_SERVER_ERROR => GatewayError::internal(message),
+        _ => GatewayError::invalid_request(message),
+    };
+    let mut response = protocol_error_reply(&err, protocol);
+    if response.status() != status {
+        *response.status_mut() = status;
+    }
+    response
 }
 
 /// 带协议信息的 rejection，让 `recover` 能回出正确形状的错误体。
