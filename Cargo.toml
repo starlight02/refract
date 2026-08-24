@@ -13,7 +13,7 @@ members = [
 [workspace.package]
 version = "0.3.1"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.98"
 license = "AGPL-3.0-only"
 repository = "https://github.com/starlight02/refract"
 authors = ["星光の殲滅者 <starshine@aili.moe>"]
@@ -53,8 +53,10 @@ refract-api = { path = "crates/refract-api" }
 # async runtime & http
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
-warp = { version = "0.4.3", default-features = false, features = ["websocket"] }
-hyper = "1.11"
+xitca-web = { version = "0.8.2", default-features = false, features = [
+  "http1", "http2", "json", "params", "urlencoded", "websocket",
+] }
+xitca-server = "0.7.0"
 http = "1.5"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "webpki-roots", "system-proxy", "socks", "http2", "charset"] }
 bytes = "1.12"

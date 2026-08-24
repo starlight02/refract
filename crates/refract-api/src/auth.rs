@@ -8,16 +8,15 @@
 //! 存进第三方工具。它泄漏的概率远高于管理令牌。如果两者相同，一次泄漏就
 //! 意味着攻击者能改渠道配置、看全部日志、导出所有上游密钥。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Mutex;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use refract_core::{Channel, ErrorKind, GatewayError, Protocol};
 use refract_store::{ApiKey, ApiKeyRepo, SettingsRepo};
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::Mutex;
-use std::time::Instant;
-use warp::Filter;
+use xitca_web::http::HeaderMap;
 
 /// Session Cookie 名称。
 pub const SESSION_COOKIE_NAME: &str = "refract_session";
@@ -98,7 +97,7 @@ pub fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<St
     None
 }
 
-use crate::error::{ApiError, ProtocolRejection};
+use crate::error::{AppError, ProtocolRejection};
 use crate::state::AppState;
 
 /// 身份可执行的操作。
@@ -285,34 +284,43 @@ pub fn extract_token(
     None
 }
 
-/// Gemini 允许把密钥放 query string 里。
-#[derive(Debug, serde::Deserialize)]
-struct KeyQuery {
-    key: Option<String>,
+/// 从 `application/x-www-form-urlencoded` 查询串取出 Gemini 的 `key`。
+fn query_api_key(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, _)| name == "key")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
 }
 
-/// 网关鉴权过滤器。
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// 网关鉴权。
 ///
 /// `protocol` 决定失败时错误体的形状 —— 401 也要让客户端 SDK 能读懂。
-pub fn authenticate(
-    authenticator: Arc<dyn Authenticator>,
+pub async fn require_gateway(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
     protocol: Protocol,
-) -> impl Filter<Extract = (Principal,), Error = warp::Rejection> + Clone {
-    warp::header::optional::<String>("authorization")
-        .and(warp::header::optional::<String>("x-api-key"))
-        .and(warp::header::optional::<String>("x-goog-api-key"))
-        .and(warp::query::<KeyQuery>())
-        .and(warp::header::optional::<String>("sec-websocket-protocol"))
-        .and_then(move |auth, xapi, xgoog, q: KeyQuery, protocols| {
-            let authenticator = authenticator.clone();
-            async move {
-                let token = extract_token(auth, xapi, xgoog, q.key, protocols);
-                authenticator
-                    .authenticate(token.as_deref())
-                    .await
-                    .map_err(|error| ProtocolRejection::reject(error, protocol))
-            }
-        })
+) -> Result<Principal, AppError> {
+    let token = extract_token(
+        header_string(headers, "authorization"),
+        header_string(headers, "x-api-key"),
+        header_string(headers, "x-goog-api-key"),
+        query_api_key(query),
+        header_string(headers, "sec-websocket-protocol"),
+    );
+    state
+        .authenticator()
+        .authenticate(token.as_deref())
+        .await
+        .map_err(|error| AppError::Protocol(ProtocolRejection::new(error, protocol)))
 }
 
 /// 管理面防爆破守卫：按客户端 IP 记录连续失败次数与封禁截止时间。
@@ -364,83 +372,76 @@ impl AdminGuard {
     }
 }
 
+fn peer_ip(peer: Option<SocketAddr>) -> IpAddr {
+    peer.map(|addr| addr.ip())
+        .filter(|ip| !ip.is_unspecified())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
 /// 管理接口鉴权。
 ///
 /// 首次启动由 bootstrap 签发令牌，默认必须带会话。无哈希时放行只留给
 /// 设置页「关闭管理鉴权」这条显式退出路径。
-pub fn admin_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
-    warp::header::optional::<String>("authorization")
-        .and(warp::header::optional::<String>("x-admin-token"))
-        .and(warp::header::optional::<String>("cookie"))
-        .and(warp::filters::addr::remote())
-        .and_then(
-            move |auth: Option<String>,
-                  x_admin: Option<String>,
-                  cookie: Option<String>,
-                  remote_addr: Option<std::net::SocketAddr>| {
-                let state = state.clone();
-                async move {
-                    let client_ip = remote_addr
-                        .map(|a| a.ip())
-                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-                    let repo = SettingsRepo::new(state.db().clone());
-                    let expected: Option<String> = repo
-                        .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
-                        .await
-                        .map_err(|e| {
-                            warp::reject::custom(ApiError(crate::error::store_to_gateway(e)))
-                        })?;
+pub async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<(), AppError> {
+    let client_ip = peer_ip(peer);
+    let repo = SettingsRepo::new(state.db().clone());
+    let expected: Option<String> = repo
+        .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
+        .await
+        .map_err(|error| AppError::Admin(crate::error::store_to_gateway(error)))?;
 
-                    let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
-                        // 用户在设置里关掉了管理鉴权。
-                        return Ok(());
-                    };
+    let Some(expected_hash) = expected.filter(|hash| !hash.trim().is_empty()) else {
+        // 用户在设置里关掉了管理鉴权。
+        return Ok(());
+    };
 
-                    // 1. 优先检查请求头显式传递的令牌（CLI / 脚本）
-                    if let Some(token) = extract_token(auth, x_admin, None, None, None) {
-                        if constant_time_eq(
-                            refract_store::ApiKeyRepo::hash(&token).as_bytes(),
-                            expected_hash.as_bytes(),
-                        ) {
-                            state.admin_guard().record_success(client_ip);
-                            return Ok(());
-                        } else {
-                            let _locked = state.admin_guard().record_failure(client_ip);
-                            if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
-                                let err = GatewayError::new(
-                                    ErrorKind::PermissionDenied,
-                                    format!(
-                                        "too many failed login attempts, locked for {wait_secs}s"
-                                    ),
-                                )
-                                .with_retry_after(std::time::Duration::from_secs(wait_secs));
-                                return Err(warp::reject::custom(ApiError(err)));
-                            } else {
-                                return Err(warp::reject::custom(ApiError(GatewayError::new(
-                                    ErrorKind::PermissionDenied,
-                                    "invalid admin token",
-                                ))));
-                            }
-                        }
-                    }
+    // 1. 优先检查请求头显式传递的令牌（CLI / 脚本）
+    if let Some(token) = extract_token(
+        header_string(headers, "authorization"),
+        header_string(headers, "x-admin-token"),
+        None,
+        None,
+        None,
+    ) {
+        if constant_time_eq(
+            ApiKeyRepo::hash(&token).as_bytes(),
+            expected_hash.as_bytes(),
+        ) {
+            state.admin_guard().record_success(client_ip);
+            return Ok(());
+        }
+        let _locked = state.admin_guard().record_failure(client_ip);
+        if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
+            let err = GatewayError::new(
+                ErrorKind::PermissionDenied,
+                format!("too many failed login attempts, locked for {wait_secs}s"),
+            )
+            .with_retry_after(std::time::Duration::from_secs(wait_secs));
+            return Err(AppError::Admin(err));
+        }
+        return Err(AppError::Admin(GatewayError::new(
+            ErrorKind::PermissionDenied,
+            "invalid admin token",
+        )));
+    }
 
-                    // 2. 检查 HttpOnly Session Cookie（Web 控制台）
-                    if let Some(cookie_str) = cookie
-                        && let Some(ticket) = extract_cookie_value(&cookie_str, SESSION_COOKIE_NAME)
-                        && verify_session_ticket(&ticket, state.session_secret(), &expected_hash)
-                    {
-                        state.admin_guard().record_success(client_ip);
-                        return Ok(());
-                    }
+    // 2. 检查 HttpOnly Session Cookie（Web 控制台）
+    if let Some(cookie_str) = header_string(headers, "cookie")
+        && let Some(ticket) = extract_cookie_value(&cookie_str, SESSION_COOKIE_NAME)
+        && verify_session_ticket(&ticket, state.session_secret(), &expected_hash)
+    {
+        state.admin_guard().record_success(client_ip);
+        return Ok(());
+    }
 
-                    // 3. 未提供有效凭据
-                    Err(warp::reject::custom(ApiError(
-                        GatewayError::unauthenticated("missing admin token or session"),
-                    )))
-                }
-            },
-        )
-        .untuple_one()
+    // 3. 未提供有效凭据
+    Err(AppError::Admin(GatewayError::unauthenticated(
+        "missing admin token or session",
+    )))
 }
 
 /// 恒时字节比较。

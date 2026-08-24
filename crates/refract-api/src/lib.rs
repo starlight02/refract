@@ -1,7 +1,3 @@
-// warp 过滤器的 or 链会产生深度嵌套的类型，路由数量增长后会撞上
-// 编译器默认的查询深度上限 —— 与 refract-server 相同的处理。
-#![recursion_limit = "256"]
-
 //! HTTP 层。
 //!
 //! 两组路由，边界清晰：
@@ -12,16 +8,12 @@
 //! 两者分开的理由不只是整洁：网关路由的鉴权用「网关 API 密钥」，管理路由用
 //! 「管理令牌」。混在一起意味着一个泄漏的推理密钥能改配置。
 
-// lint 配置统一在 workspace `Cargo.toml` 的 [workspace.lints] 里维护。
-
-#[macro_use]
-pub mod router;
-
 pub mod admin;
 pub mod auth;
 pub mod backup;
 pub mod crypto;
 pub mod error;
+pub mod extract;
 pub mod gateway;
 pub mod metrics;
 pub mod notify;
@@ -31,86 +23,159 @@ pub mod realtime;
 pub mod state;
 pub mod statics;
 
+#[cfg(test)]
+pub mod http_test;
+
 pub use error::{ApiError, ErrorEnvelope};
-pub use router::any_of;
 pub use state::AppState;
 
-use refract_core::Protocol;
-use warp::{Filter, Rejection, Reply as _};
+use std::net::SocketAddr;
+use xitca_web::error::{MatchError, MethodNotAllowed};
+use xitca_web::handler::handler_service;
+use xitca_web::http::{HeaderValue, Method, StatusCode, WebResponse};
+use xitca_web::route::{get, post};
+use xitca_web::service::{Service, fn_service};
+use xitca_web::{App, WebContext};
+
+use crate::error::{AppError, empty_response};
+
+/// 未指定对端地址时视为缺失，鉴权回落到 `127.0.0.1`。
+pub(crate) fn peer_addr(addr: SocketAddr) -> Option<SocketAddr> {
+    if addr.ip().is_unspecified() {
+        None
+    } else {
+        Some(addr)
+    }
+}
 
 /// 装配全部路由。
 ///
 /// 顺序有讲究：管理与网关路由前缀不重叠，静态资源必须放最后 —— 它是
 /// 兜底的 SPA fallback，放前面会把 API 路径吃掉。
-pub fn routes(
+macro_rules! assembled_app {
+    ($state:expr) => {
+        App::new()
+            .at("/health/live", get(handler_service(ops::live)))
+            .at("/health/ready", get(handler_service(ops::ready)))
+            .at("/metrics", get(handler_service(ops::metrics)))
+            .at(
+                "/v1/chat/completions",
+                post(handler_service(gateway::chat_completions)),
+            )
+            .at("/v1/messages", post(handler_service(gateway::messages)))
+            .at("/v1/responses", post(handler_service(gateway::responses)))
+            .at("/v1/embeddings", post(handler_service(gateway::embeddings)))
+            .at(
+                "/v1/completions",
+                post(handler_service(gateway::completions)),
+            )
+            .at(
+                "/v1/images/generations",
+                post(handler_service(gateway::images_generations)),
+            )
+            .at(
+                "/v1/audio/speech",
+                post(handler_service(gateway::audio_speech)),
+            )
+            .at(
+                "/v1/moderations",
+                post(handler_service(gateway::moderations)),
+            )
+            .at("/v1/rerank", post(handler_service(gateway::rerank)))
+            .at(
+                "/v1/messages/count_tokens",
+                post(handler_service(gateway::count_tokens)),
+            )
+            .at(
+                "/v1/audio/transcriptions",
+                post(handler_service(gateway::audio_transcriptions)),
+            )
+            .at(
+                "/v1/audio/translations",
+                post(handler_service(gateway::audio_translations)),
+            )
+            .at(
+                "/v1/images/edits",
+                post(handler_service(gateway::image_edits)),
+            )
+            .at("/v1/models", get(handler_service(gateway::list_models)))
+            .at("/v1/models/{*id}", get(handler_service(gateway::get_model)))
+            .at(
+                "/v1beta/models",
+                get(handler_service(gateway::list_models_gemini)),
+            )
+            .at(
+                "/v1beta/models/{*rest}",
+                get(handler_service(gateway::get_model_gemini))
+                    .post(handler_service(gateway::gemini_action)),
+            )
+            .at("/v1/realtime", get(fn_service(realtime::realtime)))
+            .at("/api", admin::nest())
+            .at("/", get(handler_service(statics::root)))
+            .at("/{*path}", handler_service(statics::asset))
+            .with_state($state)
+            .enclosed_fn(crate::extract::require_admin_mw)
+            .enclosed_fn(options_and_cors)
+    };
+}
+
+/// 装配全部路由，供进程内测试 `finish().call()`。
+pub fn build_app(
     state: AppState,
-) -> impl Filter<Extract = (impl warp::Reply,), Error = std::convert::Infallible> + Clone {
-    // CORS preflight：浏览器里的 LLM 客户端（网页版 SillyTavern、各种
-    // playground）直接打网关端点前会先发 OPTIONS。放最前面统一应答；
-    // 是否附带 CORS 头由下面按路径决定 —— 管理面的预检拿不到许可头，
-    // 跨源调用管理 API 会被浏览器拦下，这正是想要的效果。
-    let preflight = warp::options().map(|| {
-        warp::reply::with_status(warp::reply(), warp::http::StatusCode::NO_CONTENT).into_response()
-    });
-
-    let gateway = gateway::routes(state.clone()).or(realtime::routes(state.clone()));
-    // 前缀过滤器在 recover 之外：/api 的 miss 不能被网关 recover 吃成协议 404。
-    let v1 = gateway_prefix(is_v1)
-        .and(
-            gateway
-                .clone()
-                .recover(|rejection| error::recover_protocol(rejection, Protocol::Chat))
-                .map(warp::Reply::into_response),
-        )
-        .boxed();
-    let v1beta = gateway_prefix(is_v1beta)
-        .and(
-            gateway
-                .recover(|rejection| error::recover_protocol(rejection, Protocol::Gemini))
-                .map(warp::Reply::into_response),
-        )
-        .boxed();
-
-    let api = routes![
-        preflight,
-        ops::routes(state.clone()),
-        admin::routes(state.clone()),
-        v1,
-        v1beta,
-        statics::routes(),
-    ];
-
-    warp::path::full()
-        .and(api.recover(error::recover))
-        .map(|path: warp::path::FullPath, reply| {
-            let response = warp::Reply::into_response(reply);
-            if cors_eligible(path.as_str()) {
-                apply_cors(response)
-            } else {
-                response
-            }
-        })
-        .with(warp::trace::request())
+) -> App<impl Service<Error: std::fmt::Debug> + Send + Sync, impl Send + Sync> {
+    assembled_app!(state)
 }
 
-fn is_v1(path: &str) -> bool {
-    path == "/v1" || path.starts_with("/v1/")
+#[cfg(test)]
+/// 进程内测试：对装配好的应用发一次请求并收齐响应体。
+pub(crate) async fn dispatch_test(
+    state: AppState,
+    request: xitca_web::http::Request<xitca_web::http::RequestExt<xitca_web::body::RequestBody>>,
+) -> (
+    StatusCode,
+    xitca_web::http::HeaderMap,
+    xitca_web::bytes::Bytes,
+) {
+    let service = assembled_app!(state)
+        .finish()
+        .call(())
+        .await
+        .unwrap_or_else(|error| panic!("app finish failed: {error:?}"));
+    let response = service
+        .call(request)
+        .await
+        .unwrap_or_else(|error| panic!("service call failed: {error:?}"));
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = xitca_web::test::collect_body(response.into_body())
+        .await
+        .unwrap_or_else(|error| panic!("collect body failed: {error}"));
+    (status, headers, xitca_web::bytes::Bytes::from(body))
 }
 
-fn is_v1beta(path: &str) -> bool {
-    path == "/v1beta" || path.starts_with("/v1beta/")
+/// 监听并启动 xitca-server。调用方负责 `wait` 与优雅关闭。
+pub fn start_server(
+    state: AppState,
+    listener: std::net::TcpListener,
+) -> std::io::Result<(ServerStop, impl FnOnce() -> std::io::Result<()>)> {
+    let mut server = assembled_app!(state)
+        .serve()
+        .disable_signal()
+        .listen(listener)?
+        .run();
+    let handle = server.handle()?;
+    Ok((ServerStop(handle), move || server.wait()))
 }
 
-fn gateway_prefix(pred: fn(&str) -> bool) -> impl Filter<Extract = (), Error = Rejection> + Clone {
-    warp::path::full()
-        .and_then(move |path: warp::path::FullPath| async move {
-            if pred(path.as_str()) {
-                Ok(())
-            } else {
-                Err(warp::reject::not_found())
-            }
-        })
-        .untuple_one()
+/// 已启动服务器的停止手柄。
+#[derive(Clone)]
+pub struct ServerStop(xitca_server::ServerHandle);
+
+impl ServerStop {
+    /// 请求停机。`graceful` 为真时排空连接。
+    pub fn stop(&self, graceful: bool) {
+        self.0.stop(graceful);
+    }
 }
 
 /// 哪些路径面向浏览器跨源开放。
@@ -130,8 +195,7 @@ fn cors_eligible(path: &str) -> bool {
 /// 使用这个网关。代价是 `require_auth=false` 时本机浏览器里的任意页面
 /// 也能调用网关 —— 文档中已注明，长期开放使用请启用网关鉴权。
 /// 错误响应也必须带这些头 —— 否则浏览器只报「CORS 失败」而吞掉真实错误。
-fn apply_cors(mut response: warp::reply::Response) -> warp::reply::Response {
-    use warp::http::HeaderValue;
+fn apply_cors(response: &mut WebResponse) {
     let headers = response.headers_mut();
     headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     headers.insert(
@@ -145,12 +209,71 @@ fn apply_cors(mut response: warp::reply::Response) -> warp::reply::Response {
         ),
     );
     headers.insert("access-control-max-age", HeaderValue::from_static("86400"));
-    response
+}
+
+fn map_router_error(err: &xitca_web::error::Error, path: &str) -> Option<AppError> {
+    let std_err = err.upcast();
+    if std_err.downcast_ref::<MatchError>().is_some() {
+        return Some(AppError::NotFound {
+            path: path.to_owned(),
+        });
+    }
+    if let Some(denied) = std_err.downcast_ref::<MethodNotAllowed>() {
+        let allowed = denied
+            .allowed_methods()
+            .iter()
+            .map(Method::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(AppError::MethodNotAllowed { allowed });
+    }
+    std_err.downcast_ref::<AppError>().cloned()
+}
+
+async fn options_and_cors<S, E>(
+    service: &S,
+    mut ctx: WebContext<'_, AppState>,
+) -> Result<WebResponse, xitca_web::error::Error>
+where
+    S: for<'r> Service<WebContext<'r, AppState>, Response = WebResponse, Error = E>,
+    E: Into<xitca_web::error::Error>,
+{
+    let path = ctx.req().uri().path().to_owned();
+    let method = ctx.req().method().clone();
+
+    if method == Method::OPTIONS {
+        let mut response = empty_response(StatusCode::NO_CONTENT);
+        if cors_eligible(&path) {
+            apply_cors(&mut response);
+        }
+        tracing::info!(method = %method, path = %path, status = 204);
+        return Ok(response);
+    }
+
+    let mut response = match service.call(ctx.reborrow()).await {
+        Ok(response) => response,
+        Err(error) => {
+            let error = error.into();
+            if let Some(app_error) = map_router_error(&error, &path) {
+                app_error.to_response(&path)
+            } else {
+                Service::call(&error, ctx.reborrow()).await?
+            }
+        }
+    };
+
+    if cors_eligible(&path) {
+        apply_cors(&mut response);
+    }
+    tracing::info!(method = %method, path = %path, status = response.status().as_u16());
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_test::TestRequest;
+    use xitca_web::http::Method;
 
     async fn test_state() -> AppState {
         let db = refract_store::Database::open_in_memory().await.unwrap();
@@ -160,12 +283,11 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_returns_no_content_with_cors_headers() {
-        let response = warp::test::request()
-            .method("OPTIONS")
-            .path("/v1/chat/completions")
+        let response = TestRequest::get("/v1/chat/completions")
+            .method(Method::OPTIONS)
             .header("origin", "https://client.example")
             .header("access-control-request-method", "POST")
-            .reply(&routes(test_state().await))
+            .send(test_state().await)
             .await;
 
         assert_eq!(response.status(), 204);
@@ -185,11 +307,9 @@ mod tests {
     #[tokio::test]
     async fn error_responses_also_carry_cors_headers() {
         // 浏览器只有在错误响应也带 CORS 头时才能读到真实错误信息。
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({ "model": "ghost", "messages": [] }))
-            .reply(&routes(test_state().await))
+            .send(test_state().await)
             .await;
 
         assert_eq!(response.status(), 404);
@@ -201,13 +321,11 @@ mod tests {
         // 管理面是同源应用，发放跨源许可等于把 /api/export 里的密钥明文
         // 暴露给任意网页。GET + 无自定义头是「简单请求」，不经预检直达，
         // 所以防线只能是响应头缺失 —— 断言它确实缺失。
-        let routes = routes(test_state().await);
+        let state = test_state().await;
         for path in ["/api/channels", "/api/export"] {
-            let response = warp::test::request()
-                .method("GET")
-                .path(path)
+            let response = TestRequest::get(path)
                 .header("origin", "https://evil.example")
-                .reply(&routes)
+                .send(state.clone())
                 .await;
             assert!(
                 !response
@@ -218,12 +336,11 @@ mod tests {
         }
 
         // 预检同样不该为管理面放行。
-        let response = warp::test::request()
-            .method("OPTIONS")
-            .path("/api/channels")
+        let response = TestRequest::get("/api/channels")
+            .method(Method::OPTIONS)
             .header("origin", "https://evil.example")
             .header("access-control-request-method", "GET")
-            .reply(&routes)
+            .send(state)
             .await;
         assert!(
             !response
@@ -237,11 +354,9 @@ mod tests {
     async fn metrics_endpoint_never_carries_cors_headers() {
         // Prometheus 从服务端抓取，不需要 CORS；给浏览器脚本留一个
         // 跨源读 /metrics 的口子只会泄漏运行指标（渠道/模型标签、计数）。
-        let response = warp::test::request()
-            .method("GET")
-            .path("/metrics")
+        let response = TestRequest::get("/metrics")
             .header("origin", "https://evil.example")
-            .reply(&routes(test_state().await))
+            .send(test_state().await)
             .await;
         assert_eq!(response.status(), 200);
         assert!(
@@ -254,13 +369,11 @@ mod tests {
 
     #[tokio::test]
     async fn unmatched_v1_path_uses_openai_error_envelope() {
-        let response = warp::test::request()
-            .method("GET")
-            .path("/v1/chat/completion")
-            .reply(&routes(test_state().await))
+        let response = TestRequest::get("/v1/chat/completion")
+            .send(test_state().await)
             .await;
         assert_eq!(response.status(), 404);
-        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        let body = response.json();
         assert_eq!(body["error"]["message"], "endpoint not found");
         assert!(
             body.get("code").is_none(),
@@ -270,29 +383,50 @@ mod tests {
 
     #[tokio::test]
     async fn unmatched_v1beta_path_uses_gemini_error_envelope() {
-        let response = warp::test::request()
-            .method("GET")
-            .path("/v1beta/not-a-real-endpoint")
-            .reply(&routes(test_state().await))
+        let response = TestRequest::get("/v1beta/not-a-real-endpoint")
+            .send(test_state().await)
             .await;
         assert_eq!(response.status(), 404);
-        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        let body = response.json();
         assert_eq!(body["error"]["message"], "endpoint not found");
         assert_eq!(body["error"]["status"], "NOT_FOUND");
     }
 
     #[tokio::test]
     async fn unmatched_admin_path_keeps_admin_envelope() {
-        let response = warp::test::request()
-            .method("GET")
-            .path("/api/does-not-exist")
-            .reply(&routes(test_state().await))
+        let response = TestRequest::get("/api/does-not-exist")
+            .send(test_state().await)
             .await;
-        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        let body = response.json();
         assert!(
             body.get("code").is_some(),
             "admin fallback must keep {{code,message}}, got {body}"
         );
-        assert!(body.get("error").and_then(|e| e.get("message")).is_none());
+        assert!(
+            body.get("error")
+                .and_then(|error| error.get("message"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unmatched_post_is_404_not_catch_all_405() {
+        let state = test_state().await;
+
+        let chat = TestRequest::post("/v1/chat/completion")
+            .send(state.clone())
+            .await;
+        assert_eq!(chat.status(), 404);
+        assert_eq!(chat.json()["error"]["message"], "endpoint not found");
+
+        let gemini = TestRequest::post("/v1beta/not-a-real-endpoint")
+            .send(state.clone())
+            .await;
+        assert_eq!(gemini.status(), 404);
+        assert_eq!(gemini.json()["error"]["status"], "NOT_FOUND");
+
+        let admin = TestRequest::post("/api/does-not-exist").send(state).await;
+        assert!(admin.json().get("code").is_some());
+        assert_eq!(admin.status(), 404);
     }
 }

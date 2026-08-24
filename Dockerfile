@@ -27,7 +27,7 @@ RUN pnpm --filter @refract/admin build
 RUN mkdir -p /admin && cp -r /build/apps/admin/dist /admin/dist
 FROM $admin_src AS admin-final
 
-FROM rust:1.97-alpine AS rust-builder
+FROM rust:1.98-alpine AS rust-builder
 ARG ALPINE_MIRROR
 ARG TARGETARCH
 # Alpine package revisions rotate out of stable indexes; pin the release branch instead.

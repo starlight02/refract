@@ -1,76 +1,60 @@
 //! 无鉴权的服务存活与就绪探针，以及 Prometheus 指标端点。
 
-use std::convert::Infallible;
+use std::net::SocketAddr;
 
 use serde_json::json;
-use warp::filters::BoxedFilter;
-use warp::{Filter, Reply};
+use xitca_web::body::ResponseBody;
+use xitca_web::handler::state::StateRef;
+use xitca_web::http::{HeaderMap, HeaderValue, StatusCode, WebResponse, header};
 
-use crate::state::{AppState, with_state};
+use crate::auth::require_admin;
+use crate::error::{AppError, json_response};
+use crate::state::AppState;
 
-/// 装配 `/health/live`、`/health/ready` 与 `/metrics`。
-pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let metrics = warp::path("metrics")
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(crate::auth::admin_auth(state.clone()))
-        .and(with_state(state.clone()))
-        .map(|state: AppState| {
-            // 与健康探针同样不鉴权：指标不含密钥明文，模型/协议名的暴露面
-            // 与部署内网可达性一致；需要隔离时在反代层挡即可。
-            warp::reply::with_header(
-                state.metrics().render(),
-                "content-type",
-                "text/plain; version=0.0.4; charset=utf-8",
-            )
-            .into_response()
-        });
-    let probes = probe_routes(state);
-    routes![metrics, probes]
+/// `GET /health/live`
+pub async fn live() -> Result<WebResponse, AppError> {
+    Ok(json_response(StatusCode::OK, &json!({"status": "ok"})))
 }
 
-/// 装配 `/health/live` 与 `/health/ready`。
-fn probe_routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let live = warp::path!("health" / "live")
-        .and(warp::path::end())
-        .and(warp::get())
-        .map(|| {
-            warp::reply::with_status(
-                warp::reply::json(&json!({"status": "ok"})),
-                warp::http::StatusCode::OK,
+/// `GET /health/ready`
+pub async fn ready(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let (status, body) = match state.db().ping().await {
+        Ok(()) => (
+            StatusCode::OK,
+            json!({"status": "ok", "checks": {"database": "ok"}}),
+        ),
+        Err(error) => {
+            tracing::warn!(error = %error, "readiness database check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"status": "unavailable", "checks": {"database": "failed"}}),
             )
-            .into_response()
-        });
+        }
+    };
+    Ok(json_response(status, &body))
+}
 
-    let ready = warp::path!("health" / "ready")
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state))
-        .and_then(|state: AppState| async move {
-            let (status, body) = match state.db().ping().await {
-                Ok(()) => (
-                    warp::http::StatusCode::OK,
-                    json!({"status": "ok", "checks": {"database": "ok"}}),
-                ),
-                Err(error) => {
-                    tracing::warn!(error = %error, "readiness database check failed");
-                    (
-                        warp::http::StatusCode::SERVICE_UNAVAILABLE,
-                        json!({"status": "unavailable", "checks": {"database": "failed"}}),
-                    )
-                }
-            };
-            Ok::<_, Infallible>(
-                warp::reply::with_status(warp::reply::json(&body), status).into_response(),
-            )
-        });
-
-    routes![live, ready]
+/// `GET /metrics`
+pub async fn metrics(
+    StateRef(state): StateRef<'_, AppState>,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+) -> Result<WebResponse, AppError> {
+    require_admin(state, headers, crate::peer_addr(addr)).await?;
+    let body = state.metrics().render();
+    let mut response = WebResponse::new(ResponseBody::bytes(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_test::TestRequest;
     use refract_store::Database;
 
     async fn state() -> AppState {
@@ -82,11 +66,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_render_in_prometheus_text_format() {
         let state = state().await;
-        let response = warp::test::request()
-            .method("GET")
-            .path("/metrics")
-            .reply(&routes(state))
-            .await;
+        let response = TestRequest::get("/metrics").send(state).await;
         assert_eq!(response.status(), 200);
         assert!(
             response.headers()["content-type"]
@@ -103,30 +83,18 @@ mod tests {
     async fn liveness_is_independent_of_database_state() {
         let state = state().await;
         state.db().close().await;
-        let response = warp::test::request()
-            .method("GET")
-            .path("/health/live")
-            .reply(&routes(state))
-            .await;
+        let response = TestRequest::get("/health/live").send(state).await;
         assert_eq!(response.status(), 200);
     }
 
     #[tokio::test]
     async fn readiness_tracks_database_availability() {
         let state = state().await;
-        let ready = warp::test::request()
-            .method("GET")
-            .path("/health/ready")
-            .reply(&routes(state.clone()))
-            .await;
+        let ready = TestRequest::get("/health/ready").send(state.clone()).await;
         assert_eq!(ready.status(), 200);
 
         state.db().close().await;
-        let unavailable = warp::test::request()
-            .method("GET")
-            .path("/health/ready")
-            .reply(&routes(state))
-            .await;
+        let unavailable = TestRequest::get("/health/ready").send(state).await;
         assert_eq!(unavailable.status(), 503);
     }
 }

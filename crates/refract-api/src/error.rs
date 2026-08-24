@@ -6,11 +6,18 @@
 //! 都拿不到错误信息，只能抛出一个无意义的解析异常 —— 这是 new-api 上真实
 //! 存在的体验问题。
 
+use std::convert::Infallible;
+use std::fmt;
+use std::pin::pin;
+
 use refract_core::{ErrorKind, GatewayError, Protocol};
 use serde_json::{Value, json};
-use std::convert::Infallible;
-use warp::http::StatusCode;
-use warp::{Rejection, Reply};
+use xitca_web::WebContext;
+use xitca_web::body::{BodyExt, RequestBody, ResponseBody};
+use xitca_web::bytes::Bytes;
+use xitca_web::error::{Error as WebError, Request};
+use xitca_web::http::{HeaderValue, StatusCode, WebResponse, header};
+use xitca_web::service::Service;
 
 /// 管理 API 的错误体。
 ///
@@ -31,8 +38,6 @@ pub struct ErrorEnvelope {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]
 pub struct ApiError(pub GatewayError);
-
-impl warp::reject::Reject for ApiError {}
 
 impl From<GatewayError> for ApiError {
     fn from(err: GatewayError) -> Self {
@@ -91,10 +96,30 @@ pub fn error_body(err: &GatewayError, protocol: Protocol) -> Value {
     }
 }
 
+/// 构造 JSON 响应。
+pub fn json_response(status: StatusCode, body: &impl serde::Serialize) -> WebResponse {
+    let bytes =
+        serde_json::to_vec(body).unwrap_or_else(|_| br#"{"error":"serialize failed"}"#.to_vec());
+    let mut response = WebResponse::new(ResponseBody::bytes(bytes));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// 空 body 响应。
+pub fn empty_response(status: StatusCode) -> WebResponse {
+    let mut response = WebResponse::new(ResponseBody::empty());
+    *response.status_mut() = status;
+    response
+}
+
 /// 构造一个协议正确的错误响应。
-pub fn protocol_error_reply(err: &GatewayError, protocol: Protocol) -> warp::reply::Response {
+pub fn protocol_error_reply(err: &GatewayError, protocol: Protocol) -> WebResponse {
     let status = StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    warp::reply::with_status(warp::reply::json(&error_body(err, protocol)), status).into_response()
+    json_response(status, &error_body(err, protocol))
 }
 
 /// 管理 API 的错误码字符串。
@@ -118,7 +143,7 @@ fn admin_code(kind: ErrorKind) -> &'static str {
 }
 
 /// 管理 API 的错误响应。
-pub fn admin_error_reply(err: &GatewayError) -> warp::reply::Response {
+pub fn admin_error_reply(err: &GatewayError) -> WebResponse {
     let status = StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let envelope = ErrorEnvelope {
         code: admin_code(err.kind),
@@ -126,93 +151,10 @@ pub fn admin_error_reply(err: &GatewayError) -> warp::reply::Response {
         // 上游原始响应对排查渠道配置至关重要 —— 前端会把它折叠展示。
         detail: err.upstream_body.clone(),
     };
-    warp::reply::with_status(warp::reply::json(&envelope), status).into_response()
+    json_response(status, &envelope)
 }
 
-/// warp rejection 到 HTTP 响应的兜底转换。
-///
-/// 请求路径决定错误格式：`/v1` 与 `/v1beta` 下的失败要用协议格式回，
-/// 否则客户端 SDK 解析不了。管理面走 [`recover`]，网关面走 [`recover_protocol`]。
-pub async fn recover(rejection: Rejection) -> Result<warp::reply::Response, Infallible> {
-    if let Some(response) = known_rejection_reply(&rejection) {
-        return Ok(response);
-    }
-    let (status, message) = fallback_status(&rejection);
-    Ok(admin_fallback(status, message))
-}
-
-/// 网关未匹配路由的兜底：404/405 也回协议信封，而不是管理面 `{code,message}`。
-pub async fn recover_protocol(
-    rejection: Rejection,
-    protocol: Protocol,
-) -> Result<warp::reply::Response, Infallible> {
-    if let Some(response) = known_rejection_reply(&rejection) {
-        return Ok(response);
-    }
-    let (status, message) = fallback_status(&rejection);
-    Ok(protocol_fallback(status, message, protocol))
-}
-
-fn known_rejection_reply(rejection: &Rejection) -> Option<warp::reply::Response> {
-    if let Some(ApiError(err)) = rejection.find::<ApiError>() {
-        return Some(admin_error_reply(err));
-    }
-    if let Some(ProtocolRejection {
-        error,
-        protocol,
-        status,
-        request_id,
-    }) = rejection.find::<ProtocolRejection>()
-    {
-        let mut response = protocol_error_reply(error, *protocol);
-        if let Some(status) = status {
-            *response.status_mut() = *status;
-        }
-        if let Some(id) = request_id
-            && let Ok(value) = warp::http::HeaderValue::from_str(id)
-        {
-            // 网关自有标识，与上游透传的 `x-request-id` 分属两条排障链路。
-            response.headers_mut().insert("x-refract-request-id", value);
-        }
-        // 限流（本地或上游）时告诉客户端何时重试 —— 标准客户端会自动遵守。
-        if let Some(wait) = error.retry_after
-            && let Ok(value) = warp::http::HeaderValue::from_str(&wait.as_secs().max(1).to_string())
-        {
-            response.headers_mut().insert("retry-after", value);
-        }
-        return Some(response);
-    }
-    None
-}
-
-fn fallback_status(rejection: &Rejection) -> (StatusCode, String) {
-    if rejection.is_not_found() {
-        (StatusCode::NOT_FOUND, "endpoint not found".to_owned())
-    } else if let Some(e) = rejection.find::<warp::filters::body::BodyDeserializeError>() {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("malformed request body: {e}"),
-        )
-    } else if rejection.find::<warp::reject::MethodNotAllowed>().is_some() {
-        (
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed".to_owned(),
-        )
-    } else if rejection.find::<warp::reject::PayloadTooLarge>().is_some() {
-        (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body too large".to_owned(),
-        )
-    } else {
-        tracing::error!(?rejection, "unhandled rejection");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal server error".to_owned(),
-        )
-    }
-}
-
-fn admin_fallback(status: StatusCode, message: String) -> warp::reply::Response {
+fn admin_fallback(status: StatusCode, message: String) -> WebResponse {
     let envelope = ErrorEnvelope {
         code: match status {
             StatusCode::NOT_FOUND => "not_found",
@@ -224,14 +166,10 @@ fn admin_fallback(status: StatusCode, message: String) -> warp::reply::Response 
         message,
         detail: None,
     };
-    warp::reply::with_status(warp::reply::json(&envelope), status).into_response()
+    json_response(status, &envelope)
 }
 
-fn protocol_fallback(
-    status: StatusCode,
-    message: String,
-    protocol: Protocol,
-) -> warp::reply::Response {
+fn protocol_fallback(status: StatusCode, message: String, protocol: Protocol) -> WebResponse {
     let err = match status {
         StatusCode::NOT_FOUND => GatewayError::not_found(message),
         StatusCode::PAYLOAD_TOO_LARGE => GatewayError::new(ErrorKind::PayloadTooLarge, message),
@@ -245,8 +183,19 @@ fn protocol_fallback(
     response
 }
 
-/// 带协议信息的 rejection，让 `recover` 能回出正确形状的错误体。
-#[derive(Debug)]
+/// 按路径选择协议信封：`/v1beta` → Gemini，`/v1` → Chat，其余 → 管理面。
+pub fn envelope_protocol(path: &str) -> Option<Protocol> {
+    if path == "/v1beta" || path.starts_with("/v1beta/") {
+        Some(Protocol::Gemini)
+    } else if path == "/v1" || path.starts_with("/v1/") {
+        Some(Protocol::Chat)
+    } else {
+        None
+    }
+}
+
+/// 带协议信息的错误，让恢复路径能回出正确形状的错误体。
+#[derive(Debug, Clone)]
 pub struct ProtocolRejection {
     /// 底层错误。
     pub error: GatewayError,
@@ -254,51 +203,208 @@ pub struct ProtocolRejection {
     pub protocol: Protocol,
     /// 少数 HTTP 层错误（例如 405）不能只由领域错误类型表达。
     pub status: Option<StatusCode>,
-    /// 网关生成的请求标识；有值时回写 `x-request-id` 响应头。
+    /// 网关生成的请求标识；有值时回写 `x-refract-request-id` 响应头。
     pub request_id: Option<String>,
 }
 
-impl warp::reject::Reject for ProtocolRejection {}
-
 impl ProtocolRejection {
-    /// 构造一个协议感知的 rejection。
-    pub fn reject(error: GatewayError, protocol: Protocol) -> warp::Rejection {
-        warp::reject::custom(Self {
+    /// 构造一个协议感知的错误。
+    pub fn new(error: GatewayError, protocol: Protocol) -> Self {
+        Self {
             error,
             protocol,
             status: None,
             request_id: None,
-        })
+        }
     }
 
-    /// 构造带请求标识的协议错误 —— 客户端拿着 `x-request-id` 报障时，
+    /// 构造带请求标识的协议错误 —— 客户端拿着 `x-refract-request-id` 报障时，
     /// 失败的请求也要能对上日志。
-    pub fn reject_with_id(
-        error: GatewayError,
-        protocol: Protocol,
-        request_id: String,
-    ) -> warp::Rejection {
-        warp::reject::custom(Self {
+    pub fn with_id(error: GatewayError, protocol: Protocol, request_id: String) -> Self {
+        Self {
             error,
             protocol,
             status: None,
             request_id: Some(request_id),
-        })
+        }
     }
 
     /// 构造带显式 HTTP 状态码的协议错误。
-    pub fn with_status(
-        error: GatewayError,
-        protocol: Protocol,
-        status: StatusCode,
-    ) -> warp::Rejection {
-        warp::reject::custom(Self {
+    pub fn with_status(error: GatewayError, protocol: Protocol, status: StatusCode) -> Self {
+        Self {
             error,
             protocol,
             status: Some(status),
             request_id: None,
-        })
+        }
     }
+
+    /// 渲染为协议信封响应，并补上网关请求标识与 Retry-After。
+    pub fn into_response(&self) -> WebResponse {
+        let mut response = protocol_error_reply(&self.error, self.protocol);
+        if let Some(status) = self.status {
+            *response.status_mut() = status;
+        }
+        if let Some(id) = &self.request_id
+            && let Ok(value) = HeaderValue::from_str(id)
+        {
+            // 网关自有标识，与上游透传的 `x-request-id` 分属两条排障链路。
+            response.headers_mut().insert("x-refract-request-id", value);
+        }
+        // 限流（本地或上游）时告诉客户端何时重试 —— 标准客户端会自动遵守。
+        if let Some(wait) = self.error.retry_after
+            && let Ok(value) = HeaderValue::from_str(&wait.as_secs().max(1).to_string())
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
+        response
+    }
+}
+
+/// handler 的统一错误类型。
+#[derive(Debug, Clone)]
+pub enum AppError {
+    /// 管理面信封。
+    Admin(GatewayError),
+    /// 协议信封。
+    Protocol(ProtocolRejection),
+    /// 未匹配路由。
+    NotFound {
+        /// 原始请求路径，用来选信封。
+        path: String,
+    },
+    /// 方法不允许。
+    MethodNotAllowed {
+        /// 该路径允许的方法，写入错误信息。
+        allowed: String,
+    },
+    /// 请求体超过上限。
+    PayloadTooLarge,
+    /// 畸形请求。
+    BadRequest(String),
+}
+
+impl AppError {
+    /// 按路径把本错误渲染成 HTTP 响应。
+    pub fn to_response(&self, request_path: &str) -> WebResponse {
+        match self {
+            Self::Admin(err) => admin_error_reply(err),
+            Self::Protocol(rejection) => rejection.into_response(),
+            Self::NotFound { path } => match envelope_protocol(path) {
+                Some(protocol) => protocol_fallback(
+                    StatusCode::NOT_FOUND,
+                    "endpoint not found".to_owned(),
+                    protocol,
+                ),
+                None => admin_fallback(StatusCode::NOT_FOUND, "endpoint not found".to_owned()),
+            },
+            Self::MethodNotAllowed { allowed } => {
+                let message = format!("HTTP method not allowed; this endpoint accepts {allowed}");
+                let mut response = match envelope_protocol(request_path) {
+                    Some(protocol) => {
+                        protocol_fallback(StatusCode::METHOD_NOT_ALLOWED, message, protocol)
+                    }
+                    None => admin_fallback(StatusCode::METHOD_NOT_ALLOWED, message),
+                };
+                if let Ok(value) = HeaderValue::from_str(allowed) {
+                    response.headers_mut().insert(header::ALLOW, value);
+                }
+                response
+            }
+            Self::PayloadTooLarge => match envelope_protocol(request_path) {
+                Some(protocol) => protocol_fallback(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body too large".to_owned(),
+                    protocol,
+                ),
+                None => admin_fallback(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body too large".to_owned(),
+                ),
+            },
+            Self::BadRequest(message) => match envelope_protocol(request_path) {
+                Some(protocol) => {
+                    protocol_fallback(StatusCode::BAD_REQUEST, message.clone(), protocol)
+                }
+                None => admin_fallback(StatusCode::BAD_REQUEST, message.clone()),
+            },
+        }
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Admin(err) => write!(f, "{err}"),
+            Self::Protocol(rejection) => write!(f, "{}", rejection.error),
+            Self::NotFound { path } => write!(f, "endpoint not found: {path}"),
+            Self::MethodNotAllowed { allowed } => {
+                write!(
+                    f,
+                    "HTTP method not allowed; this endpoint accepts {allowed}"
+                )
+            }
+            Self::PayloadTooLarge => f.write_str("request body too large"),
+            Self::BadRequest(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl From<ProtocolRejection> for AppError {
+    fn from(rejection: ProtocolRejection) -> Self {
+        Self::Protocol(rejection)
+    }
+}
+
+impl From<ApiError> for AppError {
+    fn from(err: ApiError) -> Self {
+        Self::Admin(err.0)
+    }
+}
+
+impl From<GatewayError> for AppError {
+    fn from(err: GatewayError) -> Self {
+        Self::Admin(err)
+    }
+}
+
+impl From<refract_store::StoreError> for AppError {
+    fn from(err: refract_store::StoreError) -> Self {
+        Self::Admin(store_to_gateway(err))
+    }
+}
+
+impl From<AppError> for WebError {
+    fn from(err: AppError) -> Self {
+        WebError::from_service(err)
+    }
+}
+
+impl<'r> Service<WebContext<'r, Request<'r>>> for AppError {
+    type Response = WebResponse;
+    type Error = Infallible;
+
+    async fn call(&self, ctx: WebContext<'r, Request<'r>>) -> Result<Self::Response, Self::Error> {
+        Ok(self.to_response(ctx.req().uri().path()))
+    }
+}
+
+/// 带上限地读完请求体。超过 `limit` 返回 [`AppError::PayloadTooLarge`]。
+pub async fn collect_limited(body: &mut RequestBody, limit: usize) -> Result<Bytes, AppError> {
+    let mut body = pin!(body);
+    let mut collected = Vec::new();
+    while let Some(chunk) = body.as_mut().data().await {
+        let chunk = chunk.map_err(|error| {
+            AppError::BadRequest(format!("failed to read request body: {error}"))
+        })?;
+        collected.extend_from_slice(chunk.as_ref());
+        if collected.len() > limit {
+            return Err(AppError::PayloadTooLarge);
+        }
+    }
+    Ok(Bytes::from(collected))
 }
 
 #[cfg(test)]

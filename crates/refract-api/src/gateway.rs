@@ -20,24 +20,28 @@
 //!
 //! 1. **流式响应必须边收边发**。把整个流收完再返回等于把流式变成非流式，
 //!    客户端的「打字机效果」会退化成「卡十秒然后全部出现」。所以用
-//!    `warp::sse` 直接桥接上游流，转码在流经过时逐帧发生。
+//!    转码流自己拼 SSE 文本，经 mpsc 边收边发。
 //! 2. **日志在响应结束后才落库**。流式请求的 token 用量只有在最后一帧才知道，
 //!    提前写日志会得到一堆 `output_tokens: 0`。
 
 use std::convert::Infallible;
 
-use bytes::{Buf, Bytes, BytesMut};
-use futures_util::{Stream, StreamExt as _};
+use bytes::Bytes;
+use futures_util::StreamExt as _;
 use refract_core::{ErrorKind, GatewayError, PassKind, Protocol};
 use refract_protocol::StreamAggregator;
 use refract_router::{Diagnosis, InboundPayload, RoutedResponse, RoutedStream};
 use refract_store::NewRequestLog;
 use serde_json::Value;
-use warp::{Filter, Rejection, Reply, filters::BoxedFilter};
+use xitca_web::body::{Frame, RequestBody, ResponseBody, StreamBody};
+use xitca_web::handler::body::Body;
+use xitca_web::handler::params::Params;
+use xitca_web::handler::state::StateRef;
+use xitca_web::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, WebResponse, header};
 
-use crate::auth::{Principal, authenticate};
-use crate::error::ProtocolRejection;
-use crate::state::{AppState, with_state};
+use crate::auth::{Principal, require_gateway};
+use crate::error::{AppError, ProtocolRejection, collect_limited, json_response};
+use crate::state::AppState;
 
 /// 单个推理请求体的硬上限。
 ///
@@ -55,7 +59,7 @@ const FORWARDED_HEADER_NAMES: [&str; 4] =
     ["anthropic-beta", "openai-beta", "http-referer", "x-title"];
 
 /// 从入站请求头里筛出可透传的部分。
-fn forwardable_headers(headers: &warp::http::HeaderMap) -> Vec<(String, String)> {
+fn forwardable_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     FORWARDED_HEADER_NAMES
         .iter()
         .flat_map(|name| headers.get_all(*name).iter().map(move |v| (name, v)))
@@ -70,201 +74,368 @@ fn forwardable_headers(headers: &warp::http::HeaderMap) -> Vec<(String, String)>
 ///
 /// 用自有头而不是 `x-request-id`：后者是上游的标识，端到端透传给客户端
 /// 拿去向上游报障用，覆盖它会把两个排障链路搅在一起。
-fn tag_request_id(mut response: warp::reply::Response, request_id: &str) -> warp::reply::Response {
-    if let Ok(value) = warp::http::HeaderValue::from_str(request_id) {
+fn tag_request_id(mut response: WebResponse, request_id: &str) -> WebResponse {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
         response.headers_mut().insert("x-refract-request-id", value);
     }
     response
 }
 
-/// 装配网关路由。
-///
-/// 四个协议各有自己的路径形状 —— 这是外部契约，不能统一。
-pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    // JSON 形状的直通端点：字节原样往返，只做路由与治理。
-    let json_pass = routes![
-        warp::path!("v1" / "embeddings").and(json_pass_tail(state.clone(), PassKind::Embeddings)),
-        warp::path!("v1" / "completions").and(json_pass_tail(state.clone(), PassKind::Completions)),
-        warp::path!("v1" / "images" / "generations")
-            .and(json_pass_tail(state.clone(), PassKind::Images)),
-        warp::path!("v1" / "audio" / "speech")
-            .and(json_pass_tail(state.clone(), PassKind::AudioSpeech)),
-        warp::path!("v1" / "moderations").and(json_pass_tail(state.clone(), PassKind::Moderations)),
-        warp::path!("v1" / "rerank").and(json_pass_tail(state.clone(), PassKind::Rerank)),
-        warp::path!("v1" / "messages" / "count_tokens")
-            .and(json_pass_tail(state.clone(), PassKind::CountTokens)),
-    ];
-
-    // multipart 形状的直通端点：boundary 原样透传。
-    let multipart_pass = routes![
-        warp::path!("v1" / "audio" / "transcriptions").and(multipart_pass_tail(
-            state.clone(),
-            PassKind::AudioTranscriptions,
+fn protocol_body_error(err: AppError, protocol: Protocol) -> AppError {
+    match err {
+        AppError::PayloadTooLarge => AppError::Protocol(ProtocolRejection::new(
+            GatewayError::new(ErrorKind::PayloadTooLarge, "request body too large"),
+            protocol,
         )),
-        warp::path!("v1" / "audio" / "translations").and(multipart_pass_tail(
-            state.clone(),
-            PassKind::AudioTranslations,
+        AppError::BadRequest(message) => AppError::Protocol(ProtocolRejection::new(
+            GatewayError::invalid_request(message),
+            protocol,
         )),
-        warp::path!("v1" / "images" / "edits")
-            .and(multipart_pass_tail(state.clone(), PassKind::ImageEdits,)),
-    ];
-
-    routes![
-        chat(state.clone()),
-        messages(state.clone()),
-        responses(state.clone()),
-        gemini(state.clone()),
-        json_pass,
-        multipart_pass,
-        list_models(state.clone()),
-        list_models_gemini(state.clone()),
-        get_model(state.clone()),
-        get_model_gemini(state),
-    ]
+        other => other,
+    }
 }
 
-fn chat(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path!("v1" / "chat" / "completions")
-        .and(protocol_method(warp::http::Method::POST, Protocol::Chat))
-        .and(authenticate(state.authenticator(), Protocol::Chat))
-        .and(warp::header::headers_cloned())
-        .and(protocol_json_body(Protocol::Chat))
-        .and(warp::filters::addr::remote())
-        .and(with_state(state))
-        .and_then(|caller, headers, body, remote, state| {
-            dispatch(state, caller, Protocol::Chat, headers, body, None, remote)
-        })
-        .boxed()
-}
-
-/// `POST /v1/messages` —— Anthropic Messages。
-fn messages(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path!("v1" / "messages")
-        .and(protocol_method(
-            warp::http::Method::POST,
-            Protocol::Messages,
+fn parse_json_body(raw: Bytes, protocol: Protocol) -> Result<JsonBody, AppError> {
+    let routing: RoutingFields = serde_json::from_slice(&raw).map_err(|error| {
+        AppError::Protocol(ProtocolRejection::new(
+            GatewayError::invalid_request(format!("malformed request body: {error}")),
+            protocol,
         ))
-        .and(authenticate(state.authenticator(), Protocol::Messages))
-        .and(warp::header::headers_cloned())
-        .and(protocol_json_body(Protocol::Messages))
-        .and(warp::filters::addr::remote())
-        .and(with_state(state))
-        .and_then(|caller, headers, body, remote, state| {
-            dispatch(
-                state,
-                caller,
-                Protocol::Messages,
-                headers,
-                body,
-                None,
-                remote,
-            )
-        })
-        .boxed()
+    })?;
+    Ok(JsonBody {
+        raw,
+        model: routing.model,
+        stream: routing.stream,
+    })
 }
 
-/// `POST /v1/responses` —— OpenAI Responses。
-fn responses(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path!("v1" / "responses")
-        .and(protocol_method(
-            warp::http::Method::POST,
-            Protocol::Responses,
+async fn pass_json(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: std::net::SocketAddr,
+    body: &mut RequestBody,
+    kind: PassKind,
+) -> Result<WebResponse, AppError> {
+    let protocol = kind.protocol();
+    let principal = require_gateway(state, headers, None, protocol).await?;
+    let raw = collect_limited(body, GATEWAY_BODY_LIMIT)
+        .await
+        .map_err(|err| protocol_body_error(err, protocol))?;
+    let parsed = parse_json_body(raw, protocol)?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let model = parsed
+        .model
+        .as_deref()
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| {
+            AppError::Protocol(ProtocolRejection::with_id(
+                GatewayError::invalid_request(
+                    "missing required field `model` — the gateway needs it to route",
+                ),
+                protocol,
+                request_id.clone(),
+            ))
+        })?
+        .to_owned();
+    passthrough_response(
+        state.clone(),
+        principal,
+        kind,
+        request_id,
+        headers.clone(),
+        model,
+        parsed.raw,
+        None,
+        crate::peer_addr(addr),
+    )
+    .await
+}
+
+async fn pass_multipart(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: std::net::SocketAddr,
+    body: &mut RequestBody,
+    kind: PassKind,
+) -> Result<WebResponse, AppError> {
+    let protocol = kind.protocol();
+    let principal = require_gateway(state, headers, None, protocol).await?;
+    let raw = collect_limited(body, MULTIPART_BODY_LIMIT)
+        .await
+        .map_err(|err| protocol_body_error(err, protocol))?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let model = multipart_model(&raw).ok_or_else(|| {
+        AppError::Protocol(ProtocolRejection::with_id(
+            GatewayError::invalid_request(
+                "multipart form must include a `model` field — \
+                 the gateway needs it to route",
+            ),
+            protocol,
+            request_id.clone(),
         ))
-        .and(authenticate(state.authenticator(), Protocol::Responses))
-        .and(warp::header::headers_cloned())
-        .and(protocol_json_body(Protocol::Responses))
-        .and(warp::filters::addr::remote())
-        .and(with_state(state))
-        .and_then(|caller, headers, body, remote, state| {
-            dispatch(
-                state,
-                caller,
-                Protocol::Responses,
-                headers,
-                body,
-                None,
-                remote,
-            )
-        })
-        .boxed()
+    })?;
+    passthrough_response(
+        state.clone(),
+        principal,
+        kind,
+        request_id,
+        headers.clone(),
+        model,
+        raw,
+        content_type,
+        crate::peer_addr(addr),
+    )
+    .await
 }
 
-/// `POST /v1beta/models/{model}:generateContent`（及 `:streamGenerateContent`）。
-///
-/// Gemini 把模型名和动作编码在**路径**里，而不是请求体 —— 所以这里要把它们
-/// 抽出来注入 IR，否则路由器不知道要路由到哪个模型。
-fn gemini(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path!("v1beta" / "models" / String)
-        .and(protocol_method(warp::http::Method::POST, Protocol::Gemini))
-        .and(authenticate(state.authenticator(), Protocol::Gemini))
-        .and(warp::header::headers_cloned())
-        .and(protocol_json_body(Protocol::Gemini))
-        .and(warp::filters::addr::remote())
-        .and(with_state(state))
-        .and_then(
-            |spec: String,
-             principal: Principal,
-             headers: warp::http::HeaderMap,
-             body: JsonBody,
-             remote: Option<std::net::SocketAddr>,
-             state: AppState| async move {
-                // `gemini-2.5-pro:streamGenerateContent` → (模型, 动作)
-                let (model, verb) = spec
-                    .split_once(':')
-                    .unwrap_or((spec.as_str(), "generateContent"));
-                // 计数与嵌入是直通端点，没有转码语义 —— 走字节直通。
-                let pass_kind = match verb {
-                    "countTokens" => Some(PassKind::GeminiCountTokens),
-                    "embedContent" => Some(PassKind::GeminiEmbed),
-                    "batchEmbedContents" => Some(PassKind::GeminiBatchEmbed),
-                    _ => None,
-                };
-                if let Some(kind) = pass_kind {
-                    let request_id = uuid::Uuid::new_v4().to_string();
-                    return passthrough_response(
-                        state,
-                        principal,
-                        kind,
-                        request_id,
-                        headers,
-                        model.to_owned(),
-                        body.raw,
-                        None,
-                        remote,
-                    )
-                    .await;
-                }
-                // 未知动作明确拒绝 —— 误发到 generateContent 会得到一个
-                // 与真实问题毫无关系的上游 400，排障极其误导。
-                if !matches!(verb, "generateContent" | "streamGenerateContent") {
-                    return Err(ProtocolRejection::reject(
-                        GatewayError::invalid_request(format!(
-                            "unsupported Gemini action `:{verb}`; supported: generateContent, \
-                             streamGenerateContent, countTokens, embedContent, batchEmbedContents"
-                        )),
-                        Protocol::Gemini,
-                    ));
-                }
-                let stream = verb.starts_with("stream");
-                dispatch(
-                    state,
-                    principal,
-                    Protocol::Gemini,
-                    headers,
-                    body,
-                    Some(GeminiPath {
-                        model: model.to_owned(),
-                        stream,
-                    }),
-                    remote,
-                )
+macro_rules! json_handler {
+    ($name:ident, $protocol:expr) => {
+        /// 网关 JSON 入口。
+        pub async fn $name(
+            StateRef(state): StateRef<'_, AppState>,
+            headers: &HeaderMap,
+            addr: std::net::SocketAddr,
+            Body(mut body): Body<RequestBody>,
+            req: &xitca_web::http::WebRequest<()>,
+        ) -> Result<WebResponse, AppError> {
+            let principal = require_gateway(state, headers, req.uri().query(), $protocol).await?;
+            let raw = collect_limited(&mut body, GATEWAY_BODY_LIMIT)
                 .await
-            },
-        )
-        .boxed()
+                .map_err(|err| protocol_body_error(err, $protocol))?;
+            let parsed = parse_json_body(raw, $protocol)?;
+            dispatch(
+                state.clone(),
+                principal,
+                $protocol,
+                headers.clone(),
+                parsed,
+                None,
+                crate::peer_addr(addr),
+            )
+            .await
+        }
+    };
 }
 
-/// Gemini 从 URL 里带进来的信息。
+json_handler!(chat_completions, Protocol::Chat);
+json_handler!(messages, Protocol::Messages);
+json_handler!(responses, Protocol::Responses);
+
+macro_rules! pass_json_handler {
+    ($name:ident, $kind:expr) => {
+        /// 网关 JSON 直通入口。
+        pub async fn $name(
+            StateRef(state): StateRef<'_, AppState>,
+            headers: &HeaderMap,
+            addr: std::net::SocketAddr,
+            Body(mut body): Body<RequestBody>,
+            req: &xitca_web::http::WebRequest<()>,
+        ) -> Result<WebResponse, AppError> {
+            let _ = req;
+            pass_json(state, headers, addr, &mut body, $kind).await
+        }
+    };
+}
+
+pass_json_handler!(embeddings, PassKind::Embeddings);
+pass_json_handler!(completions, PassKind::Completions);
+pass_json_handler!(images_generations, PassKind::Images);
+pass_json_handler!(audio_speech, PassKind::AudioSpeech);
+pass_json_handler!(moderations, PassKind::Moderations);
+pass_json_handler!(rerank, PassKind::Rerank);
+pass_json_handler!(count_tokens, PassKind::CountTokens);
+
+macro_rules! pass_multipart_handler {
+    ($name:ident, $kind:expr) => {
+        /// 网关 multipart 直通入口。
+        pub async fn $name(
+            StateRef(state): StateRef<'_, AppState>,
+            headers: &HeaderMap,
+            addr: std::net::SocketAddr,
+            Body(mut body): Body<RequestBody>,
+        ) -> Result<WebResponse, AppError> {
+            pass_multipart(state, headers, addr, &mut body, $kind).await
+        }
+    };
+}
+
+pass_multipart_handler!(audio_transcriptions, PassKind::AudioTranscriptions);
+pass_multipart_handler!(audio_translations, PassKind::AudioTranslations);
+pass_multipart_handler!(image_edits, PassKind::ImageEdits);
+
+/// `GET /v1/models`
+pub async fn list_models(
+    StateRef(state): StateRef<'_, AppState>,
+    headers: &HeaderMap,
+    req: &xitca_web::http::WebRequest<()>,
+) -> Result<WebResponse, AppError> {
+    let principal = require_gateway(state, headers, req.uri().query(), Protocol::Chat).await?;
+    let names = visible_model_names(state, &principal);
+    let now = chrono::Utc::now().timestamp();
+    let data: Vec<Value> = names
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": now,
+                "owned_by": "refract",
+            })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &serde_json::json!({ "object": "list", "data": data }),
+    ))
+}
+
+/// `GET /v1/models/{*id}`
+pub async fn get_model(
+    StateRef(state): StateRef<'_, AppState>,
+    headers: &HeaderMap,
+    Params(model): Params<String>,
+    req: &xitca_web::http::WebRequest<()>,
+) -> Result<WebResponse, AppError> {
+    let principal = require_gateway(state, headers, req.uri().query(), Protocol::Chat).await?;
+    if model.is_empty() || !visible_model_names(state, &principal).contains(&model) {
+        return Err(AppError::Protocol(ProtocolRejection::new(
+            GatewayError::not_found(format!("model `{model}` does not exist")),
+            Protocol::Chat,
+        )));
+    }
+    Ok(json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "id": model,
+            "object": "model",
+            "created": chrono::Utc::now().timestamp(),
+            "owned_by": "refract",
+        }),
+    ))
+}
+
+/// `GET /v1beta/models`
+pub async fn list_models_gemini(
+    StateRef(state): StateRef<'_, AppState>,
+    headers: &HeaderMap,
+    req: &xitca_web::http::WebRequest<()>,
+) -> Result<WebResponse, AppError> {
+    let principal = require_gateway(state, headers, req.uri().query(), Protocol::Gemini).await?;
+    let models: Vec<Value> = visible_model_names(state, &principal)
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": format!("models/{name}"),
+                "displayName": name,
+                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+            })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &serde_json::json!({ "models": models }),
+    ))
+}
+
+/// `GET /v1beta/models/{*rest}`
+pub async fn get_model_gemini(
+    StateRef(state): StateRef<'_, AppState>,
+    headers: &HeaderMap,
+    Params(rest): Params<String>,
+    req: &xitca_web::http::WebRequest<()>,
+) -> Result<WebResponse, AppError> {
+    let principal = require_gateway(state, headers, req.uri().query(), Protocol::Gemini).await?;
+    let raw = rest.trim_matches('/');
+    let model = raw.strip_prefix("models/").unwrap_or(raw).to_owned();
+    if model.is_empty() || !visible_model_names(state, &principal).contains(&model) {
+        return Err(AppError::Protocol(ProtocolRejection::new(
+            GatewayError::not_found(format!("model `{model}` does not exist")),
+            Protocol::Gemini,
+        )));
+    }
+    Ok(json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "name": format!("models/{model}"),
+            "displayName": model,
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+        }),
+    ))
+}
+
+/// `POST /v1beta/models/{*rest}`
+pub async fn gemini_action(
+    StateRef(state): StateRef<'_, AppState>,
+    headers: &HeaderMap,
+    addr: std::net::SocketAddr,
+    Params(rest): Params<String>,
+    Body(mut body): Body<RequestBody>,
+    req: &xitca_web::http::WebRequest<()>,
+) -> Result<WebResponse, AppError> {
+    let principal = require_gateway(state, headers, req.uri().query(), Protocol::Gemini).await?;
+    let spec = rest.trim_matches('/');
+    let spec = spec.strip_prefix("models/").unwrap_or(spec);
+    let (model, verb) = spec.split_once(':').unwrap_or((spec, "generateContent"));
+    let pass_kind = match verb {
+        "countTokens" => Some(PassKind::GeminiCountTokens),
+        "embedContent" => Some(PassKind::GeminiEmbed),
+        "batchEmbedContents" => Some(PassKind::GeminiBatchEmbed),
+        _ => None,
+    };
+    let raw = collect_limited(&mut body, GATEWAY_BODY_LIMIT)
+        .await
+        .map_err(|err| protocol_body_error(err, Protocol::Gemini))?;
+    if let Some(kind) = pass_kind {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        return passthrough_response(
+            state.clone(),
+            principal,
+            kind,
+            request_id,
+            headers.clone(),
+            model.to_owned(),
+            raw,
+            None,
+            crate::peer_addr(addr),
+        )
+        .await;
+    }
+    if !matches!(verb, "generateContent" | "streamGenerateContent") {
+        return Err(AppError::Protocol(ProtocolRejection::new(
+            GatewayError::invalid_request(format!(
+                "unsupported Gemini action `:{verb}`; supported: generateContent, \
+                 streamGenerateContent, countTokens, embedContent, batchEmbedContents"
+            )),
+            Protocol::Gemini,
+        )));
+    }
+    let parsed = parse_json_body(raw, Protocol::Gemini)?;
+    dispatch(
+        state.clone(),
+        principal,
+        Protocol::Gemini,
+        headers.clone(),
+        parsed,
+        Some(GeminiPath {
+            model: model.to_owned(),
+            stream: verb.starts_with("stream"),
+        }),
+        crate::peer_addr(addr),
+    )
+    .await
+}
+
+/// 原始 JSON 与路由所需的轻量字段；完整 IR 由 executor 按需构造。
+struct JsonBody {
+    raw: Bytes,
+    model: Option<String>,
+    stream: bool,
+}
+
 struct GeminiPath {
     model: String,
     stream: bool,
@@ -272,100 +443,6 @@ struct GeminiPath {
 
 /// multipart 请求体的大小上限：音频文件（OpenAI 限 25MB）加表单开销。
 const MULTIPART_BODY_LIMIT: usize = 64 * 1024 * 1024;
-
-/// JSON 形状直通端点在路径之后的公共尾部。
-///
-/// 直通端点没有跨协议转换语义（Anthropic 无图像 API，Gemini 嵌入形状完全
-/// 不同），只透传到与入口协议同构的原生端点：把对应模型加进渠道的模型
-/// 列表即可路由。别名、参数覆盖、熔断、重试与对话请求一致。
-fn json_pass_tail(state: AppState, kind: PassKind) -> BoxedFilter<(warp::reply::Response,)> {
-    let protocol = kind.protocol();
-    protocol_method(warp::http::Method::POST, protocol)
-        .and(authenticate(state.authenticator(), protocol))
-        .and(warp::header::headers_cloned())
-        .and(protocol_json_body(protocol))
-        .and(warp::filters::addr::remote())
-        .and(with_state(state))
-        .and_then(
-            move |principal: Principal,
-                  headers: warp::http::HeaderMap,
-                  body: JsonBody,
-                  remote: Option<std::net::SocketAddr>,
-                  state: AppState| async move {
-                let request_id = uuid::Uuid::new_v4().to_string();
-                let model = body
-                    .model
-                    .as_deref()
-                    .filter(|model| !model.is_empty())
-                    .ok_or_else(|| {
-                        ProtocolRejection::reject_with_id(
-                            GatewayError::invalid_request(
-                                "missing required field `model` — the gateway needs it to route",
-                            ),
-                            kind.protocol(),
-                            request_id.clone(),
-                        )
-                    })?
-                    .to_owned();
-                passthrough_response(
-                    state, principal, kind, request_id, headers, model, body.raw, None, remote,
-                )
-                .await
-            },
-        )
-        .boxed()
-}
-
-/// multipart 形状直通端点（音频转写/翻译、图像编辑）的公共尾部。
-///
-/// 表单原始字节连同 boundary 原样送往上游；`model` 从表单字段提取，
-/// 仅用于路由决策。
-fn multipart_pass_tail(state: AppState, kind: PassKind) -> BoxedFilter<(warp::reply::Response,)> {
-    let protocol = kind.protocol();
-    protocol_method(warp::http::Method::POST, protocol)
-        .and(authenticate(state.authenticator(), protocol))
-        .and(warp::header::headers_cloned())
-        .and(warp::body::stream())
-        .and(warp::filters::addr::remote())
-        .and(with_state(state))
-        .and_then(
-            move |principal: Principal,
-                  headers: warp::http::HeaderMap,
-                  stream,
-                  remote: Option<std::net::SocketAddr>,
-                  state: AppState| async move {
-                let request_id = uuid::Uuid::new_v4().to_string();
-                let raw = read_raw_body(stream, protocol, MULTIPART_BODY_LIMIT).await?;
-                let content_type = headers
-                    .get(warp::http::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
-                let model = multipart_model(&raw).ok_or_else(|| {
-                    ProtocolRejection::reject_with_id(
-                        GatewayError::invalid_request(
-                            "multipart form must include a `model` field — \
-                             the gateway needs it to route",
-                        ),
-                        protocol,
-                        request_id.clone(),
-                    )
-                })?;
-                passthrough_response(
-                    state,
-                    principal,
-                    kind,
-                    request_id,
-                    headers,
-                    model,
-                    raw,
-                    content_type,
-                    remote,
-                )
-                .await
-            },
-        )
-        .boxed()
-}
 
 /// 直通请求的分发与执行。
 ///
@@ -377,25 +454,25 @@ async fn passthrough_response(
     principal: Principal,
     kind: PassKind,
     request_id: String,
-    headers: warp::http::HeaderMap,
+    headers: HeaderMap,
     model: String,
     raw: Bytes,
     content_type: Option<String>,
     remote_addr: Option<std::net::SocketAddr>,
-) -> Result<warp::reply::Response, Rejection> {
+) -> Result<WebResponse, AppError> {
     let inbound = kind.protocol();
     let started = std::time::Instant::now();
 
     enforce_ip_limit(&state, remote_addr.map(|a| a.ip()), inbound, &request_id)?;
     if !principal.allows_model(&model) {
-        return Err(ProtocolRejection::reject_with_id(
+        return Err(AppError::Protocol(ProtocolRejection::with_id(
             GatewayError::new(
                 refract_core::ErrorKind::PermissionDenied,
                 format!("this API key is not allowed to use model `{model}`"),
             ),
             inbound,
             request_id,
-        ));
+        )));
     }
     enforce_rate_limit(&state, &principal, inbound, &request_id)?;
     let _concurrency_permit = enforce_global_limits(&state, inbound, &request_id)?;
@@ -411,12 +488,11 @@ async fn passthrough_response(
             .planner()
             .plan(allowed_channels.iter().copied(), &model, inbound, &mut rng)
     };
-    // 透传没有转码路径：只保留入口协议的原生端点。
-    route.attempts.retain(|c| c.protocol() == inbound);
+    route
+        .attempts
+        .retain(|candidate| candidate.protocol() == inbound);
 
-    // 透传端点同样吃模型级亲和：缓存键按 key+model 走，与 chat 请求共享。
     let affinity = resolve_affinity(&state, &principal, inbound, &headers, &raw, &model);
-    // 黏性密钥策略的锚点与 dispatch 一致。
     route.identity = principal.key_id().map(|id| id as u64);
     if let Some(decision) = &affinity
         && let Some(bound) = decision.binding
@@ -435,7 +511,6 @@ async fn passthrough_response(
         stream: false,
         forward_headers: forwardable_headers(&headers),
         capture_bodies,
-        // multipart 混着文件字节，文本快照没有意义。
         request_snapshot: (capture_bodies
             && !content_type
                 .as_deref()
@@ -455,7 +530,6 @@ async fn passthrough_response(
         return Err(context.reject(err));
     }
 
-    // 绑定即承诺时截掉兜底尝试：透传端点同样遵守。
     let pinned = context.affinity.as_ref().and_then(|d| d.binding);
     let pinned_only = context
         .affinity
@@ -486,7 +560,6 @@ async fn passthrough_response(
             return Err(context.reject(error));
         }
     };
-    // 成功（含兜底换渠道）→ 记录或改写绑定。
     if let Some(decision) = &context.affinity {
         context
             .state
@@ -531,18 +604,13 @@ async fn passthrough_response(
 }
 
 /// 尽力从直通响应提取输入侧用量；解析失败不影响透传。
-///
-/// 图像与音频端点不返回 token 用量（0 是准确值而非缺失）；计数端点的
-/// 返回值是「这段输入折多少 token」，记进输入侧便于观察。
 fn passthrough_usage(kind: PassKind, body: &Bytes) -> u64 {
     #[derive(serde::Deserialize, Default)]
     struct Envelope {
         #[serde(default)]
         usage: Option<UsageFields>,
-        // Anthropic count_tokens：{"input_tokens": N}
         #[serde(default)]
         input_tokens: Option<u64>,
-        // Gemini countTokens：{"totalTokens": N}
         #[serde(default, rename = "totalTokens")]
         total_tokens: Option<u64>,
     }
@@ -553,7 +621,6 @@ fn passthrough_usage(kind: PassKind, body: &Bytes) -> u64 {
     }
     let envelope = serde_json::from_slice::<Envelope>(body).unwrap_or_default();
     match kind {
-        // legacy completions 与 embeddings 一样在 usage.prompt_tokens 里报输入量。
         PassKind::Embeddings | PassKind::Completions => {
             envelope.usage.unwrap_or_default().prompt_tokens
         }
@@ -564,13 +631,8 @@ fn passthrough_usage(kind: PassKind, body: &Bytes) -> u64 {
 }
 
 /// 从 multipart 字节里提取 `model` 字段值。
-///
-/// 值区间由「双 CRLF 之后到下一个 CRLF」界定（model 是文本字段，值必然
-/// 单行），这个结构由 RFC 7578 保证；不值得为一个字段引入完整解析器。
 fn multipart_model(raw: &[u8]) -> Option<String> {
     const MARKER: &[u8] = b"name=\"model\"";
-    // 逐次定位 marker：必须出现在属性边界上（`;` 或空白之后），否则
-    // `filename="model"` 这类属性会被误当成 model 字段。
     let mut search_from = 0usize;
     loop {
         let rest = &raw[search_from..];
@@ -594,39 +656,6 @@ fn multipart_model(raw: &[u8]) -> Option<String> {
     }
 }
 
-/// `GET /v1/models` —— 模型清单。
-///
-/// 由渠道快照派生，形状照抄 OpenAI（Anthropic/Gemini 的 SDK 也认这个形状的变体，
-/// 但真正会调这个端点的几乎都是 OpenAI 系工具）。
-fn list_models(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path!("v1" / "models")
-        .and(protocol_method(warp::http::Method::GET, Protocol::Chat))
-        .and(authenticate(state.authenticator(), Protocol::Chat))
-        .and(with_state(state))
-        .and_then(|principal: Principal, state: AppState| async move {
-            let names = visible_model_names(&state, &principal);
-            let now = chrono::Utc::now().timestamp();
-            let data: Vec<Value> = names
-                .iter()
-                .map(|id| {
-                    serde_json::json!({
-                        "id": id,
-                        "object": "model",
-                        "created": now,
-                        "owned_by": "refract",
-                    })
-                })
-                .collect();
-
-            Ok::<_, Rejection>(
-                warp::reply::json(&serde_json::json!({ "object": "list", "data": data }))
-                    .into_response(),
-            )
-        })
-        .boxed()
-}
-
-/// 调用者可见的去重模型名清单。三个模型发现端点共用。
 fn visible_model_names(state: &AppState, principal: &Principal) -> Vec<String> {
     let channels = state.channels();
     let allowed_channels: Vec<_> = channels
@@ -637,164 +666,23 @@ fn visible_model_names(state: &AppState, principal: &Principal) -> Vec<String> {
         .planner()
         .visible_models(allowed_channels)
         .into_iter()
-        .filter(|m| principal.allows_model(m))
+        .filter(|name| principal.allows_model(name))
         .collect();
     names.sort_unstable();
     names.dedup();
     names
 }
 
-/// `GET /v1/models/{model}` —— OpenAI 单模型查询。
-///
-/// 不少 SDK 在启动时用它验证配置的模型是否存在，404 会直接卡死接入。
-fn get_model(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    // 用 tail 而不是单段 String：带命名空间的模型 id（如 `openai/gpt-4o`）
-    // 含 `/`，单段匹配会 404，把 SDK 的启动校验直接卡死。
-    warp::path!("v1" / "models" / ..)
-        .and(warp::path::tail())
-        .and(protocol_method(warp::http::Method::GET, Protocol::Chat))
-        .and(authenticate(state.authenticator(), Protocol::Chat))
-        .and(with_state(state))
-        .and_then(
-            |tail: warp::path::Tail, principal: Principal, state: AppState| async move {
-                let model = tail.as_str().to_owned();
-                if model.is_empty() || !visible_model_names(&state, &principal).contains(&model) {
-                    return Err(ProtocolRejection::reject(
-                        GatewayError::not_found(format!("model `{model}` does not exist")),
-                        Protocol::Chat,
-                    ));
-                }
-                Ok::<_, Rejection>(
-                    warp::reply::json(&serde_json::json!({
-                        "id": model,
-                        "object": "model",
-                        "created": chrono::Utc::now().timestamp(),
-                        "owned_by": "refract",
-                    }))
-                    .into_response(),
-                )
-            },
-        )
-        .boxed()
-}
-
-/// `GET /v1beta/models` —— Gemini 形状的模型清单。
-///
-/// Google 官方 SDK 启动时会打这个端点；只回 OpenAI 形状等于把 Gemini
-/// 客户端挡在门外。
-fn list_models_gemini(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path!("v1beta" / "models")
-        .and(protocol_method(warp::http::Method::GET, Protocol::Gemini))
-        .and(authenticate(state.authenticator(), Protocol::Gemini))
-        .and(with_state(state))
-        .and_then(|principal: Principal, state: AppState| async move {
-            let models: Vec<Value> = visible_model_names(&state, &principal)
-                .into_iter()
-                .map(|name| {
-                    serde_json::json!({
-                        "name": format!("models/{name}"),
-                        "displayName": name,
-                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
-                    })
-                })
-                .collect();
-            Ok::<_, Rejection>(
-                warp::reply::json(&serde_json::json!({ "models": models })).into_response(),
-            )
-        })
-        .boxed()
-}
-
-/// `GET /v1beta/models/{model}` —— Gemini 单模型查询。
-///
-/// 官方 SDK 启动时会打这个端点；只实现清单会让单模型探测落到 POST 路由上吃 405。
-fn get_model_gemini(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    // 必须先匹配 GET：同一路径前缀还承载 POST :generateContent。
-    // 若先吃路径再 protocol_method(GET)，自定义 405 不会落到后面的 POST 路由。
-    warp::get()
-        .and(warp::path!("v1beta" / "models" / ..))
-        .and(warp::path::tail())
-        .and(authenticate(state.authenticator(), Protocol::Gemini))
-        .and(with_state(state))
-        .and_then(
-            |tail: warp::path::Tail, principal: Principal, state: AppState| async move {
-                let raw = tail.as_str().trim_matches('/');
-                let model = raw.strip_prefix("models/").unwrap_or(raw).to_owned();
-                if model.is_empty() || !visible_model_names(&state, &principal).contains(&model) {
-                    return Err(ProtocolRejection::reject(
-                        GatewayError::not_found(format!("model `{model}` does not exist")),
-                        Protocol::Gemini,
-                    ));
-                }
-                Ok::<_, Rejection>(
-                    warp::reply::json(&serde_json::json!({
-                        "name": format!("models/{model}"),
-                        "displayName": model,
-                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
-                    }))
-                    .into_response(),
-                )
-            },
-        )
-        .boxed()
-}
-
-/// 协议感知的方法检查。
-///
-/// 使用 `warp::post()` 会在进入 handler 前产生一个没有协议信息的 rejection，
-/// 全局恢复器只能回管理 API 形状。这里把 405 包装成协议错误，官方 SDK 才能
-/// 正常读到 `error.message`。
-fn protocol_method(
-    expected: warp::http::Method,
-    protocol: Protocol,
-) -> impl Filter<Extract = (), Error = Rejection> + Clone {
-    warp::method()
-        .and_then(move |actual: warp::http::Method| {
-            let expected = expected.clone();
-            async move {
-                if actual == expected {
-                    Ok(())
-                } else {
-                    Err(ProtocolRejection::with_status(
-                        GatewayError::invalid_request(format!(
-                            "method `{actual}` is not allowed; use `{expected}`"
-                        )),
-                        protocol,
-                        warp::http::StatusCode::METHOD_NOT_ALLOWED,
-                    ))
-                }
-            }
-        })
-        .untuple_one()
-}
-
-/// 有硬上限、且把解析失败包装成对应协议错误的 JSON body。
-fn protocol_json_body(
-    protocol: Protocol,
-) -> impl Filter<Extract = (JsonBody,), Error = Rejection> + Clone {
-    warp::body::stream().and_then(move |stream| read_json_body(stream, protocol))
-}
-
-/// 原始 JSON 与路由所需的轻量字段；完整 IR 由 executor 按需构造。
-struct JsonBody {
-    raw: Bytes,
-    model: Option<String>,
-    stream: bool,
-}
-
 /// 管理面 Playground 的入口：用本地身份直接走完整的分发管线。
 ///
 /// 不发放临时网关密钥、不绕过任何路由/熔断/日志逻辑 —— Playground 请求
 /// 与真实客户端请求唯一的区别是鉴权面（管理令牌而非网关密钥）。
-pub(crate) async fn playground_chat(
-    state: AppState,
-    raw: Bytes,
-) -> Result<warp::reply::Response, Rejection> {
+pub(crate) async fn playground_chat(state: AppState, raw: Bytes) -> Result<WebResponse, AppError> {
     let routing: RoutingFields = serde_json::from_slice(&raw).map_err(|error| {
-        ProtocolRejection::reject(
+        AppError::Protocol(ProtocolRejection::new(
             GatewayError::invalid_request(format!("malformed request body: {error}")),
             Protocol::Chat,
-        )
+        ))
     })?;
     let body = JsonBody {
         raw,
@@ -805,7 +693,7 @@ pub(crate) async fn playground_chat(
         state,
         Principal::local(refract_core::DEFAULT_OWNER_ID),
         Protocol::Chat,
-        warp::http::HeaderMap::new(),
+        HeaderMap::new(),
         body,
         None,
         None,
@@ -842,9 +730,9 @@ fn body_snapshot(bytes: &[u8]) -> String {
 }
 
 /// 响应是否值得存文本快照 —— 音频等二进制存进 TEXT 列只会产生乱码。
-fn snapshot_worthy(headers: &warp::http::HeaderMap) -> bool {
+fn snapshot_worthy(headers: &HeaderMap) -> bool {
     headers
-        .get(warp::http::header::CONTENT_TYPE)
+        .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_none_or(|ct| {
             ct.starts_with("application/json") || ct.starts_with("text/") || ct.contains("+json")
@@ -872,8 +760,12 @@ struct DispatchContext {
 
 impl DispatchContext {
     /// 构造带请求标识的协议错误，失败响应也能对上日志。
-    fn reject(&self, error: GatewayError) -> Rejection {
-        ProtocolRejection::reject_with_id(error, self.inbound, self.request_id.clone())
+    fn reject(&self, error: GatewayError) -> AppError {
+        AppError::Protocol(ProtocolRejection::with_id(
+            error,
+            self.inbound,
+            self.request_id.clone(),
+        ))
     }
 }
 
@@ -895,7 +787,7 @@ fn resolve_affinity(
     state: &AppState,
     principal: &Principal,
     inbound: Protocol,
-    headers: &warp::http::HeaderMap,
+    headers: &HeaderMap,
     body: &Bytes,
     model: &str,
 ) -> Option<refract_router::AffinityDecision> {
@@ -952,69 +844,6 @@ fn settle_affinity_on_failure(state: &AppState, decision: &refract_router::Affin
     }
 }
 
-/// 把请求体流收集为字节，超过 `limit` 直接以 413 拒绝。
-async fn read_raw_body<S, B>(
-    stream: S,
-    protocol: Protocol,
-    limit: usize,
-) -> Result<Bytes, Rejection>
-where
-    S: Stream<Item = Result<B, warp::Error>>,
-    B: Buf,
-{
-    futures_util::pin_mut!(stream);
-    let mut body = BytesMut::new();
-
-    while let Some(chunk) = stream.next().await {
-        let mut chunk = chunk.map_err(|_| {
-            ProtocolRejection::reject(
-                GatewayError::invalid_request("failed to read request body"),
-                protocol,
-            )
-        })?;
-
-        if body.len().saturating_add(chunk.remaining()) > limit {
-            return Err(ProtocolRejection::reject(
-                GatewayError::new(
-                    ErrorKind::PayloadTooLarge,
-                    format!("request body exceeds {limit} bytes"),
-                ),
-                protocol,
-            ));
-        }
-
-        while chunk.has_remaining() {
-            let part = chunk.chunk();
-            if part.is_empty() {
-                break;
-            }
-            body.extend_from_slice(part);
-            chunk.advance(part.len());
-        }
-    }
-
-    Ok(body.freeze())
-}
-
-async fn read_json_body<S, B>(stream: S, protocol: Protocol) -> Result<JsonBody, Rejection>
-where
-    S: Stream<Item = Result<B, warp::Error>>,
-    B: Buf,
-{
-    let raw = read_raw_body(stream, protocol, GATEWAY_BODY_LIMIT).await?;
-    let routing: RoutingFields = serde_json::from_slice(&raw).map_err(|error| {
-        ProtocolRejection::reject(
-            GatewayError::invalid_request(format!("malformed request body: {error}")),
-            protocol,
-        )
-    })?;
-    Ok(JsonBody {
-        raw,
-        model: routing.model,
-        stream: routing.stream,
-    })
-}
-
 /// 请求分发的核心。
 ///
 /// 所有四个协议汇聚到这里 —— 差异已经在 codec 里被吸收掉了。
@@ -1022,11 +851,11 @@ async fn dispatch(
     state: AppState,
     principal: Principal,
     inbound: Protocol,
-    headers: warp::http::HeaderMap,
+    headers: HeaderMap,
     body: JsonBody,
     gemini_path: Option<GeminiPath>,
     remote_addr: Option<std::net::SocketAddr>,
-) -> Result<warp::reply::Response, Rejection> {
+) -> Result<WebResponse, AppError> {
     let started = std::time::Instant::now();
     let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -1040,11 +869,11 @@ async fn dispatch(
                 .as_deref()
                 .filter(|model| !model.is_empty())
                 .ok_or_else(|| {
-                    ProtocolRejection::reject_with_id(
+                    AppError::Protocol(ProtocolRejection::with_id(
                         GatewayError::invalid_request("missing required field `model`"),
                         inbound,
                         request_id.clone(),
-                    )
+                    ))
                 })?
                 .to_owned();
             (model, body.stream)
@@ -1053,14 +882,14 @@ async fn dispatch(
 
     // 密钥的模型白名单 —— 在路由之前拦截，避免「路由成功但无权访问」的混乱语义。
     if !principal.allows_model(&model) {
-        return Err(ProtocolRejection::reject_with_id(
+        return Err(AppError::Protocol(ProtocolRejection::with_id(
             GatewayError::new(
                 refract_core::ErrorKind::PermissionDenied,
                 format!("this API key is not allowed to use model `{model}`"),
             ),
             inbound,
             request_id,
-        ));
+        )));
     }
     enforce_rate_limit(&state, &principal, inbound, &request_id)?;
     let concurrency_permit = enforce_global_limits(&state, inbound, &request_id)?;
@@ -1151,7 +980,7 @@ async fn unary_response(
     raw: JsonBody,
     route: refract_router::Route<'_>,
     pinned: Option<refract_core::ChannelId>,
-) -> Result<warp::reply::Response, Rejection> {
+) -> Result<WebResponse, AppError> {
     // 亲和钉住且 skip_retry_on_failure：绑定即承诺，失败不偷偷换渠道
     // 造成会话漂移 —— 错误原样返回，绑定保留。
     let pinned_only = context
@@ -1218,11 +1047,13 @@ async fn unary_response(
                 .codecs()
                 .for_protocol(inbound)
                 .encode_response(payload)
-                .map_err(|e| ProtocolRejection::reject_with_id(e, inbound, request_id.clone()))?;
+                .map_err(|e| {
+                    AppError::Protocol(ProtocolRejection::with_id(e, inbound, request_id.clone()))
+                })?;
             if capture_bodies {
                 response_snapshot = Some(body_snapshot(body.to_string().as_bytes()));
             }
-            warp::reply::json(&body).into_response()
+            json_response(StatusCode::OK, &body)
         }
     };
     let response = tag_request_id(response, &request_id);
@@ -1255,21 +1086,16 @@ async fn unary_response(
 }
 
 /// 构造同协议非流式响应，并只保留可跨连接转发的 headers。
-fn native_unary_response(
-    upstream: &refract_upstream::UpstreamRawResponse,
-) -> warp::reply::Response {
-    let mut response = warp::reply::Response::new(upstream.body.clone().into());
-    if let Ok(status) = warp::http::StatusCode::from_u16(upstream.status) {
+fn native_unary_response(upstream: &refract_upstream::UpstreamRawResponse) -> WebResponse {
+    let mut response = WebResponse::new(ResponseBody::bytes(upstream.body.clone()));
+    if let Ok(status) = StatusCode::from_u16(upstream.status) {
         *response.status_mut() = status;
     }
     copy_end_to_end_headers(&upstream.headers, response.headers_mut(), false);
-    if !response
-        .headers()
-        .contains_key(warp::http::header::CONTENT_TYPE)
-    {
+    if !response.headers().contains_key(header::CONTENT_TYPE) {
         response.headers_mut().insert(
-            warp::http::header::CONTENT_TYPE,
-            warp::http::HeaderValue::from_static("application/json"),
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
         );
     }
     response
@@ -1277,7 +1103,7 @@ fn native_unary_response(
 
 /// 流式响应。
 ///
-/// 关键在于**不等流结束**：`warp::sse::reply` 接受一个 `Stream`，我们把上游流
+/// 关键在于**不等流结束**：响应体是 `StreamBody`，我们把上游流
 /// 包装后直接交出去。转码逐帧发生，日志在流的末尾用 `finally` 语义补写。
 async fn stream_response(
     dispatch: DispatchContext,
@@ -1285,7 +1111,7 @@ async fn stream_response(
     route: refract_router::Route<'_>,
     pinned: Option<refract_core::ChannelId>,
     concurrency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> Result<warp::reply::Response, Rejection> {
+) -> Result<WebResponse, AppError> {
     let pinned_only = dispatch
         .affinity
         .as_ref()
@@ -1474,17 +1300,31 @@ async fn record_stream_endpoint_health(
 fn transcoded_stream_response(
     context: StreamContext,
     mut upstream: refract_upstream::SseStream,
-) -> warp::reply::Response {
+) -> WebResponse {
     let codecs = context.state.codecs();
     let decoder = codecs
         .for_protocol(context.upstream_protocol)
         .stream_decoder();
     let encoder = codecs.for_protocol(context.inbound).stream_encoder();
 
-    // warp 0.4 的 SSE reply 要求返回流 `Sync`，而上游流与 codec 状态机只保证
-    // `Send`。把生产者放到独立 Tokio task，响应侧只持有线程安全的 mpsc Receiver：
-    // 非 Sync 的网络/codec/数据库状态不会穿过 warp 的 Reply 边界。
-    let (tx, rx) = tokio::sync::mpsc::channel::<warp::sse::Event>(32);
+    // 转码流与 codec 状态机只保证 `Send`。把生产者放到独立 Tokio task，
+    // 响应侧只持有线程安全的 mpsc Receiver。
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+    let keep_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if keep_tx
+                .send(Bytes::from_static(b": keep-alive\n\n"))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut decoder = decoder;
         let mut encoder = encoder;
@@ -1664,16 +1504,29 @@ fn transcoded_stream_response(
         record(&context.state, entry, context.key_id, usage.total());
     });
 
-    let stream =
-        tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<warp::sse::Event, Infallible>);
-    warp::sse::reply(warp::sse::keep_alive().stream(stream)).into_response()
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|bytes: Bytes| Ok::<_, Infallible>(Frame::Data(bytes)));
+    let mut response = WebResponse::new(ResponseBody::boxed(StreamBody::new(stream)));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
 }
 
 /// 原生协议流：不解析、不重编码，逐字节转发上游 SSE。
 fn native_stream_response(
     context: StreamContext,
     upstream: refract_upstream::UpstreamRawStream,
-) -> warp::reply::Response {
+) -> WebResponse {
     let refract_upstream::UpstreamRawStream {
         status,
         headers,
@@ -1682,9 +1535,10 @@ fn native_stream_response(
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
     tokio::spawn(relay_native_stream(context, upstream, tx));
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<Bytes, std::io::Error>);
-    let mut response = warp::reply::stream(stream).into_response();
-    if let Ok(status) = warp::http::StatusCode::from_u16(status) {
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|bytes: Bytes| Ok::<_, Infallible>(Frame::Data(bytes)));
+    let mut response = WebResponse::new(ResponseBody::boxed(StreamBody::new(stream)));
+    if let Ok(status) = StatusCode::from_u16(status) {
         *response.status_mut() = status;
     }
     copy_end_to_end_headers(&headers, response.headers_mut(), true);
@@ -1692,16 +1546,15 @@ fn native_stream_response(
     // SSE 流，上游把它错标成 text/plain（部分反代会这样）不该传染给客户端
     // —— 客户端 SDK 靠这个头决定按流解析还是整体读取。
     response.headers_mut().insert(
-        warp::http::header::CONTENT_TYPE,
-        warp::http::HeaderValue::from_static("text/event-stream"),
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
     );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     response.headers_mut().insert(
-        warp::http::header::CACHE_CONTROL,
-        warp::http::HeaderValue::from_static("no-cache"),
-    );
-    response.headers_mut().insert(
-        warp::http::HeaderName::from_static("x-accel-buffering"),
-        warp::http::HeaderValue::from_static("no"),
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
     );
     response
 }
@@ -1850,13 +1703,9 @@ async fn relay_native_stream(
 }
 
 /// 复制端到端响应头；逐连接 headers 不能跨代理边界继续传播。
-fn copy_end_to_end_headers(
-    source: &warp::http::HeaderMap,
-    target: &mut warp::http::HeaderMap,
-    streaming: bool,
-) {
+fn copy_end_to_end_headers(source: &HeaderMap, target: &mut HeaderMap, streaming: bool) {
     let connection_tokens: Vec<String> = source
-        .get_all(warp::http::header::CONNECTION)
+        .get_all(header::CONNECTION)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
@@ -1867,8 +1716,7 @@ fn copy_end_to_end_headers(
     // 同名头第一次出现用 insert 覆盖 target 里的预设值（如流式路径预置的
     // Content-Type），之后的重复出现才 append —— 否则预设值 + 上游值会在
     // 响应里产生两个 Content-Type。多值头（如 Set-Cookie）仍然保留全部。
-    let mut seen: std::collections::HashSet<warp::http::HeaderName> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<HeaderName> = std::collections::HashSet::new();
     for (name, value) in source {
         let lower = name.as_str();
         let hop_by_hop = matches!(
@@ -1882,7 +1730,7 @@ fn copy_end_to_end_headers(
                 | "transfer-encoding"
                 | "upgrade"
         ) || connection_tokens.iter().any(|token| token == lower);
-        if hop_by_hop || (streaming && name == warp::http::header::CONTENT_LENGTH) {
+        if hop_by_hop || (streaming && name == header::CONTENT_LENGTH) {
             continue;
         }
         if seen.insert(name.clone()) {
@@ -1922,24 +1770,29 @@ fn inspect_native_frames(
 
 /// 向客户端发送一批已经编码的 SSE 帧；返回 false 表示客户端已断开。
 async fn send_frames(
-    tx: &tokio::sync::mpsc::Sender<warp::sse::Event>,
+    tx: &tokio::sync::mpsc::Sender<Bytes>,
     frames: Vec<refract_protocol::SseFrame>,
 ) -> bool {
     for frame in frames {
-        if tx.send(to_sse(&frame)).await.is_err() {
+        if tx.send(sse_bytes(&frame)).await.is_err() {
             return false;
         }
     }
     true
 }
 
-/// 把协议帧转成 warp 的 SSE 事件。
-fn to_sse(frame: &refract_protocol::SseFrame) -> warp::sse::Event {
-    let event = warp::sse::Event::default().data(&frame.data);
-    match &frame.event {
-        Some(name) => event.event(name),
-        None => event,
+/// 把协议帧转成 SSE 文本。
+fn sse_bytes(frame: &refract_protocol::SseFrame) -> Bytes {
+    let mut out = String::new();
+    if let Some(name) = &frame.event {
+        out.push_str("event: ");
+        out.push_str(name);
+        out.push('\n');
     }
+    out.push_str("data: ");
+    out.push_str(&frame.data);
+    out.push_str("\n\n");
+    Bytes::from(out)
 }
 
 /// 写一条失败日志。
@@ -1984,7 +1837,7 @@ pub(crate) fn enforce_global_limits(
     state: &AppState,
     inbound: Protocol,
     request_id: &str,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Rejection> {
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, AppError> {
     let limits = state.global_limits();
     if let Err(exceeded) = state.rate_limiter().admit(
         crate::rate::GLOBAL_WINDOW_KEY,
@@ -2006,11 +1859,11 @@ pub(crate) fn enforce_global_limits(
             ),
         )
         .with_retry_after(std::time::Duration::from_secs(exceeded.retry_after_secs));
-        return Err(ProtocolRejection::reject_with_id(
+        return Err(AppError::Protocol(ProtocolRejection::with_id(
             error,
             inbound,
             request_id.to_owned(),
-        ));
+        )));
     }
     match state.concurrency_semaphore() {
         None => Ok(None),
@@ -2026,11 +1879,11 @@ pub(crate) fn enforce_global_limits(
                     ),
                 )
                 .with_retry_after(std::time::Duration::from_secs(1));
-                Err(ProtocolRejection::reject_with_id(
+                Err(AppError::Protocol(ProtocolRejection::with_id(
                     error,
                     inbound,
                     request_id.to_owned(),
-                ))
+                )))
             }
         },
     }
@@ -2042,7 +1895,7 @@ pub(crate) fn enforce_rate_limit(
     principal: &Principal,
     inbound: Protocol,
     request_id: &str,
-) -> Result<(), Rejection> {
+) -> Result<(), AppError> {
     let Some(key) = principal.api_key.as_deref() else {
         return Ok(());
     };
@@ -2060,11 +1913,11 @@ pub(crate) fn enforce_rate_limit(
             ),
         )
         .with_retry_after(std::time::Duration::from_secs(exceeded.retry_after_secs));
-        return Err(ProtocolRejection::reject_with_id(
+        return Err(AppError::Protocol(ProtocolRejection::with_id(
             error,
             inbound,
             request_id.to_owned(),
-        ));
+        )));
     }
     Ok(())
 }
@@ -2075,7 +1928,7 @@ pub(crate) fn enforce_ip_limit(
     remote_ip: Option<std::net::IpAddr>,
     inbound: Protocol,
     request_id: &str,
-) -> Result<(), Rejection> {
+) -> Result<(), AppError> {
     let limits = state.ip_limits();
     if limits.rpm == 0 {
         return Ok(());
@@ -2090,11 +1943,11 @@ pub(crate) fn enforce_ip_limit(
             ),
         )
         .with_retry_after(std::time::Duration::from_secs(exceeded.retry_after_secs));
-        return Err(ProtocolRejection::reject_with_id(
+        return Err(AppError::Protocol(ProtocolRejection::with_id(
             error,
             inbound,
             request_id.to_owned(),
-        ));
+        )));
     }
     Ok(())
 }
@@ -2287,14 +2140,12 @@ mod tests {
 
         let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "messages": [{ "role": "user", "content": "ping" }]
             }))
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2322,11 +2173,9 @@ mod tests {
             vec![ModelEntry::mapped("my-embed", "text-embedding-3-small")];
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/embeddings")
+        let response = crate::http_test::TestRequest::post("/v1/embeddings")
             .json(&serde_json::json!({ "model": "my-embed", "input": "hello" }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2360,11 +2209,9 @@ mod tests {
         channel.endpoints[0].models = vec![ModelEntry::mapped("my-image", "gpt-image-1")];
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/images/generations")
+        let response = crate::http_test::TestRequest::post("/v1/images/generations")
             .json(&serde_json::json!({ "model": "my-image", "prompt": "a cat" }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2406,12 +2253,10 @@ mod tests {
             "FAKEAUDIO\r\n",
             "--BOUNDARY--\r\n",
         );
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/audio/transcriptions")
+        let response = crate::http_test::TestRequest::post("/v1/audio/transcriptions")
             .header("content-type", "multipart/form-data; boundary=BOUNDARY")
             .body(form)
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2442,12 +2287,10 @@ mod tests {
             "DATA\r\n",
             "--B--\r\n",
         );
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/audio/transcriptions")
+        let response = crate::http_test::TestRequest::post("/v1/audio/transcriptions")
             .header("content-type", "multipart/form-data; boundary=B")
             .body(form)
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 400);
     }
@@ -2466,14 +2309,12 @@ mod tests {
         let channel = channel_at(&server.uri(), Protocol::Messages, &["claude-sonnet-4-6"]);
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/messages/count_tokens")
+        let response = crate::http_test::TestRequest::post("/v1/messages/count_tokens")
             .json(&serde_json::json!({
                 "model": "claude-sonnet-4-6",
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2499,14 +2340,13 @@ mod tests {
         let channel = channel_at(&server.uri(), Protocol::Gemini, &["gemini-2.5-pro"]);
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1beta/models/gemini-2.5-pro:countTokens")
-            .json(&serde_json::json!({
-                "contents": [{ "parts": [{ "text": "hi" }] }]
-            }))
-            .reply(&crate::routes(state.clone()))
-            .await;
+        let response =
+            crate::http_test::TestRequest::post("/v1beta/models/gemini-2.5-pro:countTokens")
+                .json(&serde_json::json!({
+                    "contents": [{ "parts": [{ "text": "hi" }] }]
+                }))
+                .send(state.clone())
+                .await;
 
         assert_eq!(response.status(), 200);
         let body: Value = serde_json::from_slice(response.body()).unwrap();
@@ -2524,23 +2364,17 @@ mod tests {
             &["gpt-4o"],
         )])
         .await;
-        let api = crate::routes(state);
-
         // OpenAI 单模型查询。
-        let response = warp::test::request()
-            .method("GET")
-            .path("/v1/models/gpt-4o")
-            .reply(&api)
+        let response = crate::http_test::TestRequest::get("/v1/models/gpt-4o")
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
         let body: Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["id"], "gpt-4o");
         assert_eq!(body["object"], "model");
 
-        let missing = warp::test::request()
-            .method("GET")
-            .path("/v1/models/ghost")
-            .reply(&api)
+        let missing = crate::http_test::TestRequest::get("/v1/models/ghost")
+            .send(state.clone())
             .await;
         assert_eq!(missing.status(), 404);
 
@@ -2551,56 +2385,43 @@ mod tests {
             &["openai/gpt-4o"],
         )])
         .await;
-        let ns_api = crate::routes(ns_state);
-        let namespaced = warp::test::request()
-            .method("GET")
-            .path("/v1/models/openai/gpt-4o")
-            .reply(&ns_api)
+        let namespaced = crate::http_test::TestRequest::get("/v1/models/openai/gpt-4o")
+            .send(ns_state.clone())
             .await;
         assert_eq!(namespaced.status(), 200);
         let body: Value = serde_json::from_slice(namespaced.body()).unwrap();
         assert_eq!(body["id"], "openai/gpt-4o");
 
         // Gemini 形状清单。
-        let gemini = warp::test::request()
-            .method("GET")
-            .path("/v1beta/models")
-            .reply(&api)
+        let gemini = crate::http_test::TestRequest::get("/v1beta/models")
+            .send(state.clone())
             .await;
         assert_eq!(gemini.status(), 200);
         let body: Value = serde_json::from_slice(gemini.body()).unwrap();
         assert_eq!(body["models"][0]["name"], "models/gpt-4o");
 
-        let listed = warp::test::request()
-            .method("GET")
-            .path("/v1/models")
-            .reply(&api)
+        let listed = crate::http_test::TestRequest::get("/v1/models")
+            .send(state.clone())
             .await;
         assert_eq!(listed.status(), 200);
         let body: Value = serde_json::from_slice(listed.body()).unwrap();
         assert_eq!(body["object"], "list");
         assert_eq!(body["data"][0]["id"], "gpt-4o");
 
-        let gemini_one = warp::test::request()
-            .method("GET")
-            .path("/v1beta/models/gpt-4o")
-            .reply(&api)
+        let gemini_one = crate::http_test::TestRequest::get("/v1beta/models/gpt-4o")
+            .send(state.clone())
             .await;
         assert_eq!(gemini_one.status(), 200);
         let body: Value = serde_json::from_slice(gemini_one.body()).unwrap();
         assert_eq!(body["name"], "models/gpt-4o");
 
-        let gemini_prefixed = warp::test::request()
-            .method("GET")
-            .path("/v1beta/models/models/gpt-4o")
-            .reply(&api)
+        let gemini_prefixed = crate::http_test::TestRequest::get("/v1beta/models/models/gpt-4o")
+            .send(state.clone())
             .await;
         assert_eq!(gemini_prefixed.status(), 200);
 
-        let gemini_missing = warp::test::request()
-            .method("GET")
-            .path("/v1beta/models/ghost")
-            .reply(&api)
+        let gemini_missing = crate::http_test::TestRequest::get("/v1beta/models/ghost")
+            .send(state.clone())
             .await;
         assert_eq!(gemini_missing.status(), 404);
     }
@@ -2626,11 +2447,9 @@ mod tests {
             &["codestral-fim"],
         )])
         .await;
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/completions")
+        let response = crate::http_test::TestRequest::post("/v1/completions")
             .json(&serde_json::json!({ "model": "codestral-fim", "prompt": "fn main() {" }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2656,14 +2475,13 @@ mod tests {
         let channel = channel_at(&server.uri(), Protocol::Gemini, &["text-embedding-004"]);
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1beta/models/text-embedding-004:embedContent")
-            .json(&serde_json::json!({
-                "content": { "parts": [{ "text": "hello" }] }
-            }))
-            .reply(&crate::routes(state.clone()))
-            .await;
+        let response =
+            crate::http_test::TestRequest::post("/v1beta/models/text-embedding-004:embedContent")
+                .json(&serde_json::json!({
+                    "content": { "parts": [{ "text": "hello" }] }
+                }))
+                .send(state.clone())
+                .await;
 
         assert_eq!(response.status(), 200);
         let body: Value = serde_json::from_slice(response.body()).unwrap();
@@ -2684,15 +2502,15 @@ mod tests {
         let channel = channel_at(&server.uri(), Protocol::Gemini, &["text-embedding-004"]);
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1beta/models/text-embedding-004:batchEmbedContents")
-            .json(&serde_json::json!({
-                "requests": [{ "model": "models/text-embedding-004",
-                               "content": { "parts": [{ "text": "hi" }] } }]
-            }))
-            .reply(&crate::routes(state.clone()))
-            .await;
+        let response = crate::http_test::TestRequest::post(
+            "/v1beta/models/text-embedding-004:batchEmbedContents",
+        )
+        .json(&serde_json::json!({
+            "requests": [{ "model": "models/text-embedding-004",
+                           "content": { "parts": [{ "text": "hi" }] } }]
+        }))
+        .send(state.clone())
+        .await;
 
         assert_eq!(response.status(), 200);
     }
@@ -2700,12 +2518,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_gemini_verbs_are_rejected_up_front() {
         let state = state_with(vec![]).await;
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1beta/models/gemini-2.5-pro:tuneModel")
-            .json(&serde_json::json!({}))
-            .reply(&crate::routes(state))
-            .await;
+        let response =
+            crate::http_test::TestRequest::post("/v1beta/models/gemini-2.5-pro:tuneModel")
+                .json(&serde_json::json!({}))
+                .send(state.clone())
+                .await;
 
         assert_eq!(response.status(), 400);
         let body: Value = serde_json::from_slice(response.body()).unwrap();
@@ -2733,11 +2550,9 @@ mod tests {
         let channel = channel_at(&server.uri(), Protocol::Chat, &["tts-1"]);
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/audio/speech")
+        let response = crate::http_test::TestRequest::post("/v1/audio/speech")
             .json(&serde_json::json!({ "model": "tts-1", "input": "hi", "voice": "alloy" }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2745,7 +2560,7 @@ mod tests {
             response.headers().get("content-type").unwrap(),
             "audio/mpeg"
         );
-        assert_eq!(response.body().as_ref(), b"ID3FAKEMP3");
+        assert_eq!(response.body(), b"ID3FAKEMP3");
     }
 
     #[test]
@@ -2796,14 +2611,12 @@ mod tests {
             .await;
 
         let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "messages": [{ "role": "user", "content": "secret-ping" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
 
@@ -2848,14 +2661,12 @@ mod tests {
             .unwrap();
         state.reload_capture_bodies().await.unwrap();
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "messages": [{ "role": "user", "content": "private" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
 
@@ -2882,14 +2693,12 @@ mod tests {
             .await;
 
         let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "messages": [{ "role": "user", "content": "boom" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 400);
 
@@ -2940,14 +2749,12 @@ mod tests {
             .unwrap();
         state.reload_pricing().await.unwrap();
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
 
@@ -2972,14 +2779,12 @@ mod tests {
 
         // 连续三次凭据错误触发自动禁用（阈值 = 3）。
         for _ in 0..3 {
-            let response = warp::test::request()
-                .method("POST")
-                .path("/v1/chat/completions")
+            let response = crate::http_test::TestRequest::post("/v1/chat/completions")
                 .json(&serde_json::json!({
                     "model": "gpt-4o",
                     "messages": [{ "role": "user", "content": "hi" }]
                 }))
-                .reply(&crate::routes(state.clone()))
+                .send(state.clone())
                 .await;
             assert_eq!(response.status(), 401);
         }
@@ -3059,14 +2864,12 @@ mod tests {
             .unwrap();
         state.reload_breaker().await.unwrap();
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert!(response.status().is_server_error());
 
@@ -3128,15 +2931,13 @@ mod tests {
             .unwrap();
         state.reload_pricing().await.unwrap();
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/messages")
+        let response = crate::http_test::TestRequest::post("/v1/messages")
             .json(&serde_json::json!({
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 100,
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
 
@@ -3186,12 +2987,8 @@ mod tests {
             .unwrap();
         let client = refract_upstream::UpstreamClient::new(Default::default()).unwrap();
         let state = AppState::bootstrap(db, client, true).await.unwrap();
-        let api = crate::routes(state);
-
         let request = || {
-            warp::test::request()
-                .method("POST")
-                .path("/v1/chat/completions")
+            crate::http_test::TestRequest::post("/v1/chat/completions")
                 .header("authorization", format!("Bearer {plaintext}"))
                 .json(&serde_json::json!({
                     "model": "gpt-4o",
@@ -3199,11 +2996,11 @@ mod tests {
                 }))
         };
 
-        let first = request().reply(&api).await;
+        let first = request().send(state.clone()).await;
         assert_eq!(first.status(), 200);
 
         // 同一分钟内的第二个请求超过 rpm=1，429 且带 Retry-After。
-        let second = request().reply(&api).await;
+        let second = request().send(state.clone()).await;
         assert_eq!(second.status(), 429);
         let retry_after: u64 = second
             .headers()
@@ -3249,23 +3046,18 @@ mod tests {
             .await
             .unwrap();
         state.reload_global_limits().await.unwrap();
-        let api = crate::routes(state);
-
         let request = || {
-            warp::test::request()
-                .method("POST")
-                .path("/v1/chat/completions")
-                .json(&serde_json::json!({
-                    "model": "gpt-4o",
-                    "messages": [{ "role": "user", "content": "hi" }]
-                }))
+            crate::http_test::TestRequest::post("/v1/chat/completions").json(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
         };
 
         // 第一个请求放行（窗口初始为空），并把 100 token 计入全局窗口。
-        assert_eq!(request().reply(&api).await.status(), 200);
+        assert_eq!(request().send(state.clone()).await.status(), 200);
 
         // 窗口已达 tpm=100 上限，下一个请求被挡。
-        let blocked = request().reply(&api).await;
+        let blocked = request().send(state.clone()).await;
         assert_eq!(blocked.status(), 429);
         let retry_after: u64 = blocked
             .headers()
@@ -3315,23 +3107,18 @@ mod tests {
             .await
             .unwrap();
         state.reload_global_limits().await.unwrap();
-        let api = crate::routes(state);
-
         let request = || {
-            warp::test::request()
-                .method("POST")
-                .path("/v1/chat/completions")
-                .json(&serde_json::json!({
-                    "model": "gpt-4o",
-                    "messages": [{ "role": "user", "content": "hi" }]
-                }))
+            crate::http_test::TestRequest::post("/v1/chat/completions").json(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
         };
 
         // rpm=2 意味着恰好放行两个请求：若两个维度各计一次 requests，第二个就会被挡。
-        assert_eq!(request().reply(&api).await.status(), 200);
-        assert_eq!(request().reply(&api).await.status(), 200);
+        assert_eq!(request().send(state.clone()).await.status(), 200);
+        assert_eq!(request().send(state.clone()).await.status(), 200);
 
-        let blocked = request().reply(&api).await;
+        let blocked = request().send(state.clone()).await;
         assert_eq!(blocked.status(), 429);
         let message = serde_json::from_slice::<Value>(blocked.body()).unwrap()["error"]["message"]
             .as_str()
@@ -3355,11 +3142,9 @@ mod tests {
         };
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/embeddings")
+        let response = crate::http_test::TestRequest::post("/v1/embeddings")
             .json(&serde_json::json!({ "model": "embed-model", "input": "x" }))
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 404);
@@ -3384,12 +3169,10 @@ mod tests {
         let request_body =
             br#"{ "model" : "gpt-4o", "messages" : [], "future_request" : [1,2,3] }"#;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .header("content-type", "application/json")
-            .body(request_body)
-            .reply(&crate::routes(state))
+            .body(request_body.as_slice())
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -3422,11 +3205,9 @@ mod tests {
             .await;
         let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({"model": "gpt-4o", "messages": []}))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 201);
@@ -3551,14 +3332,14 @@ mod tests {
 
     #[test]
     fn response_header_filter_removes_hop_by_hop_and_stream_length() {
-        let mut source = warp::http::HeaderMap::new();
+        let mut source = HeaderMap::new();
         source.insert("connection", "x-hop".parse().unwrap());
         source.insert("x-hop", "private".parse().unwrap());
         source.insert("transfer-encoding", "chunked".parse().unwrap());
         source.insert("content-length", "42".parse().unwrap());
         source.insert("x-request-id", "req-1".parse().unwrap());
 
-        let mut unary = warp::http::HeaderMap::new();
+        let mut unary = HeaderMap::new();
         copy_end_to_end_headers(&source, &mut unary, false);
         assert_eq!(unary.get("content-length").unwrap(), "42");
         assert_eq!(unary.get("x-request-id").unwrap(), "req-1");
@@ -3566,7 +3347,7 @@ mod tests {
         assert!(!unary.contains_key("x-hop"));
         assert!(!unary.contains_key("transfer-encoding"));
 
-        let mut streaming = warp::http::HeaderMap::new();
+        let mut streaming = HeaderMap::new();
         copy_end_to_end_headers(&source, &mut streaming, true);
         assert!(!streaming.contains_key("content-length"));
         assert_eq!(streaming.get("x-request-id").unwrap(), "req-1");
@@ -3581,14 +3362,12 @@ mod tests {
         )])
         .await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "does-not-exist",
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 404);
@@ -3603,15 +3382,13 @@ mod tests {
         channel.endpoints[0].transcode = TranscodePolicy::DISABLED;
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/messages")
+        let response = crate::http_test::TestRequest::post("/v1/messages")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "max_tokens": 16,
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 400);
@@ -3627,15 +3404,13 @@ mod tests {
         // 错误体的形状也是外部契约 —— Anthropic SDK 读 error.type。
         let state = state_with(vec![]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/messages")
+        let response = crate::http_test::TestRequest::post("/v1/messages")
             .json(&serde_json::json!({
                 "model": "nope",
                 "max_tokens": 16,
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         let body: Value = serde_json::from_slice(response.body()).unwrap();
@@ -3647,24 +3422,20 @@ mod tests {
     async fn malformed_json_uses_the_inbound_protocol_error_envelope() {
         let state = state_with(vec![]).await;
 
-        let chat = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let chat = crate::http_test::TestRequest::post("/v1/chat/completions")
             .header("content-type", "application/json")
             .body("{")
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(chat.status(), 400);
         let chat_body: Value = serde_json::from_slice(chat.body()).unwrap();
         assert!(chat_body["error"]["message"].is_string());
         assert!(chat_body["error"]["type"].is_string());
 
-        let messages = warp::test::request()
-            .method("POST")
-            .path("/v1/messages")
+        let messages = crate::http_test::TestRequest::post("/v1/messages")
             .header("content-type", "application/json")
             .body("{")
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
         assert_eq!(messages.status(), 400);
         let messages_body: Value = serde_json::from_slice(messages.body()).unwrap();
@@ -3675,13 +3446,12 @@ mod tests {
     #[tokio::test]
     async fn wrong_method_uses_the_protocol_envelope_and_405() {
         let state = state_with(vec![]).await;
-        let response = warp::test::request()
-            .method("GET")
-            .path("/v1/responses")
-            .reply(&crate::routes(state))
+        let response = crate::http_test::TestRequest::get("/v1/responses")
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 405);
+        assert_eq!(response.headers()["allow"], "POST");
         let body: Value = serde_json::from_slice(response.body()).unwrap();
         assert!(
             body["error"]["message"]
@@ -3717,15 +3487,13 @@ mod tests {
         };
         let state = state_with(vec![channel]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/messages")
+        let response = crate::http_test::TestRequest::post("/v1/messages")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "max_tokens": 32,
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -3756,14 +3524,13 @@ mod tests {
         )])
         .await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1beta/models/gemini-2.5-pro:generateContent")
-            .json(&serde_json::json!({
-                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
-            }))
-            .reply(&crate::routes(state))
-            .await;
+        let response =
+            crate::http_test::TestRequest::post("/v1beta/models/gemini-2.5-pro:generateContent")
+                .json(&serde_json::json!({
+                    "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
+                }))
+                .send(state.clone())
+                .await;
 
         assert_eq!(response.status(), 200);
         let body: Value = serde_json::from_slice(response.body()).unwrap();
@@ -3792,14 +3559,12 @@ mod tests {
 
         let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
 
-        warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         let logs = wait_for_logs(&state, 1).await;
@@ -3826,11 +3591,9 @@ mod tests {
         let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
 
         // 成功响应：头里的 id 必须能对上落库的那条日志。
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({"model": "gpt-4o", "messages": []}))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
         let request_id = response
@@ -3843,11 +3606,9 @@ mod tests {
         assert_eq!(log.request_id, request_id);
 
         // 失败响应（未知模型）同样要带 id —— 报障的往往正是失败的请求。
-        let failure = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let failure = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({"model": "ghost", "messages": []}))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(failure.status(), 404);
         let failure_id = failure
@@ -3868,14 +3629,12 @@ mod tests {
         // 失败日志是排查「这个模型为什么总是不通」的唯一线索。
         let state = state_with(vec![]).await;
 
-        warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "ghost",
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         let logs = wait_for_logs(&state, 1).await;
@@ -3891,10 +3650,8 @@ mod tests {
         ])
         .await;
 
-        let response = warp::test::request()
-            .method("GET")
-            .path("/v1/models")
-            .reply(&crate::routes(state))
+        let response = crate::http_test::TestRequest::get("/v1/models")
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -3924,15 +3681,13 @@ mod tests {
 
         let state = state_with(vec![channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"])]).await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/v1/chat/completions")
+        let response = crate::http_test::TestRequest::post("/v1/chat/completions")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "stream": true,
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);

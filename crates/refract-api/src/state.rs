@@ -20,7 +20,6 @@ use refract_store::{
     ApiKeyRepo, ChannelRepo, Database, HealthRepo, LogRepo, SettingsRepo, StoreError,
 };
 use refract_upstream::UpstreamClient;
-use warp::Filter;
 
 use crate::auth::{Authenticator, SingleUserAuthenticator};
 
@@ -488,13 +487,6 @@ impl AppState {
         self.inner.health.set_policy(breaker);
         Ok(())
     }
-}
-
-/// 把应用状态注入 warp 过滤器链的统一 helper。
-pub fn with_state(
-    state: AppState,
-) -> impl warp::Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || state.clone())
 }
 
 #[cfg(test)]

@@ -15,14 +15,22 @@
 use refract_core::{
     Action, Channel, ChannelId, Credential, GatewayError, Protocol, RoutingPolicy, UpstreamAddress,
 };
-use refract_store::{LogFilter, NewApiKey};
-use serde::de::DeserializeOwned;
+use refract_store::LogFilter;
 use serde::{Deserialize, Serialize};
-use warp::{Filter, Rejection, Reply, filters::BoxedFilter};
+use xitca_web::body::{RequestBody, ResponseBody};
+use xitca_web::handler::body::Body;
+use xitca_web::handler::handler_service;
+use xitca_web::handler::params::Params;
+use xitca_web::handler::query::Query;
+use xitca_web::handler::state::StateRef;
+use xitca_web::http::{HeaderMap, HeaderValue, StatusCode, WebResponse};
+use xitca_web::route::{get, post, put};
+use xitca_web::{App, NestApp};
 
-use crate::auth::admin_auth;
-use crate::error::{ApiError, store_to_gateway};
-use crate::state::{AppState, with_state};
+use crate::auth::require_admin;
+use crate::error::{AppError, collect_limited, json_response, store_to_gateway};
+use crate::extract::{AdminJson, decode_admin_json};
+use crate::state::AppState;
 
 /// 统一成功包裹。
 ///
@@ -32,69 +40,20 @@ struct Envelope<T> {
     data: T,
 }
 
-/// 管理 API 单个 JSON 请求体的上限。
-///
-/// 渠道配置即便包含数千个模型也远小于 2 MiB。更大的请求通常是误传文件或
-/// 恶意耗尽内存，必须在 `warp::body::json` 聚合前拒绝。
-const ADMIN_BODY_LIMIT: u64 = 2 * 1024 * 1024;
-
-/// 带大小上限与端到端解密支持的管理 API JSON body。
-///
-/// 若收到前端 Web Crypto 发送的加密信封（`EncryptedEnvelope`），
-/// 会在反序列化前自动使用服务端私钥通过 ECDH + AES-256-GCM 完成解密；
-/// 若收到普通未加密 JSON 则按原样解析，保证开发调试与测试脚本的兼容性。
-fn json_body<T>(state: AppState) -> impl Filter<Extract = (T,), Error = Rejection> + Clone
-where
-    T: DeserializeOwned + Send + 'static,
-{
-    warp::body::content_length_limit(ADMIN_BODY_LIMIT)
-        .and(warp::body::bytes())
-        .and(with_state(state))
-        .and_then(|bytes: bytes::Bytes, state: AppState| async move {
-            if let Ok(envelope) = serde_json::from_slice::<crate::crypto::EncryptedEnvelope>(&bytes)
-                && envelope.__encrypted
-            {
-                let decrypted = state
-                    .transport_crypto()
-                    .decrypt_envelope(&envelope)
-                    .map_err(|e| {
-                        warp::reject::custom(ApiError(refract_core::GatewayError::new(
-                            refract_core::ErrorKind::InvalidRequest,
-                            format!("failed to decrypt transport payload: {e}"),
-                        )))
-                    })?;
-                let val = serde_json::from_slice::<T>(&decrypted).map_err(|e| {
-                    warp::reject::custom(ApiError(refract_core::GatewayError::new(
-                        refract_core::ErrorKind::InvalidRequest,
-                        format!("failed to parse decrypted JSON payload: {e}"),
-                    )))
-                })?;
-                return Ok(val);
-            }
-
-            serde_json::from_slice::<T>(&bytes).map_err(|e| {
-                warp::reject::custom(ApiError(refract_core::GatewayError::new(
-                    refract_core::ErrorKind::InvalidRequest,
-                    format!("invalid JSON payload: {e}"),
-                )))
-            })
-        })
-}
-
 /// 把仓储结果渲染成 JSON 响应。
-fn ok<T: Serialize>(value: T) -> Result<warp::reply::Response, Rejection> {
-    Ok(warp::reply::json(&Envelope { data: value }).into_response())
+fn ok<T: Serialize>(value: T) -> Result<WebResponse, AppError> {
+    Ok(json_response(StatusCode::OK, &Envelope { data: value }))
 }
 
-/// 把 `StoreError` 转成 warp 拒绝。
-fn reject(err: refract_store::StoreError) -> Rejection {
-    warp::reject::custom(ApiError(store_to_gateway(err)))
+/// 把 `StoreError` 转成管理面错误。
+fn reject(err: refract_store::StoreError) -> AppError {
+    AppError::Admin(store_to_gateway(err))
 }
 
 /// 提交渠道变更：写库之后**必须**刷新内存快照。
 ///
 /// 这个函数存在的唯一目的就是让「忘记刷新」变得不可能 —— 写路径全部经由它。
-async fn commit_channels(state: &AppState) -> Result<(), Rejection> {
+async fn commit_channels(state: &AppState) -> Result<(), AppError> {
     state.reload_channels().await.map_err(reject)
 }
 
@@ -132,7 +91,7 @@ fn looks_masked(value: &str) -> bool {
 /// [`restore_unchanged_credentials`] 只能还原「还在原位」的掩码；端点协议
 /// 一旦变更，掩码就找不到对应的旧凭据了。放行意味着把 `sk-a…9f2c` 这样的
 /// 占位符存成真实密钥 —— 之后每个请求都 401，而用户看不出配置哪里错了。
-fn reject_masked_credentials(channel: &Channel) -> Result<(), Rejection> {
+fn reject_masked_credentials(channel: &Channel) -> Result<(), AppError> {
     let offending = if looks_masked(channel.credential.expose()) {
         Some("渠道默认".to_owned())
     } else if channel.credentials.iter().any(|c| looks_masked(c.expose())) {
@@ -149,11 +108,9 @@ fn reject_masked_credentials(channel: &Channel) -> Result<(), Rejection> {
             .map(|ep| format!("{} 端点", ep.protocol))
     };
     match offending {
-        Some(place) => Err(warp::reject::custom(ApiError(
-            GatewayError::invalid_request(format!(
-                "{place}密钥是脱敏占位符（含 … 或 •）。修改协议或复制配置后，请重新输入真实密钥"
-            )),
-        ))),
+        Some(place) => Err(AppError::Admin(GatewayError::invalid_request(format!(
+            "{place}密钥是脱敏占位符（含 … 或 •）。修改协议或复制配置后，请重新输入真实密钥"
+        )))),
         None => Ok(()),
     }
 }
@@ -204,557 +161,1201 @@ fn restore_unchanged_credentials(existing: &Channel, incoming: &mut Channel) {
     }
 }
 
-/// 公开公钥端点：无需管理鉴权，供客户端协商传输层加密密钥。
-fn crypto(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path("crypto")
-        .and(warp::path("public-key"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state))
-        .and_then(|state: AppState| async move {
-            let resp = state.transport_crypto().public_key_response();
-            ok(resp)
-        })
-        .boxed()
+/// 装配管理路由。路径相对 `/api`（由外层 `App::at("/api", admin::nest())` 挂载）。
+pub fn nest() -> NestApp<AppState> {
+    App::new()
+        .at(
+            "/crypto/public-key",
+            get(handler_service(crypto_public_key)),
+        )
+        .at("/auth/login", post(handler_service(auth_login)))
+        .at("/auth/logout", post(handler_service(auth_logout)))
+        .at("/auth/session", get(handler_service(auth_session)))
+        .at(
+            "/channels",
+            get(handler_service(list_channels)).post(handler_service(create_channel)),
+        )
+        .at("/channels/bulk", post(handler_service(bulk_channels)))
+        .at(
+            "/channels/probe-direct",
+            post(handler_service(probe_direct)),
+        )
+        .at(
+            "/channels/{id}",
+            get(handler_service(get_channel))
+                .put(handler_service(update_channel))
+                .delete(handler_service(delete_channel)),
+        )
+        .at(
+            "/channels/{id}/enabled",
+            post(handler_service(toggle_channel)),
+        )
+        .at("/channels/{id}/probe", post(handler_service(probe_channel)))
+        .at("/channels/{id}/test", post(handler_service(test_channel)))
+        .at(
+            "/channels/{id}/duplicate",
+            post(handler_service(duplicate_channel)),
+        )
+        .at(
+            "/channels/{id}/balance",
+            post(handler_service(get_channel_balance)),
+        )
+        .at(
+            "/keys",
+            get(handler_service(list_keys)).post(handler_service(create_key)),
+        )
+        .at(
+            "/keys/{id}",
+            put(handler_service(update_key)).delete(handler_service(delete_key)),
+        )
+        .at("/keys/{id}/enabled", post(handler_service(toggle_key)))
+        .at(
+            "/keys/{id}/reset-usage",
+            post(handler_service(reset_key_usage)),
+        )
+        .at("/data/stats", get(handler_service(data_stats)))
+        .at("/data/backup", get(handler_service(data_backup)))
+        .at("/logs", get(handler_service(query_logs)))
+        .at("/logs/prune", post(handler_service(prune_logs)))
+        .at("/logs/export", get(handler_service(export_logs)))
+        .at("/logs/{id}", get(handler_service(get_log)))
+        .at("/stats", get(handler_service(stats_summary)))
+        .at("/stats/models", get(handler_service(stats_by_model)))
+        .at("/stats/channels", get(handler_service(stats_by_channel)))
+        .at("/stats/timeseries", get(handler_service(stats_timeseries)))
+        .at("/stats/keys", get(handler_service(stats_by_key)))
+        .at(
+            "/settings/routing",
+            get(handler_service(get_policy)).put(handler_service(set_policy)),
+        )
+        .at(
+            "/settings/log-retention",
+            get(handler_service(get_retention)).put(handler_service(set_retention)),
+        )
+        .at(
+            "/settings/breaker",
+            get(handler_service(get_breaker)).put(handler_service(set_breaker)),
+        )
+        .at(
+            "/settings/pricing",
+            get(handler_service(get_pricing)).put(handler_service(set_pricing)),
+        )
+        .at(
+            "/settings/log-bodies",
+            get(handler_service(get_log_bodies)).put(handler_service(set_log_bodies)),
+        )
+        .at(
+            "/settings/limits",
+            get(handler_service(get_limits)).put(handler_service(set_limits)),
+        )
+        .at(
+            "/settings/empty-response-retry",
+            get(handler_service(get_empty_response_retry))
+                .put(handler_service(set_empty_response_retry)),
+        )
+        .at(
+            "/settings/notify",
+            get(handler_service(get_notify)).put(handler_service(set_notify)),
+        )
+        .at("/settings/notify/test", post(handler_service(test_notify)))
+        .at(
+            "/settings/affinity",
+            get(handler_service(get_affinity)).put(handler_service(set_affinity)),
+        )
+        .at(
+            "/settings/affinity/clear",
+            post(handler_service(clear_affinity)),
+        )
+        .at(
+            "/settings/affinity/stats",
+            get(handler_service(stats_affinity)),
+        )
+        .at(
+            "/settings/admin-token",
+            put(handler_service(set_admin_token)),
+        )
+        .at(
+            "/settings/ip-limits",
+            get(handler_service(get_ip_limits)).put(handler_service(set_ip_limits)),
+        )
+        .at(
+            "/settings/webhook-secret",
+            get(handler_service(get_webhook_secret)).put(handler_service(set_webhook_secret)),
+        )
+        .at(
+            "/settings/backup",
+            get(handler_service(get_backup_settings)).put(handler_service(set_backup_settings)),
+        )
+        .at(
+            "/settings/master-key",
+            get(handler_service(get_master_key)).put(handler_service(set_master_key)),
+        )
+        .at("/health/channels", get(handler_service(health_all)))
+        .at(
+            "/health/channels/{id}/{protocol}/reset",
+            post(handler_service(health_reset)),
+        )
+        .at("/export", get(handler_service(export_config)))
+        .at("/import", post(handler_service(import_config)))
+        .at(
+            "/backups",
+            get(handler_service(list_backups)).post(handler_service(run_backup)),
+        )
+        .at(
+            "/backups/{name}",
+            get(handler_service(download_backup)).delete(handler_service(delete_backup)),
+        )
+        .at("/playground/chat", post(handler_service(playground_chat)))
+        .at("/models", get(handler_service(list_models)))
 }
+
+fn json_with_cookie<T: Serialize>(value: T, cookie: String) -> Result<WebResponse, AppError> {
+    let mut response = ok(value)?;
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response
+            .headers_mut()
+            .insert(xitca_web::http::header::SET_COOKIE, value);
+    }
+    Ok(response)
+}
+
+fn attachment(bytes: Vec<u8>, filename: &str, content_type: &'static str) -> WebResponse {
+    let mut response = WebResponse::new(ResponseBody::bytes(bytes));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static(content_type));
+    if let Ok(disposition) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+    {
+        response
+            .headers_mut()
+            .insert("content-disposition", disposition);
+    }
+    response
+}
+
+async fn crypto_public_key(
+    StateRef(state): StateRef<'_, AppState>,
+) -> Result<WebResponse, AppError> {
+    ok(state.transport_crypto().public_key_response())
+}
+
 #[derive(Debug, Deserialize)]
 struct LoginBody {
     token: String,
 }
 
-/// 认证路由：包含登录、登出与会话探针，无需外部鉴权拦截。
-fn auth_routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("auth");
+async fn auth_login(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<LoginBody>,
+    peer: std::net::SocketAddr,
+) -> Result<WebResponse, AppError> {
+    let client_ip = peer.ip();
 
-    // POST /api/auth/login
-    let login = base
-        .and(warp::path("login"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(state.clone()))
-        .and(warp::filters::addr::remote())
-        .and(with_state(state.clone()))
-        .and_then(
-            |body: LoginBody, remote_addr: Option<std::net::SocketAddr>, state: AppState| async move {
-                let client_ip = remote_addr
-                    .map(|a| a.ip())
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
+        let err = GatewayError::new(
+            refract_core::ErrorKind::PermissionDenied,
+            format!("too many failed login attempts, locked for {wait_secs}s"),
+        )
+        .with_retry_after(std::time::Duration::from_secs(wait_secs));
+        return Err(AppError::Admin(err));
+    }
 
-                if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
-                    let err = GatewayError::new(
-                        refract_core::ErrorKind::PermissionDenied,
-                        format!("too many failed login attempts, locked for {wait_secs}s"),
-                    )
-                    .with_retry_after(std::time::Duration::from_secs(wait_secs));
-                    return Err(warp::reject::custom(ApiError(err)));
-                }
+    let expected: Option<String> = state
+        .settings_repo()
+        .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
+        .await
+        .map_err(reject)?;
+    let Some(expected_hash) = expected.filter(|hash| !hash.trim().is_empty()) else {
+        return ok(serde_json::json!({
+            "authenticated": true,
+            "username": "admin@localhost"
+        }));
+    };
 
-                let repo = state.settings_repo();
-                let expected: Option<String> = repo
-                    .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
-                    .await
-                    .map_err(reject)?;
-
-                let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
-                    // 用户关掉了管理鉴权：登录接口仍成功，不发会话票。
-                    return ok(serde_json::json!({
-                        "authenticated": true,
-                        "username": "admin@localhost"
-                    }));
-                };
-
-                let token_clean = body.token.trim();
-                let token_hash = refract_store::ApiKeyRepo::hash(token_clean);
-                if crate::auth::constant_time_eq(token_hash.as_bytes(), expected_hash.as_bytes()) {
-                    state.admin_guard().record_success(client_ip);
-                    let ticket = crate::auth::create_session_ticket(
-                        state.session_secret(),
-                        &expected_hash,
-                        crate::auth::SESSION_MAX_AGE_SECS,
-                    );
-                    let cookie = format!(
-                        "{}={ticket}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-                        crate::auth::SESSION_COOKIE_NAME,
-                        crate::auth::SESSION_MAX_AGE_SECS
-                    );
-                    let res = warp::reply::with_header(
-                        warp::reply::json(&Envelope {
-                            data: serde_json::json!({
-                                "authenticated": true,
-                                "username": "admin@localhost"
-                            }),
-                        }),
-                        warp::http::header::SET_COOKIE,
-                        cookie,
-                    );
-                    Ok::<warp::reply::Response, Rejection>(res.into_response())
-                } else {
-                    let _locked = state.admin_guard().record_failure(client_ip);
-                    if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
-                        let err = GatewayError::new(
-                            refract_core::ErrorKind::PermissionDenied,
-                            format!("too many failed login attempts, locked for {wait_secs}s"),
-                        )
-                        .with_retry_after(std::time::Duration::from_secs(wait_secs));
-                        Err(warp::reject::custom(ApiError(err)))
-                    } else {
-                        Err(warp::reject::custom(ApiError(GatewayError::new(
-                            refract_core::ErrorKind::Unauthenticated,
-                            "invalid admin token",
-                        ))))
-                    }
-                }
-            },
+    let token_hash = refract_store::ApiKeyRepo::hash(body.token.trim());
+    if crate::auth::constant_time_eq(token_hash.as_bytes(), expected_hash.as_bytes()) {
+        state.admin_guard().record_success(client_ip);
+        let ticket = crate::auth::create_session_ticket(
+            state.session_secret(),
+            &expected_hash,
+            crate::auth::SESSION_MAX_AGE_SECS,
         );
+        let cookie = format!(
+            "{}={ticket}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+            crate::auth::SESSION_COOKIE_NAME,
+            crate::auth::SESSION_MAX_AGE_SECS
+        );
+        return json_with_cookie(
+            serde_json::json!({
+                "authenticated": true,
+                "username": "admin@localhost"
+            }),
+            cookie,
+        );
+    }
 
-    // POST /api/auth/logout
-    let logout = base
-        .and(warp::path("logout"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .map(|| {
+    let _locked = state.admin_guard().record_failure(client_ip);
+    if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
+        let err = GatewayError::new(
+            refract_core::ErrorKind::PermissionDenied,
+            format!("too many failed login attempts, locked for {wait_secs}s"),
+        )
+        .with_retry_after(std::time::Duration::from_secs(wait_secs));
+        return Err(AppError::Admin(err));
+    }
+    Err(AppError::Admin(GatewayError::new(
+        refract_core::ErrorKind::Unauthenticated,
+        "invalid admin token",
+    )))
+}
+
+async fn auth_logout() -> Result<WebResponse, AppError> {
+    let cookie = format!(
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        crate::auth::SESSION_COOKIE_NAME
+    );
+    json_with_cookie(serde_json::json!({ "authenticated": false }), cookie)
+}
+
+async fn auth_session(
+    StateRef(state): StateRef<'_, AppState>,
+    headers: &HeaderMap,
+) -> Result<WebResponse, AppError> {
+    let expected: Option<String> = state
+        .settings_repo()
+        .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
+        .await
+        .map_err(reject)?;
+    let Some(_expected_hash) = expected.filter(|hash| !hash.trim().is_empty()) else {
+        return ok(serde_json::json!({
+            "authenticated": true,
+            "configured": false,
+            "username": "admin@localhost"
+        }));
+    };
+
+    if require_admin(state, headers, None).await.is_ok() {
+        return ok(serde_json::json!({
+            "authenticated": true,
+            "configured": true,
+            "username": "admin@localhost"
+        }));
+    }
+    ok(serde_json::json!({
+        "authenticated": false,
+        "configured": true,
+        "username": null
+    }))
+}
+
+async fn list_channels(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let items = state
+        .channel_repo()
+        .list(refract_core::DEFAULT_OWNER_ID)
+        .await
+        .map_err(reject)?;
+    ok(items.into_iter().map(redact_channel).collect::<Vec<_>>())
+}
+
+async fn create_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(mut channel): AdminJson<Channel>,
+) -> Result<WebResponse, AppError> {
+    channel.owner_id = refract_core::DEFAULT_OWNER_ID;
+    channel.id = 0;
+    reject_masked_credentials(&channel)?;
+    validate(&channel)?;
+    let created = state
+        .channel_repo()
+        .create(&channel)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(redact_channel(created))
+}
+
+async fn get_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<ChannelId>,
+) -> Result<WebResponse, AppError> {
+    let channel = state
+        .channel_repo()
+        .get(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    ok(redact_channel(channel))
+}
+
+async fn update_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<ChannelId>,
+    AdminJson(mut channel): AdminJson<Channel>,
+) -> Result<WebResponse, AppError> {
+    channel.id = id;
+    channel.owner_id = refract_core::DEFAULT_OWNER_ID;
+    let existing = state
+        .channel_repo()
+        .get(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    restore_unchanged_credentials(&existing, &mut channel);
+    reject_masked_credentials(&channel)?;
+    validate(&channel)?;
+    let saved = state
+        .channel_repo()
+        .update(&channel)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(redact_channel(saved))
+}
+
+async fn delete_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<ChannelId>,
+) -> Result<WebResponse, AppError> {
+    state
+        .channel_repo()
+        .delete(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(serde_json::json!({ "deleted": id }))
+}
+
+#[derive(Debug, Deserialize)]
+struct EnabledBody {
+    enabled: bool,
+}
+
+async fn toggle_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<ChannelId>,
+    AdminJson(body): AdminJson<EnabledBody>,
+) -> Result<WebResponse, AppError> {
+    state
+        .channel_repo()
+        .set_enabled(refract_core::DEFAULT_OWNER_ID, id, body.enabled)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(serde_json::json!({ "id": id, "enabled": body.enabled }))
+}
+
+async fn probe_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<ChannelId>,
+    AdminJson(req): AdminJson<EndpointRef>,
+) -> Result<WebResponse, AppError> {
+    let channel = state
+        .channel_repo()
+        .get(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    let endpoint = pick_endpoint(&channel, req.protocol)?;
+    let models = refract_upstream::probe_models(
+        state.upstream(),
+        endpoint.protocol,
+        channel.effective_address(endpoint),
+        channel.effective_credential(endpoint),
+        channel.proxy.as_deref(),
+    )
+    .await
+    .map_err(AppError::Admin)?;
+    ok(serde_json::json!({ "models": models }))
+}
+
+async fn probe_direct(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<DirectProbeRequest>,
+) -> Result<WebResponse, AppError> {
+    let address = body.address.unwrap_or_default();
+    let credential = body.credential.unwrap_or_default();
+    let models = refract_upstream::probe_models(
+        state.upstream(),
+        body.protocol,
+        &address,
+        &credential,
+        body.proxy.as_deref(),
+    )
+    .await
+    .map_err(AppError::Admin)?;
+    ok(serde_json::json!({ "models": models }))
+}
+
+async fn test_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<ChannelId>,
+    Body(mut body): Body<RequestBody>,
+) -> Result<WebResponse, AppError> {
+    let raw = collect_limited(&mut body, crate::extract::ADMIN_JSON_LIMIT)
+        .await
+        .unwrap_or_default();
+    let req: TestRequest = decode_admin_json(state, &raw).unwrap_or_default();
+    let channel = state
+        .channel_repo()
+        .get(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    ok(run_channel_test(state, &channel, req).await)
+}
+
+async fn duplicate_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<ChannelId>,
+) -> Result<WebResponse, AppError> {
+    let mut channel = state
+        .channel_repo()
+        .get(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    channel.id = 0;
+    channel.name = format!("{} 副本", channel.name);
+    channel.enabled = false;
+    let created = state
+        .channel_repo()
+        .create(&channel)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(redact_channel(created))
+}
+
+async fn get_channel_balance(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<ChannelId>,
+) -> Result<WebResponse, AppError> {
+    let channel = state
+        .channel_repo()
+        .get(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    let endpoint = channel
+        .endpoints
+        .iter()
+        .find(|ep| ep.enabled && matches!(ep.protocol, Protocol::Chat | Protocol::Responses))
+        .ok_or_else(|| {
+            reject(refract_store::StoreError::Invalid(
+                "balance probing needs an enabled chat/responses endpoint".into(),
+            ))
+        })?;
+    let amount = refract_upstream::probe_balance(
+        state.upstream(),
+        endpoint.protocol,
+        channel.effective_address(endpoint),
+        channel.effective_credential(endpoint),
+        channel.proxy.as_deref(),
+    )
+    .await
+    .map_err(AppError::Admin)?;
+    state
+        .channel_repo()
+        .set_balance(refract_core::DEFAULT_OWNER_ID, id, amount)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(serde_json::json!({ "id": id, "balance": amount }))
+}
+
+async fn bulk_channels(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<BulkRequest>,
+) -> Result<WebResponse, AppError> {
+    let repo = state.channel_repo();
+    let owner = refract_core::DEFAULT_OWNER_ID;
+    let affected = match body.action {
+        BulkAction::Enable => repo.set_enabled_many(owner, &body.ids, true).await,
+        BulkAction::Disable => repo.set_enabled_many(owner, &body.ids, false).await,
+        BulkAction::Delete => repo.delete_many(owner, &body.ids).await,
+    }
+    .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(serde_json::json!({ "affected": affected }))
+}
+
+async fn list_keys(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let items = state
+        .key_repo()
+        .list(refract_core::DEFAULT_OWNER_ID)
+        .await
+        .map_err(reject)?;
+    ok(items)
+}
+
+async fn create_key(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(spec): AdminJson<refract_store::NewApiKey>,
+) -> Result<WebResponse, AppError> {
+    let (key, plaintext) = state
+        .key_repo()
+        .create(refract_core::DEFAULT_OWNER_ID, spec)
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "key": key, "plaintext": plaintext }))
+}
+
+async fn update_key(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<i64>,
+    AdminJson(spec): AdminJson<refract_store::NewApiKey>,
+) -> Result<WebResponse, AppError> {
+    let key = state
+        .key_repo()
+        .update(refract_core::DEFAULT_OWNER_ID, id, &spec)
+        .await
+        .map_err(reject)?;
+    ok(key)
+}
+
+async fn toggle_key(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<i64>,
+    AdminJson(body): AdminJson<EnabledBody>,
+) -> Result<WebResponse, AppError> {
+    state
+        .key_repo()
+        .set_enabled(refract_core::DEFAULT_OWNER_ID, id, body.enabled)
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "id": id, "enabled": body.enabled }))
+}
+
+async fn reset_key_usage(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<i64>,
+) -> Result<WebResponse, AppError> {
+    state
+        .key_repo()
+        .reset_usage(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "id": id, "used_quota": 0 }))
+}
+
+async fn delete_key(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<i64>,
+) -> Result<WebResponse, AppError> {
+    state
+        .key_repo()
+        .delete(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "deleted": id }))
+}
+
+async fn data_stats(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let (db_bytes, log_rows, oldest) = state.db().stats().await.map_err(reject)?;
+    ok(serde_json::json!({
+        "db_bytes": db_bytes,
+        "log_rows": log_rows,
+        "oldest_log_at": oldest,
+    }))
+}
+
+async fn data_backup(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    const MAX_INLINE_BACKUP: u64 = 512 * 1024 * 1024;
+    let target = std::env::temp_dir().join(format!(
+        "refract-backup-{}-{}.db",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(error) = state.db().vacuum_into(&target).await {
+        let _ = tokio::fs::remove_file(&target).await;
+        return Err(reject(error));
+    }
+    let metadata = tokio::fs::metadata(&target).await.ok();
+    if metadata.is_none_or(|item| item.len() > MAX_INLINE_BACKUP) {
+        let _ = tokio::fs::remove_file(&target).await;
+        return Err(reject(refract_store::StoreError::Invalid(
+            "database exceeds 512 MB — back it up offline (see OPERATIONS.md)".into(),
+        )));
+    }
+    let bytes = tokio::fs::read(&target)
+        .await
+        .map_err(|error| AppError::Admin(GatewayError::internal(error.to_string())))?;
+    let _ = tokio::fs::remove_file(&target).await;
+    let filename = format!("refract-{}.db", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    Ok(attachment(bytes, &filename, "application/vnd.sqlite3"))
+}
+
+async fn query_logs(
+    StateRef(state): StateRef<'_, AppState>,
+    Query(filter): Query<LogFilter>,
+) -> Result<WebResponse, AppError> {
+    let items = state
+        .log_repo()
+        .query(refract_core::DEFAULT_OWNER_ID, &filter)
+        .await
+        .map_err(reject)?;
+    ok(items)
+}
+
+async fn prune_logs(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<PruneBody>,
+) -> Result<WebResponse, AppError> {
+    let removed = state.log_repo().prune(body.days).await.map_err(reject)?;
+    ok(serde_json::json!({ "removed": removed }))
+}
+
+async fn export_logs(
+    StateRef(state): StateRef<'_, AppState>,
+    Query(mut filter): Query<LogFilter>,
+) -> Result<WebResponse, AppError> {
+    filter.limit = Some(filter.limit.unwrap_or(50_000).min(50_000));
+    filter.offset = None;
+    let items = state
+        .log_repo()
+        .query(refract_core::DEFAULT_OWNER_ID, &filter)
+        .await
+        .map_err(reject)?;
+    let mut body = String::with_capacity(items.len() * 256);
+    for item in &items {
+        if let Ok(line) = serde_json::to_string(item) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    Ok(attachment(
+        body.into_bytes(),
+        "refract-logs.ndjson",
+        "application/x-ndjson; charset=utf-8",
+    ))
+}
+
+async fn get_log(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(id): Params<i64>,
+) -> Result<WebResponse, AppError> {
+    let log = state
+        .log_repo()
+        .get(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    ok(log)
+}
+
+async fn stats_summary(
+    StateRef(state): StateRef<'_, AppState>,
+    Query(query): Query<StatsQuery>,
+) -> Result<WebResponse, AppError> {
+    ok(state
+        .log_repo()
+        .summary(refract_core::DEFAULT_OWNER_ID, query.hours)
+        .await
+        .map_err(reject)?)
+}
+
+async fn stats_by_model(
+    StateRef(state): StateRef<'_, AppState>,
+    Query(query): Query<StatsQuery>,
+) -> Result<WebResponse, AppError> {
+    ok(state
+        .log_repo()
+        .by_model(refract_core::DEFAULT_OWNER_ID, query.hours, 50)
+        .await
+        .map_err(reject)?)
+}
+
+async fn stats_by_channel(
+    StateRef(state): StateRef<'_, AppState>,
+    Query(query): Query<StatsQuery>,
+) -> Result<WebResponse, AppError> {
+    ok(state
+        .log_repo()
+        .by_channel(refract_core::DEFAULT_OWNER_ID, query.hours)
+        .await
+        .map_err(reject)?)
+}
+
+async fn stats_timeseries(
+    StateRef(state): StateRef<'_, AppState>,
+    Query(query): Query<TimeseriesQuery>,
+) -> Result<WebResponse, AppError> {
+    ok(state
+        .log_repo()
+        .timeseries(
+            refract_core::DEFAULT_OWNER_ID,
+            query.hours,
+            query.bucket == "day",
+        )
+        .await
+        .map_err(reject)?)
+}
+
+async fn stats_by_key(
+    StateRef(state): StateRef<'_, AppState>,
+    Query(query): Query<StatsQuery>,
+) -> Result<WebResponse, AppError> {
+    ok(state
+        .log_repo()
+        .by_key(refract_core::DEFAULT_OWNER_ID, query.hours)
+        .await
+        .map_err(reject)?)
+}
+
+async fn get_policy(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(state.policy())
+}
+
+async fn set_policy(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(policy): AdminJson<RoutingPolicy>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_routing_policy(&policy)
+        .await
+        .map_err(reject)?;
+    state.reload_policy().await.map_err(reject)?;
+    ok(policy)
+}
+
+async fn get_retention(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let days = state.settings_repo().log_retention_days().await;
+    ok(LogRetentionBody { days })
+}
+
+async fn set_retention(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<LogRetentionBody>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_log_retention_days(body.days)
+        .await
+        .map_err(reject)?;
+    ok(body)
+}
+
+async fn get_breaker(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(state
+        .settings_repo()
+        .breaker_policy()
+        .await
+        .map_err(reject)?)
+}
+
+async fn set_breaker(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(policy): AdminJson<refract_store::BreakerPolicy>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_breaker_policy(&policy)
+        .await
+        .map_err(reject)?;
+    state.reload_breaker().await.map_err(reject)?;
+    ok(policy)
+}
+
+async fn get_pricing(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(state.settings_repo().pricing().await.map_err(reject)?)
+}
+
+async fn set_pricing(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(pricing): AdminJson<Vec<refract_store::ModelPrice>>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_pricing(&pricing)
+        .await
+        .map_err(reject)?;
+    state.reload_pricing().await.map_err(reject)?;
+    ok(pricing)
+}
+
+async fn get_log_bodies(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let enabled = state
+        .settings_repo()
+        .capture_bodies()
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "enabled": enabled }))
+}
+
+async fn set_log_bodies(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<LogBodiesBody>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_capture_bodies(body.enabled)
+        .await
+        .map_err(reject)?;
+    state.reload_capture_bodies().await.map_err(reject)?;
+    ok(serde_json::json!({ "enabled": body.enabled }))
+}
+
+async fn get_limits(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(state
+        .settings_repo()
+        .global_limits()
+        .await
+        .map_err(reject)?)
+}
+
+async fn set_limits(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(limits): AdminJson<refract_store::GlobalLimits>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_global_limits(&limits)
+        .await
+        .map_err(reject)?;
+    state.reload_global_limits().await.map_err(reject)?;
+    ok(limits)
+}
+
+async fn get_empty_response_retry(
+    StateRef(state): StateRef<'_, AppState>,
+) -> Result<WebResponse, AppError> {
+    ok(state.empty_response_retry())
+}
+
+async fn set_empty_response_retry(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(policy): AdminJson<refract_core::EmptyResponseRetryPolicy>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_empty_response_retry(policy)
+        .await
+        .map_err(reject)?;
+    state.reload_empty_response_retry().await.map_err(reject)?;
+    ok(policy)
+}
+
+async fn get_notify(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let webhook_url = state.settings_repo().webhook_url().await.map_err(reject)?;
+    let retest_minutes = state.settings_repo().retest_minutes().await;
+    ok(serde_json::json!({
+        "webhook_url": webhook_url,
+        "retest_minutes": retest_minutes,
+    }))
+}
+
+async fn set_notify(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<NotifyBody>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_notify(body.webhook_url.as_deref(), body.retest_minutes)
+        .await
+        .map_err(reject)?;
+    state.reload_webhook().await.map_err(reject)?;
+    ok(body)
+}
+
+async fn test_notify(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let Some(url) = state.webhook_url() else {
+        return Err(reject(refract_store::StoreError::Invalid(
+            "webhook url is not configured — save it first".into(),
+        )));
+    };
+    let secret = state.webhook_secret();
+    crate::notify::send_webhook(
+        &url,
+        "notify.test",
+        "refract",
+        None,
+        "这是一条测试通知；收到即表示 webhook 配置正确",
+        secret.as_deref(),
+    )
+    .await;
+    ok(serde_json::json!({ "sent": true }))
+}
+
+async fn get_affinity(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(state.settings_repo().affinity().await.map_err(reject)?)
+}
+
+async fn set_affinity(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(policy): AdminJson<refract_core::AffinitySettings>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_affinity(&policy)
+        .await
+        .map_err(reject)?;
+    state.reload_affinity().await.map_err(reject)?;
+    ok(policy)
+}
+
+async fn clear_affinity(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let cleared = state.affinity().clear();
+    ok(serde_json::json!({ "cleared": cleared }))
+}
+
+async fn stats_affinity(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(serde_json::json!({
+        "active": state.affinity().is_active(),
+        "stats": state.affinity().stats(),
+    }))
+}
+
+async fn set_admin_token(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<AdminTokenBody>,
+) -> Result<WebResponse, AppError> {
+    let repo = state.settings_repo();
+    match body.token.filter(|token| !token.trim().is_empty()) {
+        Some(token) => {
+            let hash = refract_store::ApiKeyRepo::hash(&token);
+            repo.set_admin_token(Some(&hash)).await.map_err(reject)?;
+            let ticket = crate::auth::create_session_ticket(
+                state.session_secret(),
+                &hash,
+                crate::auth::SESSION_MAX_AGE_SECS,
+            );
+            let cookie = format!(
+                "{}={ticket}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                crate::auth::SESSION_COOKIE_NAME,
+                crate::auth::SESSION_MAX_AGE_SECS
+            );
+            json_with_cookie(serde_json::json!({ "configured": true }), cookie)
+        }
+        None => {
+            repo.set_admin_token(None).await.map_err(reject)?;
             let cookie = format!(
                 "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
                 crate::auth::SESSION_COOKIE_NAME
             );
-            warp::reply::with_header(
-                warp::reply::json(&Envelope {
-                    data: serde_json::json!({ "authenticated": false }),
-                }),
-                warp::http::header::SET_COOKIE,
-                cookie,
-            )
-            .into_response()
-        });
-
-    // GET /api/auth/session
-    let session = base
-        .and(warp::path("session"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::header::optional::<String>("authorization"))
-        .and(warp::header::optional::<String>("x-admin-token"))
-        .and(warp::header::optional::<String>("cookie"))
-        .and(with_state(state))
-        .and_then(
-            |auth: Option<String>,
-             x_admin: Option<String>,
-             cookie: Option<String>,
-             state: AppState| async move {
-                let repo = state.settings_repo();
-                let expected: Option<String> = repo
-                    .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
-                    .await
-                    .map_err(reject)?;
-
-                let Some(expected_hash) = expected.filter(|h| !h.trim().is_empty()) else {
-                    return ok(serde_json::json!({
-                        "authenticated": true,
-                        "configured": false,
-                        "username": "admin@localhost"
-                    }));
-                };
-
-                // 1. 检查请求头
-                if let Some(token) = crate::auth::extract_token(auth, x_admin, None, None, None)
-                    && crate::auth::constant_time_eq(
-                        refract_store::ApiKeyRepo::hash(&token).as_bytes(),
-                        expected_hash.as_bytes(),
-                    )
-                {
-                    return ok(serde_json::json!({
-                        "authenticated": true,
-                        "configured": true,
-                        "username": "admin@localhost"
-                    }));
-                }
-
-                // 2. 检查 Cookie
-                if let Some(cookie_str) = cookie
-                    && let Some(ticket) = crate::auth::extract_cookie_value(
-                        &cookie_str,
-                        crate::auth::SESSION_COOKIE_NAME,
-                    )
-                    && crate::auth::verify_session_ticket(
-                        &ticket,
-                        state.session_secret(),
-                        &expected_hash,
-                    )
-                {
-                    return ok(serde_json::json!({
-                        "authenticated": true,
-                        "configured": true,
-                        "username": "admin@localhost"
-                    }));
-                }
-
-                ok(serde_json::json!({
-                    "authenticated": false,
-                    "configured": true,
-                    "username": null
-                }))
-            },
-        );
-
-    routes![login, logout, session].boxed()
+            json_with_cookie(serde_json::json!({ "configured": false }), cookie)
+        }
+    }
 }
 
-/// 装配管理路由。
-pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let auth = admin_auth(state.clone());
-    let crypto_route = crypto(state.clone());
-    let auth_route = auth_routes(state.clone());
-
-    let authenticated = auth.and(routes![
-        channels(state.clone()),
-        keys(state.clone()),
-        logs(state.clone()),
-        stats(state.clone()),
-        settings(state.clone()),
-        health(state.clone()),
-        backup(state.clone()),
-        backups(state.clone()),
-        playground(state.clone()),
-        data(state.clone()),
-        models(state),
-    ]);
-
-    warp::path("api")
-        .and(
-            crypto_route
-                .or(auth_route)
-                .unify()
-                .or(authenticated)
-                .unify(),
-        )
-        .boxed()
+async fn get_ip_limits(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(state.settings_repo().ip_limits().await.map_err(reject)?)
 }
 
-/// `POST /api/playground/chat` —— 管理面的模型调试台。
-///
-/// 请求体是 OpenAI Chat 形状，直接进入网关的完整分发管线（路由、转码、
-/// 熔断、日志一个不少）；流式响应原样转发 SSE。
-fn playground(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path("playground")
-        .and(warp::path("chat"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(warp::body::bytes())
-        .and(with_state(state))
-        .and_then(|raw: bytes::Bytes, state: AppState| async move {
-            crate::gateway::playground_chat(state, raw).await
-        })
-        .boxed()
+async fn set_ip_limits(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(limits): AdminJson<refract_store::IpLimits>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_ip_limits(&limits)
+        .await
+        .map_err(reject)?;
+    state.reload_ip_limits().await.map_err(reject)?;
+    ok(limits)
 }
 
-// ---------------------------------------------------------------------------
-// 渠道
-// ---------------------------------------------------------------------------
+async fn get_webhook_secret(
+    StateRef(state): StateRef<'_, AppState>,
+) -> Result<WebResponse, AppError> {
+    let secret = state
+        .settings_repo()
+        .webhook_secret()
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "configured": secret.is_some_and(|item| !item.is_empty()) }))
+}
 
-/// 渠道 CRUD。
-fn channels(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("channels");
-    let st = state.clone();
-    let probe_state = state.clone();
-    let test_state = state.clone();
+async fn set_webhook_secret(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<WebhookSecretBody>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_webhook_secret(body.secret.as_deref())
+        .await
+        .map_err(reject)?;
+    state.reload_webhook_secret().await.map_err(reject)?;
+    ok(serde_json::json!({ "configured": body.secret.is_some_and(|item| !item.is_empty()) }))
+}
 
-    // GET /api/channels
-    let list = base
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(st.clone()))
-        .and_then(|state: AppState| async move {
-            let items = state
-                .channel_repo()
-                .list(refract_core::DEFAULT_OWNER_ID)
-                .await
-                .map_err(reject)?;
-            ok(items.into_iter().map(redact_channel).collect::<Vec<_>>())
-        });
+async fn get_backup_settings(
+    StateRef(state): StateRef<'_, AppState>,
+) -> Result<WebResponse, AppError> {
+    ok(state
+        .settings_repo()
+        .backup_settings()
+        .await
+        .map_err(reject)?)
+}
 
-    // POST /api/channels/{id}/balance —— 查询上游余额并缓存。
-    let balance_state = state.clone();
-    let balance = base
-        .and(warp::path::param::<i64>())
-        .and(warp::path("balance"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_state(balance_state))
-        .and_then(|id: i64, state: AppState| async move {
-            let channel = state
-                .channel_repo()
-                .get(refract_core::DEFAULT_OWNER_ID, id)
-                .await
-                .map_err(reject)?;
-            // 找一个 OpenAI 形状端点：余额协议只在这类上游有定义。
-            let endpoint = channel
-                .endpoints
-                .iter()
-                .find(|ep| {
-                    ep.enabled
-                        && matches!(
-                            ep.protocol,
-                            refract_core::Protocol::Chat | refract_core::Protocol::Responses
-                        )
-                })
-                .ok_or_else(|| {
-                    reject(refract_store::StoreError::Invalid(
-                        "balance probing needs an enabled chat/responses endpoint".into(),
-                    ))
-                })?;
-            let amount = refract_upstream::probe_balance(
-                state.upstream(),
-                endpoint.protocol,
-                channel.effective_address(endpoint),
-                channel.effective_credential(endpoint),
-                channel.proxy.as_deref(),
-            )
-            .await
-            .map_err(|e| warp::reject::custom(ApiError(e)))?;
+async fn set_backup_settings(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(settings): AdminJson<refract_store::BackupSettings>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_backup_settings(&settings)
+        .await
+        .map_err(reject)?;
+    state.reload_backup().await.map_err(reject)?;
+    ok(settings)
+}
+
+async fn get_master_key(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(serde_json::json!({ "configured": state.master_key().is_some() }))
+}
+
+async fn set_master_key(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<MasterKeyBody>,
+) -> Result<WebResponse, AppError> {
+    match body.key.filter(|key| !key.trim().is_empty()) {
+        Some(key) => {
+            refract_store::parse_master_key(&key).map_err(|error| {
+                AppError::Admin(GatewayError::invalid_request(error.to_string()))
+            })?;
             state
-                .channel_repo()
-                .set_balance(refract_core::DEFAULT_OWNER_ID, id, amount)
+                .settings_repo()
+                .set_master_key(Some(&key))
                 .await
                 .map_err(reject)?;
-            // 余额是写路径：必须刷快照，否则实时推送与路由读到的还是旧值。
-            commit_channels(&state).await?;
-            ok(serde_json::json!({ "id": id, "balance": amount }))
-        });
-
-    // POST /api/channels
-    let create = base
-        .and(warp::path::end())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|mut channel: Channel, state: AppState| async move {
-            // 客户端传什么 owner_id 都无所谓 —— 服务端定。
-            channel.owner_id = refract_core::DEFAULT_OWNER_ID;
-            channel.id = 0;
-            reject_masked_credentials(&channel)?;
-            validate(&channel)?;
-            let created = state
-                .channel_repo()
-                .create(&channel)
-                .await
-                .map_err(reject)?;
-            commit_channels(&state).await?;
-            ok(redact_channel(created))
-        });
-
-    // GET /api/channels/:id
-    let get = base
-        .and(warp::path::param::<ChannelId>())
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|id: ChannelId, state: AppState| async move {
-            let channel = state
-                .channel_repo()
-                .get(refract_core::DEFAULT_OWNER_ID, id)
-                .await
-                .map_err(reject)?;
-            ok(redact_channel(channel))
-        });
-
-    // PUT /api/channels/:id
-    let update = base
-        .and(warp::path::param::<ChannelId>())
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |id: ChannelId, mut channel: Channel, state: AppState| async move {
-                // 路径里的 id 是权威的，body 里的被忽略 —— 否则一个 PUT /1 带 body.id=2
-                // 会静默改掉另一个渠道。
-                channel.id = id;
-                channel.owner_id = refract_core::DEFAULT_OWNER_ID;
-                let existing = state
-                    .channel_repo()
-                    .get(refract_core::DEFAULT_OWNER_ID, id)
-                    .await
-                    .map_err(reject)?;
-                restore_unchanged_credentials(&existing, &mut channel);
-                reject_masked_credentials(&channel)?;
-                validate(&channel)?;
-                let saved = state
-                    .channel_repo()
-                    .update(&channel)
-                    .await
-                    .map_err(reject)?;
-                commit_channels(&state).await?;
-                ok(redact_channel(saved))
-            },
-        );
-
-    // DELETE /api/channels/:id
-    let delete = base
-        .and(warp::path::param::<ChannelId>())
-        .and(warp::path::end())
-        .and(warp::delete())
-        .and(with_state(state.clone()))
-        .and_then(|id: ChannelId, state: AppState| async move {
+            state.reload_master_key().await.map_err(reject)?;
+            ok(serde_json::json!({ "configured": true }))
+        }
+        None => {
             state
-                .channel_repo()
-                .delete(refract_core::DEFAULT_OWNER_ID, id)
+                .settings_repo()
+                .set_master_key(None)
                 .await
                 .map_err(reject)?;
-            commit_channels(&state).await?;
-            // 渠道没了，指向它的亲和绑定与密钥轮转游标也一起清掉。
-            state.forget_channel(id);
-            ok(serde_json::json!({ "deleted": id }))
-        });
+            state.reload_master_key().await.map_err(reject)?;
+            ok(serde_json::json!({ "configured": false }))
+        }
+    }
+}
 
-    // POST /api/channels/:id/enabled
-    let toggle = base
-        .and(warp::path::param::<ChannelId>())
-        .and(warp::path("enabled"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |id: ChannelId, body: EnabledBody, state: AppState| async move {
-                state
-                    .channel_repo()
-                    .set_enabled(refract_core::DEFAULT_OWNER_ID, id, body.enabled)
-                    .await
-                    .map_err(reject)?;
-                commit_channels(&state).await?;
-                ok(serde_json::json!({ "id": id, "enabled": body.enabled }))
-            },
-        );
-    // POST /api/channels/probe-direct —— 在保存前直接按草稿配置探测上游模型列表。
-    let probe_direct = base
-        .and(warp::path("probe-direct"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|body: DirectProbeRequest, state: AppState| async move {
-            let address = body.address.unwrap_or_default();
-            let credential = body.credential.unwrap_or_default();
-            let models = refract_upstream::probe_models(
-                state.upstream(),
-                body.protocol,
-                &address,
-                &credential,
-                body.proxy.as_deref(),
-            )
-            .await
-            .map_err(|e| warp::reject::custom(ApiError(e)))?;
-            ok(serde_json::json!({ "models": models }))
-        });
+async fn health_all(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    ok(state.health_repo().all().await.map_err(reject)?)
+}
 
-    // POST /api/channels/:id/probe —— 拉取上游真实模型列表。
-    let probe = base
-        .and(warp::path::param::<ChannelId>())
-        .and(warp::path("probe"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(probe_state.clone()))
-        .and(with_state(probe_state))
-        .and_then(
-            |id: ChannelId, body: EndpointRef, state: AppState| async move {
-                let channel = state
-                    .channel_repo()
-                    .get(refract_core::DEFAULT_OWNER_ID, id)
-                    .await
-                    .map_err(reject)?;
-                let endpoint = pick_endpoint(&channel, body.protocol)?;
-                let models = refract_upstream::probe_models(
-                    state.upstream(),
-                    endpoint.protocol,
-                    channel.effective_address(endpoint),
-                    channel.effective_credential(endpoint),
-                    channel.proxy.as_deref(),
-                )
+async fn health_reset(
+    StateRef(state): StateRef<'_, AppState>,
+    Params((id, protocol)): Params<(ChannelId, Protocol)>,
+) -> Result<WebResponse, AppError> {
+    state
+        .health_repo()
+        .reset(id, protocol)
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "reset": id, "protocol": protocol }))
+}
+
+async fn export_config(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let owner = refract_core::DEFAULT_OWNER_ID;
+    let channels = state.channel_repo().list(owner).await.map_err(reject)?;
+    let keys = state.key_repo().export(owner).await.map_err(reject)?;
+    ok(ExportDocument {
+        version: EXPORT_VERSION,
+        exported_at: Some(chrono::Utc::now().to_rfc3339()),
+        channels,
+        keys,
+        settings: ExportedSettings {
+            routing_policy: state.policy(),
+            log_retention_days: state.settings_repo().log_retention_days().await,
+            breaker_policy: state
+                .settings_repo()
+                .breaker_policy()
                 .await
-                .map_err(|e| warp::reject::custom(ApiError(e)))?;
-                ok(serde_json::json!({ "models": models }))
-            },
-        );
+                .map_err(reject)?,
+            pricing: state.settings_repo().pricing().await.map_err(reject)?,
+            empty_response_retry: state.empty_response_retry(),
+        },
+    })
+}
 
-    // POST /api/channels/:id/test —— 发一个最小真实请求验证配置。
-    let test = base
-        .and(warp::path::param::<ChannelId>())
-        .and(warp::path("test"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(test_state.clone()))
-        .and(with_state(test_state))
-        .and_then(
-            |id: ChannelId, body: TestRequest, state: AppState| async move {
-                let channel = state
-                    .channel_repo()
-                    .get(refract_core::DEFAULT_OWNER_ID, id)
-                    .await
-                    .map_err(reject)?;
-                ok(run_channel_test(&state, &channel, body).await)
-            },
-        );
+async fn import_config(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(req): AdminJson<ImportRequest>,
+) -> Result<WebResponse, AppError> {
+    import_document(req, state).await
+}
 
-    // POST /api/channels/:id/duplicate —— 复制一份配置作为新渠道。
-    // 副本禁用创建：复制的动机通常是「改几个字段再启用」，复制即参与路由
-    // 会让同一上游瞬间吃到双倍流量。
-    let duplicate = base
-        .and(warp::path::param::<ChannelId>())
-        .and(warp::path("duplicate"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_state(state.clone()))
-        .and_then(|id: ChannelId, state: AppState| async move {
-            let mut copy = state
-                .channel_repo()
-                .get(refract_core::DEFAULT_OWNER_ID, id)
-                .await
-                .map_err(reject)?;
-            copy.id = 0;
-            copy.name = format!("{} 副本", copy.name);
-            copy.enabled = false;
-            let created = state.channel_repo().create(&copy).await.map_err(reject)?;
-            commit_channels(&state).await?;
-            ok(redact_channel(created))
-        });
+async fn list_backups(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let dir = crate::backup::resolve_backup_dir(state);
+    ok(crate::backup::list_backups(&dir))
+}
 
-    // POST /api/channels/bulk —— 批量启用/禁用/删除。
-    // 仓储层单条 SQL 完成：整批原子生效，不会出现「改到一半报错，前半批
-    // 已生效」的中间态；对列表里已被删除的 ID 天然宽容。
-    let bulk = base
-        .and(warp::path("bulk"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|body: BulkRequest, state: AppState| async move {
-            let repo = state.channel_repo();
-            let owner = refract_core::DEFAULT_OWNER_ID;
-            let affected = match body.action {
-                BulkAction::Enable => repo.set_enabled_many(owner, &body.ids, true).await,
-                BulkAction::Disable => repo.set_enabled_many(owner, &body.ids, false).await,
-                BulkAction::Delete => repo.delete_many(owner, &body.ids).await,
-            }
-            .map_err(reject)?;
-            commit_channels(&state).await?;
-            ok(serde_json::json!({ "affected": affected }))
-        });
+async fn run_backup(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let filename = crate::backup::run_backup_once(state)
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "name": filename }))
+}
 
-    // 顺序：具体路径在前，参数路径在后。`/channels/bulk` 与 `/channels/:id/enabled`
-    // 必须先匹配，否则 `:id` 会尝试把 "bulk"/"enabled" 解析成数字然后失败。
-    routes![
-        list,
-        create,
-        bulk,
-        probe_direct,
-        toggle,
-        probe,
-        test,
-        duplicate,
-        balance,
-        get,
-        update,
-        delete,
-    ]
+async fn download_backup(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(name): Params<String>,
+) -> Result<WebResponse, AppError> {
+    if !crate::backup::is_valid_backup_name(&name) {
+        return Err(AppError::Admin(GatewayError::invalid_request(
+            "invalid backup filename",
+        )));
+    }
+    let dir = crate::backup::resolve_backup_dir(state);
+    let target = dir.join(&name);
+    if !target.is_file() {
+        return Err(AppError::Admin(GatewayError::not_found(format!(
+            "backup file `{name}` not found"
+        ))));
+    }
+    let bytes = tokio::fs::read(&target).await.map_err(|error| {
+        AppError::Admin(GatewayError::internal(format!(
+            "failed to read backup file: {error}"
+        )))
+    })?;
+    Ok(attachment(bytes, &name, "application/vnd.sqlite3"))
+}
+
+async fn delete_backup(
+    StateRef(state): StateRef<'_, AppState>,
+    Params(name): Params<String>,
+) -> Result<WebResponse, AppError> {
+    if !crate::backup::is_valid_backup_name(&name) {
+        return Err(AppError::Admin(GatewayError::invalid_request(
+            "invalid backup filename",
+        )));
+    }
+    let dir = crate::backup::resolve_backup_dir(state);
+    let target = dir.join(&name);
+    if !target.is_file() {
+        return Err(AppError::Admin(GatewayError::not_found(format!(
+            "backup file `{name}` not found"
+        ))));
+    }
+    tokio::fs::remove_file(&target).await.map_err(|error| {
+        AppError::Admin(GatewayError::internal(format!(
+            "failed to remove backup file: {error}"
+        )))
+    })?;
+    ok(serde_json::json!({ "deleted": true }))
+}
+
+async fn playground_chat(
+    StateRef(state): StateRef<'_, AppState>,
+    Body(mut body): Body<RequestBody>,
+) -> Result<WebResponse, AppError> {
+    let raw = collect_limited(&mut body, crate::extract::ADMIN_JSON_LIMIT).await?;
+    crate::gateway::playground_chat(state.clone(), raw).await
+}
+
+async fn list_models(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
+    let channels = state.channels();
+    let mut names: Vec<&str> = channels
+        .iter()
+        .filter(|channel| channel.enabled)
+        .flat_map(|channel| channel.endpoints.iter())
+        .filter(|endpoint| endpoint.enabled)
+        .flat_map(|endpoint| endpoint.models.iter())
+        .map(|model| model.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    ok(names)
 }
 
 /// 直接探测上游模型列表请求体。
@@ -808,17 +1409,17 @@ pub(crate) struct TestRequest {
 fn pick_endpoint(
     channel: &Channel,
     protocol: Option<Protocol>,
-) -> Result<&refract_core::ChannelEndpoint, Rejection> {
+) -> Result<&refract_core::ChannelEndpoint, AppError> {
     match protocol {
         Some(p) => channel
             .endpoints
             .iter()
             .find(|e| e.protocol == p)
             .ok_or_else(|| {
-                warp::reject::custom(ApiError(GatewayError::not_found(format!(
+                AppError::Admin(GatewayError::not_found(format!(
                     "channel `{}` has no `{p}` endpoint",
                     channel.name
-                ))))
+                )))
             }),
         // 首选端点：order 最小者。这与路由层的选择一致（需求 5），
         // 所以「测试通过」意味着真实流量走的那条路通了。
@@ -827,10 +1428,10 @@ fn pick_endpoint(
             .first()
             .copied()
             .ok_or_else(|| {
-                warp::reject::custom(ApiError(GatewayError::invalid_request(format!(
+                AppError::Admin(GatewayError::invalid_request(format!(
                     "channel `{}` has no enabled endpoint",
                     channel.name
-                ))))
+                )))
             }),
     }
 }
@@ -968,20 +1569,13 @@ fn test_upstream_model(
     }
 }
 
-/// 启用开关的请求体。
-#[derive(Debug, Deserialize)]
-struct EnabledBody {
-    enabled: bool,
-}
-
 /// 渠道配置的语义校验。
 ///
 /// 这些检查不能只放在前端：前端可以绕过，而一个语义无效的渠道会在**请求时**
 /// 才炸 —— 那时错误信息离原因很远。宁可在保存时就拒绝。
-fn validate(channel: &Channel) -> Result<(), Rejection> {
-    let invalid = |message: String| -> Rejection {
-        warp::reject::custom(ApiError(GatewayError::invalid_request(message)))
-    };
+fn validate(channel: &Channel) -> Result<(), AppError> {
+    let invalid =
+        |message: String| -> AppError { AppError::Admin(GatewayError::invalid_request(message)) };
 
     channel
         .validate()
@@ -1005,272 +1599,6 @@ fn validate(channel: &Channel) -> Result<(), Rejection> {
 // ---------------------------------------------------------------------------
 // 密钥
 // ---------------------------------------------------------------------------
-
-/// 网关密钥管理。
-fn keys(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("keys");
-
-    let list = base
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let items = state
-                .key_repo()
-                .list(refract_core::DEFAULT_OWNER_ID)
-                .await
-                .map_err(reject)?;
-            ok(items)
-        });
-
-    let create = base
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|spec: NewApiKey, state: AppState| async move {
-            let (key, plaintext) = state
-                .key_repo()
-                .create(refract_core::DEFAULT_OWNER_ID, spec)
-                .await
-                .map_err(reject)?;
-            // 明文只在这里出现一次。前端必须当场让用户复制。
-            ok(serde_json::json!({ "key": key, "plaintext": plaintext }))
-        });
-
-    let toggle = base
-        .and(warp::path::param::<i64>())
-        .and(warp::path("enabled"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|id: i64, body: EnabledBody, state: AppState| async move {
-            state
-                .key_repo()
-                .set_enabled(refract_core::DEFAULT_OWNER_ID, id, body.enabled)
-                .await
-                .map_err(reject)?;
-            ok(serde_json::json!({ "id": id, "enabled": body.enabled }))
-        });
-
-    // PUT /api/keys/{id} —— 改治理属性，密钥本体不变。
-    let update = base
-        .and(warp::path::param::<i64>())
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |id: i64, spec: refract_store::NewApiKey, state: AppState| async move {
-                let key = state
-                    .key_repo()
-                    .update(refract_core::DEFAULT_OWNER_ID, id, &spec)
-                    .await
-                    .map_err(reject)?;
-                ok(key)
-            },
-        );
-
-    // POST /api/keys/{id}/reset-usage —— 已用配额清零（周期预算的手动形态）。
-    let reset_usage = base
-        .and(warp::path::param::<i64>())
-        .and(warp::path("reset-usage"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_state(state.clone()))
-        .and_then(|id: i64, state: AppState| async move {
-            state
-                .key_repo()
-                .reset_usage(refract_core::DEFAULT_OWNER_ID, id)
-                .await
-                .map_err(reject)?;
-            ok(serde_json::json!({ "id": id, "used_quota": 0 }))
-        });
-
-    let delete = base
-        .and(warp::path::param::<i64>())
-        .and(warp::path::end())
-        .and(warp::delete())
-        .and(with_state(state))
-        .and_then(|id: i64, state: AppState| async move {
-            state
-                .key_repo()
-                .delete(refract_core::DEFAULT_OWNER_ID, id)
-                .await
-                .map_err(reject)?;
-            ok(serde_json::json!({ "deleted": id }))
-        });
-
-    routes![list, create, toggle, update, reset_usage, delete]
-}
-
-// ---------------------------------------------------------------------------
-// 数据管理
-// ---------------------------------------------------------------------------
-
-/// 数据库观测与在线备份。
-fn data(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("data");
-
-    // GET /api/data/stats —— 库体积、日志行数、最旧日志。
-    // 正文快照 + 长保留天数组合下库会悄悄长大，用户第一次发现不该是磁盘满。
-    let stats = base
-        .and(warp::path("stats"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let (db_bytes, log_rows, oldest) = state.db().stats().await.map_err(reject)?;
-            ok(serde_json::json!({
-                "db_bytes": db_bytes,
-                "log_rows": log_rows,
-                "oldest_log_at": oldest,
-            }))
-        });
-
-    // GET /api/data/backup —— `VACUUM INTO` 在线热备（WAL 下安全、产物已紧凑），
-    // 直接作为附件下发。个人库通常几十 MB，读进内存可接受；超限提示走停机备份。
-    let backup = base
-        .and(warp::path("backup"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state))
-        .and_then(|state: AppState| async move {
-            const MAX_INLINE_BACKUP: u64 = 512 * 1024 * 1024;
-            // 同一秒的并发请求会撞上同一个文件名，而 VACUUM INTO 在目标已存在
-            // 时直接失败 —— 加随机后缀保证唯一。
-            let target = std::env::temp_dir().join(format!(
-                "refract-backup-{}-{}.db",
-                chrono::Utc::now().format("%Y%m%d-%H%M%S"),
-                uuid::Uuid::new_v4().simple()
-            ));
-            if let Err(e) = state.db().vacuum_into(&target).await {
-                let _ = tokio::fs::remove_file(&target).await;
-                return Err(reject(e));
-            }
-            let metadata = tokio::fs::metadata(&target).await.ok();
-            if metadata.is_none_or(|m| m.len() > MAX_INLINE_BACKUP) {
-                let _ = tokio::fs::remove_file(&target).await;
-                return Err(reject(refract_store::StoreError::Invalid(
-                    "database exceeds 512 MB — back it up offline (see OPERATIONS.md)".into(),
-                )));
-            }
-            let bytes = tokio::fs::read(&target).await.map_err(|e| {
-                warp::reject::custom(ApiError(refract_core::GatewayError::internal(
-                    e.to_string(),
-                )))
-            })?;
-            let _ = tokio::fs::remove_file(&target).await;
-            let mut response = warp::reply::Response::new(bytes.into());
-            response.headers_mut().insert(
-                "content-type",
-                warp::http::HeaderValue::from_static("application/vnd.sqlite3"),
-            );
-            if let Ok(disposition) = warp::http::HeaderValue::from_str(&format!(
-                "attachment; filename=\"refract-{}.db\"",
-                chrono::Utc::now().format("%Y%m%d-%H%M%S")
-            )) {
-                response
-                    .headers_mut()
-                    .insert("content-disposition", disposition);
-            }
-            Ok::<_, Rejection>(response)
-        });
-
-    routes![stats, backup]
-}
-
-// ---------------------------------------------------------------------------
-// 日志与统计
-// ---------------------------------------------------------------------------
-
-/// 请求日志查询。
-fn logs(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("logs");
-
-    let query = base
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::<LogFilter>())
-        .and(with_state(state.clone()))
-        .and_then(|filter: LogFilter, state: AppState| async move {
-            let items = state
-                .log_repo()
-                .query(refract_core::DEFAULT_OWNER_ID, &filter)
-                .await
-                .map_err(reject)?;
-            ok(items)
-        });
-
-    let prune = base
-        .and(warp::path("prune"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|body: PruneBody, state: AppState| async move {
-            let removed = state.log_repo().prune(body.days).await.map_err(reject)?;
-            ok(serde_json::json!({ "removed": removed }))
-        });
-
-    // GET /api/logs/export —— 按当前筛选导出 NDJSON（上限 5 万行，防失控）。
-    // 与列表接口共用同一个 filter：所见即所导。
-    let export = base
-        .and(warp::path("export"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::<LogFilter>())
-        .and(with_state(state.clone()))
-        .and_then(|mut filter: LogFilter, state: AppState| async move {
-            filter.limit = Some(filter.limit.unwrap_or(50_000).min(50_000));
-            filter.offset = None;
-            let items = state
-                .log_repo()
-                .query(refract_core::DEFAULT_OWNER_ID, &filter)
-                .await
-                .map_err(reject)?;
-            let mut body = String::with_capacity(items.len() * 256);
-            for item in &items {
-                if let Ok(line) = serde_json::to_string(item) {
-                    body.push_str(&line);
-                    body.push('\n');
-                }
-            }
-            let response = warp::http::Response::builder()
-                .header("content-type", "application/x-ndjson; charset=utf-8")
-                .header(
-                    "content-disposition",
-                    "attachment; filename=\"refract-logs.ndjson\"",
-                )
-                .body(body)
-                .map_err(|e| {
-                    warp::reject::custom(crate::error::ApiError(
-                        refract_core::GatewayError::internal(e.to_string()),
-                    ))
-                })?;
-            Ok::<_, Rejection>(response.into_response())
-        });
-
-    // GET /api/logs/{id} —— 单条完整记录，含请求/响应正文快照。
-    // 正文可能几十 KB，列表接口永远不带；只有用户点开详情才取。
-    let detail = base
-        .and(warp::path::param::<i64>())
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state))
-        .and_then(|id: i64, state: AppState| async move {
-            let log = state
-                .log_repo()
-                .get(refract_core::DEFAULT_OWNER_ID, id)
-                .await
-                .map_err(reject)?;
-            ok(log)
-        });
-
-    // ok() 包 JSON 信封，export 是裸响应 —— 两组 Reply 类型不同，boxed 统一。
-    routes![prune, detail, query, export]
-}
 
 /// 日志清理请求体。
 #[derive(Debug, Deserialize)]
@@ -1304,626 +1632,6 @@ fn default_bucket() -> String {
     "hour".into()
 }
 
-/// 仪表盘统计。
-fn stats(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("stats");
-
-    let summary = base
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::<StatsQuery>())
-        .and(with_state(state.clone()))
-        .and_then(|q: StatsQuery, state: AppState| async move {
-            let value = state
-                .log_repo()
-                .summary(refract_core::DEFAULT_OWNER_ID, q.hours)
-                .await
-                .map_err(reject)?;
-            ok(value)
-        });
-
-    let by_model = base
-        .and(warp::path("models"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::<StatsQuery>())
-        .and(with_state(state.clone()))
-        .and_then(|q: StatsQuery, state: AppState| async move {
-            let items = state
-                .log_repo()
-                .by_model(refract_core::DEFAULT_OWNER_ID, q.hours, 50)
-                .await
-                .map_err(reject)?;
-            ok(items)
-        });
-
-    let by_channel = base
-        .and(warp::path("channels"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::<StatsQuery>())
-        .and(with_state(state.clone()))
-        .and_then(|q: StatsQuery, state: AppState| async move {
-            let value = state
-                .log_repo()
-                .by_channel(refract_core::DEFAULT_OWNER_ID, q.hours)
-                .await
-                .map_err(reject)?;
-            ok(value)
-        });
-
-    let timeseries = base
-        .and(warp::path("timeseries"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::<TimeseriesQuery>())
-        .and(with_state(state.clone()))
-        .and_then(|q: TimeseriesQuery, state: AppState| async move {
-            let value = state
-                .log_repo()
-                .timeseries(refract_core::DEFAULT_OWNER_ID, q.hours, q.bucket == "day")
-                .await
-                .map_err(reject)?;
-            ok(value)
-        });
-
-    let by_key = base
-        .and(warp::path("keys"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::<StatsQuery>())
-        .and(with_state(state))
-        .and_then(|q: StatsQuery, state: AppState| async move {
-            let items = state
-                .log_repo()
-                .by_key(refract_core::DEFAULT_OWNER_ID, q.hours)
-                .await
-                .map_err(reject)?;
-            ok(items)
-        });
-
-    routes![by_model, by_key, by_channel, timeseries, summary]
-}
-
-// ---------------------------------------------------------------------------
-// 设置
-// ---------------------------------------------------------------------------
-
-/// 路由策略与管理令牌。
-fn settings(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("settings");
-
-    let get_policy = base
-        .and(warp::path("routing"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move { ok(state.policy()) });
-
-    let set_policy = base
-        .and(warp::path("routing"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|policy: RoutingPolicy, state: AppState| async move {
-            state
-                .settings_repo()
-                .set_routing_policy(&policy)
-                .await
-                .map_err(reject)?;
-            // 策略也在热路径的内存快照里，同样要刷。
-            state.reload_policy().await.map_err(reject)?;
-            ok(policy)
-        });
-
-    let get_retention = base
-        .and(warp::path("log-retention"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            ok(serde_json::json!({
-                "days": state.settings_repo().log_retention_days().await,
-            }))
-        });
-
-    let set_retention = base
-        .and(warp::path("log-retention"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|body: LogRetentionBody, state: AppState| async move {
-            state
-                .settings_repo()
-                .set_log_retention_days(body.days)
-                .await
-                .map_err(reject)?;
-            ok(body)
-        });
-
-    let get_breaker = base
-        .and(warp::path("breaker"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let policy = state
-                .settings_repo()
-                .breaker_policy()
-                .await
-                .map_err(reject)?;
-            ok(policy)
-        });
-
-    let set_breaker = base
-        .and(warp::path("breaker"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |policy: refract_store::BreakerPolicy, state: AppState| async move {
-                state
-                    .settings_repo()
-                    .set_breaker_policy(&policy)
-                    .await
-                    .map_err(reject)?;
-                // 热更新共享的健康仓储，立刻对后续失败判定生效。
-                state.reload_breaker().await.map_err(reject)?;
-                ok(policy)
-            },
-        );
-
-    let get_limits = base
-        .and(warp::path("limits"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let limits = state
-                .settings_repo()
-                .global_limits()
-                .await
-                .map_err(reject)?;
-            ok(limits)
-        });
-
-    let set_limits = base
-        .and(warp::path("limits"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |limits: refract_store::GlobalLimits, state: AppState| async move {
-                state
-                    .settings_repo()
-                    .set_global_limits(&limits)
-                    .await
-                    .map_err(reject)?;
-                state.reload_global_limits().await.map_err(reject)?;
-                ok(limits)
-            },
-        );
-
-    let get_empty_response_retry = base
-        .and(warp::path("empty-response-retry"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move { ok(state.empty_response_retry()) });
-
-    let set_empty_response_retry = base
-        .and(warp::path("empty-response-retry"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |policy: refract_core::EmptyResponseRetryPolicy, state: AppState| async move {
-                state
-                    .settings_repo()
-                    .set_empty_response_retry(policy)
-                    .await
-                    .map_err(reject)?;
-                state.reload_empty_response_retry().await.map_err(reject)?;
-                ok(policy)
-            },
-        );
-
-    let get_notify = base
-        .and(warp::path("notify"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let webhook_url = state.settings_repo().webhook_url().await.map_err(reject)?;
-            let retest_minutes = state.settings_repo().retest_minutes().await;
-            ok(serde_json::json!({
-                "webhook_url": webhook_url,
-                "retest_minutes": retest_minutes,
-            }))
-        });
-
-    let set_notify = base
-        .and(warp::path("notify"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|body: NotifyBody, state: AppState| async move {
-            state
-                .settings_repo()
-                .set_notify(body.webhook_url.as_deref(), body.retest_minutes)
-                .await
-                .map_err(reject)?;
-            state.reload_webhook().await.map_err(reject)?;
-            ok(body)
-        });
-
-    // POST /api/settings/notify/test —— 立即发一条测试事件，验证 webhook 通不通。
-    let test_notify = base
-        .and(warp::path("notify"))
-        .and(warp::path("test"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let Some(url) = state.webhook_url() else {
-                return Err(reject(refract_store::StoreError::Invalid(
-                    "webhook url is not configured — save it first".into(),
-                )));
-            };
-            let secret = state.webhook_secret();
-            crate::notify::send_webhook(
-                &url,
-                "notify.test",
-                "refract",
-                None,
-                "这是一条测试通知；收到即表示 webhook 配置正确",
-                secret.as_deref(),
-            )
-            .await;
-            ok(serde_json::json!({ "sent": true }))
-        });
-
-    let get_log_bodies = base
-        .and(warp::path("log-bodies"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let enabled = state
-                .settings_repo()
-                .capture_bodies()
-                .await
-                .map_err(reject)?;
-            ok(serde_json::json!({ "enabled": enabled }))
-        });
-
-    let set_log_bodies = base
-        .and(warp::path("log-bodies"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|body: LogBodiesBody, state: AppState| async move {
-            state
-                .settings_repo()
-                .set_capture_bodies(body.enabled)
-                .await
-                .map_err(reject)?;
-            state.reload_capture_bodies().await.map_err(reject)?;
-            ok(serde_json::json!({ "enabled": body.enabled }))
-        });
-
-    let get_pricing = base
-        .and(warp::path("pricing"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let prices = state.settings_repo().pricing().await.map_err(reject)?;
-            ok(prices)
-        });
-
-    let set_pricing = base
-        .and(warp::path("pricing"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |prices: Vec<refract_store::ModelPrice>, state: AppState| async move {
-                state
-                    .settings_repo()
-                    .set_pricing(&prices)
-                    .await
-                    .map_err(reject)?;
-                // 热替换价表快照，立即对后续请求的成本计算生效。
-                state.reload_pricing().await.map_err(reject)?;
-                ok(prices)
-            },
-        );
-
-    // GET /api/settings/affinity —— 渠道亲和性设置（缺失时返回全默认）。
-    let get_affinity = base
-        .and(warp::path("affinity"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let settings = state.settings_repo().affinity().await.map_err(reject)?;
-            ok(settings)
-        });
-
-    // PUT /api/settings/affinity —— 校验并保存，随后热更新规则引擎。
-    let set_affinity = base
-        .and(warp::path("affinity"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |settings: refract_core::AffinitySettings, state: AppState| async move {
-                state
-                    .settings_repo()
-                    .set_affinity(&settings)
-                    .await
-                    .map_err(reject)?;
-                // 引擎在热路径里：规则改完必须立刻重载，否则保存了不生效。
-                state.reload_affinity().await.map_err(reject)?;
-                ok(settings)
-            },
-        );
-
-    // POST /api/settings/affinity/clear —— 清空全部已建立的绑定缓存。
-    // 规则本身不动；规则改了也无需清，缓存键按规则名区分。
-    let clear_affinity = base
-        .and(warp::path("affinity"))
-        .and(warp::path("clear"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let cleared = state.affinity().clear();
-            ok(serde_json::json!({ "cleared": cleared }))
-        });
-
-    // GET /api/settings/affinity/stats —— 命中/未命中/记录/遗忘次数与活跃绑定数。
-    let stats_affinity = base
-        .and(warp::path("affinity"))
-        .and(warp::path("stats"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let stats = state.affinity().stats();
-            let active = state.affinity().is_active();
-            ok(serde_json::json!({ "active": active, "stats": stats }))
-        });
-
-    // 管理令牌只能写、不能读 —— 读接口等于把令牌泄漏给任何已经进来的人。
-    // 首次启动由 bootstrap 签发；这里只负责轮换或显式关闭。
-    // 管理令牌设置端点：PUT /api/settings/admin-token
-    let set_token = base
-        .and(warp::path("admin-token"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|body: AdminTokenBody, state: AppState| async move {
-            let repo = state.settings_repo();
-            match body.token.filter(|t| !t.trim().is_empty()) {
-                Some(token) => {
-                    let hash = refract_store::ApiKeyRepo::hash(&token);
-                    repo.set_admin_token(Some(&hash)).await.map_err(reject)?;
-                    let ticket = crate::auth::create_session_ticket(
-                        state.session_secret(),
-                        &hash,
-                        crate::auth::SESSION_MAX_AGE_SECS,
-                    );
-                    let cookie = format!(
-                        "{}={ticket}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-                        crate::auth::SESSION_COOKIE_NAME,
-                        crate::auth::SESSION_MAX_AGE_SECS
-                    );
-                    let res = warp::reply::with_header(
-                        warp::reply::json(&Envelope {
-                            data: serde_json::json!({ "configured": true }),
-                        }),
-                        warp::http::header::SET_COOKIE,
-                        cookie,
-                    );
-                    Ok::<warp::reply::Response, Rejection>(res.into_response())
-                }
-                // 传 null 表示「关掉管理鉴权」，个人本机部署的常见需求。
-                None => {
-                    repo.set_admin_token(None).await.map_err(reject)?;
-                    let cookie = format!(
-                        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-                        crate::auth::SESSION_COOKIE_NAME
-                    );
-                    let res = warp::reply::with_header(
-                        warp::reply::json(&Envelope {
-                            data: serde_json::json!({ "configured": false }),
-                        }),
-                        warp::http::header::SET_COOKIE,
-                        cookie,
-                    );
-                    Ok::<warp::reply::Response, Rejection>(res.into_response())
-                }
-            }
-        });
-
-    let get_ip_limits = base
-        .and(warp::path("ip-limits"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let limits = state.settings_repo().ip_limits().await.map_err(reject)?;
-            ok(limits)
-        });
-
-    let set_ip_limits = base
-        .and(warp::path("ip-limits"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |limits: refract_store::IpLimits, state: AppState| async move {
-                state
-                    .settings_repo()
-                    .set_ip_limits(&limits)
-                    .await
-                    .map_err(reject)?;
-                state.reload_ip_limits().await.map_err(reject)?;
-                ok(limits)
-            },
-        );
-
-    let get_webhook_secret = base
-        .and(warp::path("webhook-secret"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let secret = state
-                .settings_repo()
-                .webhook_secret()
-                .await
-                .map_err(reject)?;
-            ok(serde_json::json!({ "configured": secret.is_some_and(|s| !s.is_empty()) }))
-        });
-
-    let set_webhook_secret = base
-        .and(warp::path("webhook-secret"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(|body: WebhookSecretBody, state: AppState| async move {
-            state
-                .settings_repo()
-                .set_webhook_secret(body.secret.as_deref())
-                .await
-                .map_err(reject)?;
-            state.reload_webhook_secret().await.map_err(reject)?;
-            let configured = body.secret.is_some_and(|s| !s.is_empty());
-            ok(serde_json::json!({ "configured": configured }))
-        });
-
-    let get_backup_settings = base
-        .and(warp::path("backup"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let settings = state
-                .settings_repo()
-                .backup_settings()
-                .await
-                .map_err(reject)?;
-            ok(settings)
-        });
-
-    let set_backup_settings = base
-        .and(warp::path("backup"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state.clone()))
-        .and_then(
-            |settings: refract_store::BackupSettings, state: AppState| async move {
-                state
-                    .settings_repo()
-                    .set_backup_settings(&settings)
-                    .await
-                    .map_err(reject)?;
-                state.reload_backup().await.map_err(reject)?;
-                ok(settings)
-            },
-        );
-
-    let get_master_key = base
-        .and(warp::path("master-key"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let configured = state.master_key().is_some();
-            ok(serde_json::json!({ "configured": configured }))
-        });
-
-    let set_master_key = base
-        .and(warp::path("master-key"))
-        .and(warp::path::end())
-        .and(warp::put())
-        .and(json_body(state.clone()))
-        .and(with_state(state))
-        .and_then(|body: MasterKeyBody, state: AppState| async move {
-            match body.key.filter(|k| !k.trim().is_empty()) {
-                Some(k) => {
-                    refract_store::parse_master_key(&k).map_err(|e| {
-                        warp::reject::custom(ApiError(GatewayError::invalid_request(e.to_string())))
-                    })?;
-                    state
-                        .settings_repo()
-                        .set_master_key(Some(&k))
-                        .await
-                        .map_err(reject)?;
-                    state.reload_master_key().await.map_err(reject)?;
-                    ok(serde_json::json!({ "configured": true }))
-                }
-                None => {
-                    state
-                        .settings_repo()
-                        .set_master_key(None)
-                        .await
-                        .map_err(reject)?;
-                    state.reload_master_key().await.map_err(reject)?;
-                    ok(serde_json::json!({ "configured": false }))
-                }
-            }
-        });
-
-    routes![
-        get_policy,
-        set_policy,
-        get_retention,
-        set_retention,
-        get_breaker,
-        set_breaker,
-        get_pricing,
-        set_pricing,
-        get_log_bodies,
-        set_log_bodies,
-        get_limits,
-        set_limits,
-        get_empty_response_retry,
-        set_empty_response_retry,
-        get_notify,
-        set_notify,
-        test_notify,
-        get_affinity,
-        set_affinity,
-        clear_affinity,
-        stats_affinity,
-        set_token,
-        get_ip_limits,
-        set_ip_limits,
-        get_webhook_secret,
-        set_webhook_secret,
-        get_backup_settings,
-        set_backup_settings,
-        get_master_key,
-        set_master_key,
-    ]
-}
 /// 设置管理令牌的请求体。
 #[derive(Debug, Deserialize)]
 struct AdminTokenBody {
@@ -1935,6 +1643,15 @@ struct AdminTokenBody {
 #[derive(Debug, Deserialize)]
 struct LogBodiesBody {
     enabled: bool,
+}
+
+fn default_retest_minutes() -> u32 {
+    refract_store::settings_repo::DEFAULT_RETEST_MINUTES
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LogRetentionBody {
+    days: u32,
 }
 
 /// 通知与自愈设置的请求体。
@@ -1961,115 +1678,6 @@ struct MasterKeyBody {
     #[serde(default)]
     key: Option<String>,
 }
-
-/// 备份文件管理端点。
-fn backups(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("backups");
-
-    // GET /api/backups
-    let list = base
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let dir = crate::backup::resolve_backup_dir(&state);
-            let items = crate::backup::list_backups(&dir);
-            ok(items)
-        });
-
-    // POST /api/backups -> 手动触发单次备份
-    let run = base
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let filename = crate::backup::run_backup_once(&state)
-                .await
-                .map_err(reject)?;
-            ok(serde_json::json!({ "name": filename }))
-        });
-
-    // GET /api/backups/{name} -> 下载
-    let download = base
-        .and(warp::path::param::<String>())
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|name: String, state: AppState| async move {
-            if !crate::backup::is_valid_backup_name(&name) {
-                return Err(warp::reject::custom(ApiError(
-                    GatewayError::invalid_request("invalid backup filename"),
-                )));
-            }
-            let dir = crate::backup::resolve_backup_dir(&state);
-            let target = dir.join(&name);
-            if !target.is_file() {
-                return Err(warp::reject::custom(ApiError(GatewayError::not_found(
-                    format!("backup file `{name}` not found"),
-                ))));
-            }
-            let bytes = tokio::fs::read(&target).await.map_err(|e| {
-                warp::reject::custom(ApiError(GatewayError::internal(format!(
-                    "failed to read backup file: {e}"
-                ))))
-            })?;
-            let mut response = warp::reply::Response::new(bytes.into());
-            response.headers_mut().insert(
-                "content-type",
-                warp::http::HeaderValue::from_static("application/vnd.sqlite3"),
-            );
-            if let Ok(disposition) =
-                warp::http::HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
-            {
-                response
-                    .headers_mut()
-                    .insert("content-disposition", disposition);
-            }
-            Ok(response)
-        });
-
-    // DELETE /api/backups/{name}
-    let delete = base
-        .and(warp::path::param::<String>())
-        .and(warp::path::end())
-        .and(warp::delete())
-        .and(with_state(state))
-        .and_then(|name: String, state: AppState| async move {
-            if !crate::backup::is_valid_backup_name(&name) {
-                return Err(warp::reject::custom(ApiError(
-                    GatewayError::invalid_request("invalid backup filename"),
-                )));
-            }
-            let dir = crate::backup::resolve_backup_dir(&state);
-            let target = dir.join(&name);
-            if !target.is_file() {
-                return Err(warp::reject::custom(ApiError(GatewayError::not_found(
-                    format!("backup file `{name}` not found"),
-                ))));
-            }
-            tokio::fs::remove_file(&target).await.map_err(|e| {
-                warp::reject::custom(ApiError(GatewayError::internal(format!(
-                    "failed to remove backup file: {e}"
-                ))))
-            })?;
-            ok(serde_json::json!({ "deleted": true }))
-        });
-
-    routes![list, run, download, delete]
-}
-
-fn default_retest_minutes() -> u32 {
-    refract_store::settings_repo::DEFAULT_RETEST_MINUTES
-}
-
-#[derive(Debug, Deserialize, serde::Serialize)]
-struct LogRetentionBody {
-    days: u32,
-}
-
-// ---------------------------------------------------------------------------
-// 备份：配置导出 / 导入
-// ---------------------------------------------------------------------------
 
 /// 备份文档的当前版本号。导入时校验，未来格式变更靠它做兼容。
 const EXPORT_VERSION: u32 = 1;
@@ -2124,71 +1732,24 @@ enum ImportMode {
     Replace,
 }
 
-/// 配置导出 / 导入。
-fn backup(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let export = warp::path("export")
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let owner = refract_core::DEFAULT_OWNER_ID;
-            let channels = state.channel_repo().list(owner).await.map_err(reject)?;
-            let keys = state.key_repo().export(owner).await.map_err(reject)?;
-            let document = ExportDocument {
-                version: EXPORT_VERSION,
-                exported_at: Some(chrono::Utc::now().to_rfc3339()),
-                channels,
-                keys,
-                settings: ExportedSettings {
-                    routing_policy: state.policy(),
-                    log_retention_days: state.settings_repo().log_retention_days().await,
-                    breaker_policy: state
-                        .settings_repo()
-                        .breaker_policy()
-                        .await
-                        .map_err(reject)?,
-                    pricing: state.settings_repo().pricing().await.map_err(reject)?,
-                    empty_response_retry: state.empty_response_retry(),
-                },
-            };
-            ok(document)
-        });
-
-    let import = warp::path("import")
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(json_body(state.clone()))
-        .and(with_state(state))
-        .and_then(|req: ImportRequest, state: AppState| async move {
-            import_document(req, &state).await
-        });
-
-    routes![export, import]
-}
-
 /// 执行导入。
 ///
 /// 先全量校验再写入：一个坏渠道不应该让备份导到一半 —— 那比导入失败更糟，
 /// 用户会拿到一个自己都说不清状态的实例。
-async fn import_document(
-    req: ImportRequest,
-    state: &AppState,
-) -> Result<warp::reply::Response, Rejection> {
+async fn import_document(req: ImportRequest, state: &AppState) -> Result<WebResponse, AppError> {
     let owner = refract_core::DEFAULT_OWNER_ID;
     if req.data.version != EXPORT_VERSION {
-        return Err(warp::reject::custom(ApiError(
-            GatewayError::invalid_request(format!(
-                "unsupported backup version {}; this build accepts version {EXPORT_VERSION}",
-                req.data.version
-            )),
-        )));
+        return Err(AppError::Admin(GatewayError::invalid_request(format!(
+            "unsupported backup version {}; this build accepts version {EXPORT_VERSION}",
+            req.data.version
+        ))));
     }
     for channel in &req.data.channels {
         channel.validate().map_err(|e| {
-            warp::reject::custom(ApiError(GatewayError::invalid_request(format!(
+            AppError::Admin(GatewayError::invalid_request(format!(
                 "channel `{}` in the backup is invalid: {e}",
                 channel.name
-            ))))
+            )))
         })?;
     }
 
@@ -2289,70 +1850,6 @@ async fn import_document(
 // 健康与模型
 // ---------------------------------------------------------------------------
 
-/// 端点健康状态。
-fn health(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    let base = warp::path("health");
-
-    let all = base
-        .and(warp::path("channels"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state.clone()))
-        .and_then(|state: AppState| async move {
-            let items = state.health_repo().all().await.map_err(reject)?;
-            ok(items)
-        });
-
-    let reset = base
-        .and(warp::path("channels"))
-        .and(warp::path::param::<ChannelId>())
-        .and(warp::path::param::<Protocol>())
-        .and(warp::path("reset"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_state(state))
-        .and_then(
-            |id: ChannelId, protocol: Protocol, state: AppState| async move {
-                state
-                    .health_repo()
-                    .reset(id, protocol)
-                    .await
-                    .map_err(reject)?;
-                ok(serde_json::json!({ "reset": id, "protocol": protocol }))
-            },
-        );
-
-    routes![reset, all]
-}
-
-/// 可用模型清单 —— 由当前渠道快照推导，不是另一张表。
-///
-/// 「模型列表」不该是用户手工维护的第二份真相：它就是「所有启用渠道的所有
-/// 启用端点声明的模型」的并集。让它成为派生值，配置改完列表自动对。
-fn models(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path("models")
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(state))
-        .and_then(|state: AppState| async move {
-            let channels = state.channels();
-            let mut names: Vec<&str> = channels
-                .iter()
-                .filter(|c| c.enabled)
-                .flat_map(|c| c.endpoints.iter())
-                .filter(|e| e.enabled)
-                .flat_map(|e| e.models.iter())
-                .map(|m| m.name.as_str())
-                .collect();
-            names.sort_unstable();
-            names.dedup();
-            ok(names)
-        })
-        .boxed()
-}
-
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2440,11 +1937,9 @@ mod tests {
         let state = test_state().await;
         assert_eq!(state.channels().len(), 0);
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/channels")
+        let response = crate::http_test::TestRequest::post("/api/channels")
             .json(&sample())
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2462,11 +1957,10 @@ mod tests {
         state.reload_channels().await.unwrap();
         assert_eq!(state.channels().len(), 1);
 
-        let response = warp::test::request()
-            .method("DELETE")
-            .path(&format!("/api/channels/{}", created.id))
-            .reply(&crate::routes(state.clone()))
-            .await;
+        let response =
+            crate::http_test::TestRequest::delete(&format!("/api/channels/{}", created.id))
+                .send(state.clone())
+                .await;
 
         assert_eq!(response.status(), 200);
         assert_eq!(state.channels().len(), 0);
@@ -2485,11 +1979,9 @@ mod tests {
         payload.id = second.id;
         payload.name = "hijacked".into();
 
-        let response = warp::test::request()
-            .method("PUT")
-            .path(&format!("/api/channels/{}", first.id))
+        let response = crate::http_test::TestRequest::put(&format!("/api/channels/{}", first.id))
             .json(&payload)
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2507,11 +1999,9 @@ mod tests {
         let mut payload = sample();
         payload.owner_id = 9999;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/channels")
+        let response = crate::http_test::TestRequest::post("/api/channels")
             .json(&payload)
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2531,11 +2021,9 @@ mod tests {
         payload.credential = Credential::new("sk-default-super-secret");
         payload.endpoints[0].credential = Some(Credential::new("sk-endpoint-super-secret"));
 
-        let created = warp::test::request()
-            .method("POST")
-            .path("/api/channels")
+        let created = crate::http_test::TestRequest::post("/api/channels")
             .json(&payload)
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(created.status(), 200);
         let created_text = String::from_utf8_lossy(created.body());
@@ -2545,10 +2033,8 @@ mod tests {
         assert!(created_text.contains("sk-e…cret"));
 
         for path in ["/api/channels", "/api/channels/1"] {
-            let response = warp::test::request()
-                .method("GET")
-                .path(path)
-                .reply(&crate::routes(state.clone()))
+            let response = crate::http_test::TestRequest::get(path)
+                .send(state.clone())
                 .await;
             assert_eq!(response.status(), 200);
             let text = String::from_utf8_lossy(response.body());
@@ -2567,20 +2053,16 @@ mod tests {
         original.endpoints[0].credential = Some(Credential::new("sk-endpoint-super-secret"));
         let created = state.channel_repo().create(&original).await.unwrap();
 
-        let response = warp::test::request()
-            .method("GET")
-            .path(&format!("/api/channels/{}", created.id))
-            .reply(&crate::routes(state.clone()))
+        let response = crate::http_test::TestRequest::get(&format!("/api/channels/{}", created.id))
+            .send(state.clone())
             .await;
         let envelope: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
         let mut redacted: Channel = serde_json::from_value(envelope["data"].clone()).unwrap();
         redacted.name = "renamed".into();
 
-        let updated = warp::test::request()
-            .method("PUT")
-            .path(&format!("/api/channels/{}", created.id))
+        let updated = crate::http_test::TestRequest::put(&format!("/api/channels/{}", created.id))
             .json(&redacted)
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(updated.status(), 200);
         let saved = state
@@ -2605,21 +2087,17 @@ mod tests {
 
         // 管理端取回脱敏后的渠道，把端点协议从 chat 改成 messages ——
         // 掩码找不到原端点，还原逻辑无能为力，必须拒绝而不是存掩码。
-        let response = warp::test::request()
-            .method("GET")
-            .path(&format!("/api/channels/{}", created.id))
-            .reply(&crate::routes(state.clone()))
+        let response = crate::http_test::TestRequest::get(&format!("/api/channels/{}", created.id))
+            .send(state.clone())
             .await;
         let envelope: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
         let mut redacted: Channel = serde_json::from_value(envelope["data"].clone()).unwrap();
         redacted.kind = ChannelKind::Single(Protocol::Messages);
         redacted.endpoints[0].protocol = Protocol::Messages;
 
-        let update = warp::test::request()
-            .method("PUT")
-            .path(&format!("/api/channels/{}", created.id))
+        let update = crate::http_test::TestRequest::put(&format!("/api/channels/{}", created.id))
             .json(&redacted)
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(
             update.status(),
@@ -2658,11 +2136,9 @@ mod tests {
             "settings": {}
         });
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/import")
+        let response = crate::http_test::TestRequest::post("/api/import")
             .json(&serde_json::json!({ "mode": "replace", "data": document }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(
             response.status(),
@@ -2688,11 +2164,10 @@ mod tests {
         original.credential = Credential::new("sk-copy-me");
         let created = state.channel_repo().create(&original).await.unwrap();
 
-        let response = warp::test::request()
-            .method("POST")
-            .path(&format!("/api/channels/{}/duplicate", created.id))
-            .reply(&crate::routes(state.clone()))
-            .await;
+        let response =
+            crate::http_test::TestRequest::post(&format!("/api/channels/{}/duplicate", created.id))
+                .send(state.clone())
+                .await;
         assert_eq!(response.status(), 200);
 
         let listed = state
@@ -2719,11 +2194,9 @@ mod tests {
             ids.push(state.channel_repo().create(&channel).await.unwrap().id);
         }
 
-        let disable = warp::test::request()
-            .method("POST")
-            .path("/api/channels/bulk")
+        let disable = crate::http_test::TestRequest::post("/api/channels/bulk")
             .json(&serde_json::json!({ "ids": ids, "action": "disable" }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(disable.status(), 200);
         let listed = state
@@ -2736,11 +2209,9 @@ mod tests {
         assert!(state.channels().iter().all(|c| !c.enabled));
 
         // 删除时包含一个不存在的 id：批量操作必须宽容缺席者。
-        let delete = warp::test::request()
-            .method("POST")
-            .path("/api/channels/bulk")
+        let delete = crate::http_test::TestRequest::post("/api/channels/bulk")
             .json(&serde_json::json!({ "ids": [ids[0], ids[1], 424242], "action": "delete" }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(delete.status(), 200);
         let body: serde_json::Value = serde_json::from_slice(delete.body()).unwrap();
@@ -2783,10 +2254,8 @@ mod tests {
             .unwrap();
         source.reload_policy().await.unwrap();
 
-        let exported = warp::test::request()
-            .method("GET")
-            .path("/api/export")
-            .reply(&crate::routes(source))
+        let exported = crate::http_test::TestRequest::get("/api/export")
+            .send(source.clone())
             .await;
         assert_eq!(exported.status(), 200);
         let envelope: serde_json::Value = serde_json::from_slice(exported.body()).unwrap();
@@ -2800,11 +2269,9 @@ mod tests {
 
         // 在全新实例导入。
         let target = test_state().await;
-        let imported = warp::test::request()
-            .method("POST")
-            .path("/api/import")
+        let imported = crate::http_test::TestRequest::post("/api/import")
             .json(&serde_json::json!({ "mode": "replace", "data": document }))
-            .reply(&crate::routes(target.clone()))
+            .send(target.clone())
             .await;
         assert_eq!(imported.status(), 200);
         let result: serde_json::Value = serde_json::from_slice(imported.body()).unwrap();
@@ -2827,11 +2294,9 @@ mod tests {
         assert_eq!(target.policy().max_attempts, 5);
 
         // 再次以 merge 导入：全部跳过，不产生重复。
-        let merged = warp::test::request()
-            .method("POST")
-            .path("/api/import")
+        let merged = crate::http_test::TestRequest::post("/api/import")
             .json(&serde_json::json!({ "mode": "merge", "data": envelope["data"] }))
-            .reply(&crate::routes(target.clone()))
+            .send(target.clone())
             .await;
         let result: serde_json::Value = serde_json::from_slice(merged.body()).unwrap();
         assert_eq!(result["data"]["channels_skipped"], 1);
@@ -2846,25 +2311,21 @@ mod tests {
     async fn import_rejects_unknown_versions_and_invalid_channels() {
         let state = test_state().await;
 
-        let wrong_version = warp::test::request()
-            .method("POST")
-            .path("/api/import")
+        let wrong_version = crate::http_test::TestRequest::post("/api/import")
             .json(&serde_json::json!({
                 "data": {
                     "version": 99,
                     "settings": { "routing_policy": refract_core::RoutingPolicy::default(), "log_retention_days": 30 }
                 }
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(wrong_version.status(), 400);
 
         // 无端点的渠道非法，导入必须整体拒绝且不落任何数据。
         let mut invalid = sample();
         invalid.endpoints.clear();
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/import")
+        let response = crate::http_test::TestRequest::post("/api/import")
             .json(&serde_json::json!({
                 "data": {
                     "version": 1,
@@ -2872,7 +2333,7 @@ mod tests {
                     "settings": { "routing_policy": refract_core::RoutingPolicy::default(), "log_retention_days": 30 }
                 }
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 400);
         assert!(state.channels().is_empty());
@@ -2888,11 +2349,9 @@ mod tests {
             ..ChannelEndpoint::new(Protocol::Chat)
         });
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/channels")
+        let response = crate::http_test::TestRequest::post("/api/channels")
             .json(&payload)
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 400);
@@ -2906,11 +2365,9 @@ mod tests {
         let mut payload = sample();
         payload.endpoints.clear();
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/channels")
+        let response = crate::http_test::TestRequest::post("/api/channels")
             .json(&payload)
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 400);
@@ -2923,11 +2380,9 @@ mod tests {
         // 声明是 Messages 渠道，但端点只有 Chat —— UI 会显示错误的类型。
         payload.kind = ChannelKind::Single(Protocol::Messages);
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/channels")
+        let response = crate::http_test::TestRequest::post("/api/channels")
             .json(&payload)
-            .reply(&crate::routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 400);
@@ -2939,12 +2394,11 @@ mod tests {
         let state = test_state().await;
         let created = state.channel_repo().create(&sample()).await.unwrap();
 
-        let response = warp::test::request()
-            .method("POST")
-            .path(&format!("/api/channels/{}/enabled", created.id))
-            .json(&serde_json::json!({ "enabled": false }))
-            .reply(&crate::routes(state.clone()))
-            .await;
+        let response =
+            crate::http_test::TestRequest::post(&format!("/api/channels/{}/enabled", created.id))
+                .json(&serde_json::json!({ "enabled": false }))
+                .send(state.clone())
+                .await;
 
         assert_eq!(response.status(), 200);
         let updated = state
@@ -2961,11 +2415,9 @@ mod tests {
     async fn api_key_plaintext_is_returned_exactly_once() {
         let state = test_state().await;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/keys")
+        let response = crate::http_test::TestRequest::post("/api/keys")
             .json(&serde_json::json!({ "name": "laptop" }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -2974,10 +2426,8 @@ mod tests {
         assert!(plaintext.starts_with("rk-"));
 
         // 列表接口不能再带出明文。
-        let listed = warp::test::request()
-            .method("GET")
-            .path("/api/keys")
-            .reply(&crate::routes(state))
+        let listed = crate::http_test::TestRequest::get("/api/keys")
+            .send(state.clone())
             .await;
         let text = String::from_utf8_lossy(listed.body()).into_owned();
         assert!(
@@ -3022,10 +2472,8 @@ mod tests {
         state.reload_channels().await.unwrap();
         let id = state.channels()[0].id;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path(&format!("/api/channels/{id}/balance"))
-            .reply(&routes(state.clone()))
+        let response = crate::http_test::TestRequest::post(&format!("/api/channels/{id}/balance"))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
@@ -3081,10 +2529,8 @@ mod tests {
         state.reload_channels().await.unwrap();
         let id = state.channels()[0].id;
 
-        let response = warp::test::request()
-            .method("POST")
-            .path(&format!("/api/channels/{id}/balance"))
-            .reply(&routes(state.clone()))
+        let response = crate::http_test::TestRequest::post(&format!("/api/channels/{id}/balance"))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
@@ -3113,9 +2559,7 @@ mod tests {
             .unwrap();
 
         // 编辑治理属性：名字、限速、备注全改，密钥本体不动。
-        let response = warp::test::request()
-            .method("PUT")
-            .path(&format!("/api/keys/{}", created.id))
+        let response = crate::http_test::TestRequest::put(&format!("/api/keys/{}", created.id))
             .json(&serde_json::json!({
                 "name": "after",
                 "quota": 500,
@@ -3123,7 +2567,7 @@ mod tests {
                 "tpm_limit": 100000,
                 "note": "给 Cursor 用的"
             }))
-            .reply(&routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 200);
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
@@ -3143,11 +2587,10 @@ mod tests {
         assert_eq!(found.name, "after");
 
         // 重置用量。
-        let response = warp::test::request()
-            .method("POST")
-            .path(&format!("/api/keys/{}/reset-usage", created.id))
-            .reply(&routes(state.clone()))
-            .await;
+        let response =
+            crate::http_test::TestRequest::post(&format!("/api/keys/{}/reset-usage", created.id))
+                .send(state.clone())
+                .await;
         assert_eq!(response.status(), 200);
         let after = state
             .key_repo()
@@ -3189,14 +2632,12 @@ mod tests {
         state.channel_repo().create(&channel).await.unwrap();
         state.reload_channels().await.unwrap();
 
-        let response = warp::test::request()
-            .method("POST")
-            .path("/api/playground/chat")
+        let response = crate::http_test::TestRequest::post("/api/playground/chat")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
                 "messages": [{ "role": "user", "content": "ping" }]
             }))
-            .reply(&routes(state))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -3216,10 +2657,8 @@ mod tests {
         state.channel_repo().create(&disabled).await.unwrap();
         state.reload_channels().await.unwrap();
 
-        let response = warp::test::request()
-            .method("GET")
-            .path("/api/models")
-            .reply(&routes(state))
+        let response = crate::http_test::TestRequest::get("/api/models")
+            .send(state.clone())
             .await;
 
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
@@ -3238,11 +2677,9 @@ mod tests {
         let mut policy = state.policy();
         policy.native_first = !policy.native_first;
 
-        let response = warp::test::request()
-            .method("PUT")
-            .path("/api/settings/routing")
+        let response = crate::http_test::TestRequest::put("/api/settings/routing")
             .json(&policy)
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
 
         assert_eq!(response.status(), 200);
@@ -3253,10 +2690,8 @@ mod tests {
     async fn log_retention_roundtrips_and_rejects_out_of_range_values() {
         let state = test_state().await;
 
-        let initial = warp::test::request()
-            .method("GET")
-            .path("/api/settings/log-retention")
-            .reply(&crate::routes(state.clone()))
+        let initial = crate::http_test::TestRequest::get("/api/settings/log-retention")
+            .send(state.clone())
             .await;
         assert_eq!(initial.status(), 200);
         let initial_body: serde_json::Value = serde_json::from_slice(initial.body()).unwrap();
@@ -3265,21 +2700,17 @@ mod tests {
             refract_store::settings_repo::DEFAULT_LOG_RETENTION_DAYS
         );
 
-        let updated = warp::test::request()
-            .method("PUT")
-            .path("/api/settings/log-retention")
+        let updated = crate::http_test::TestRequest::put("/api/settings/log-retention")
             .json(&serde_json::json!({ "days": 90 }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(updated.status(), 200);
         assert_eq!(state.settings_repo().log_retention_days().await, 90);
 
         for days in [0, refract_store::settings_repo::MAX_LOG_RETENTION_DAYS + 1] {
-            let rejected = warp::test::request()
-                .method("PUT")
-                .path("/api/settings/log-retention")
+            let rejected = crate::http_test::TestRequest::put("/api/settings/log-retention")
                 .json(&serde_json::json!({ "days": days }))
-                .reply(&crate::routes(state.clone()))
+                .send(state.clone())
                 .await;
             assert_eq!(rejected.status(), 400, "days={days}");
         }
@@ -3291,25 +2722,21 @@ mod tests {
         let state = test_state().await;
 
         // 默认值可读。
-        let initial = warp::test::request()
-            .method("GET")
-            .path("/api/settings/breaker")
-            .reply(&crate::routes(state.clone()))
+        let initial = crate::http_test::TestRequest::get("/api/settings/breaker")
+            .send(state.clone())
             .await;
         assert_eq!(initial.status(), 200);
         let body: serde_json::Value = serde_json::from_slice(initial.body()).unwrap();
         assert_eq!(body["data"]["failure_threshold"], 5);
 
         // 更新后：持久化 + 共享健康仓储热更新（不用重启）。
-        let updated = warp::test::request()
-            .method("PUT")
-            .path("/api/settings/breaker")
+        let updated = crate::http_test::TestRequest::put("/api/settings/breaker")
             .json(&serde_json::json!({
                 "failure_threshold": 3,
                 "base_cooldown_secs": 10,
                 "max_cooldown_secs": 300,
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(updated.status(), 200);
         assert_eq!(state.health_repo().policy().failure_threshold, 3);
@@ -3321,11 +2748,9 @@ mod tests {
             serde_json::json!({ "failure_threshold": 3, "base_cooldown_secs": 600, "max_cooldown_secs": 300 }),
             serde_json::json!({ "failure_threshold": 1_000_000, "base_cooldown_secs": 10, "max_cooldown_secs": 300 }),
         ] {
-            let rejected = warp::test::request()
-                .method("PUT")
-                .path("/api/settings/breaker")
+            let rejected = crate::http_test::TestRequest::put("/api/settings/breaker")
                 .json(&bad)
-                .reply(&crate::routes(state.clone()))
+                .send(state.clone())
                 .await;
             assert_eq!(rejected.status(), 400, "{bad}");
         }
@@ -3337,10 +2762,8 @@ mod tests {
         let state = test_state().await;
 
         // 默认全 0（不限）。
-        let initial = warp::test::request()
-            .method("GET")
-            .path("/api/settings/limits")
-            .reply(&crate::routes(state.clone()))
+        let initial = crate::http_test::TestRequest::get("/api/settings/limits")
+            .send(state.clone())
             .await;
         assert_eq!(initial.status(), 200);
         let body: serde_json::Value = serde_json::from_slice(initial.body()).unwrap();
@@ -3349,15 +2772,13 @@ mod tests {
         assert_eq!(body["data"]["max_concurrency"], 0);
 
         // 更新后：持久化 + AppState 快照热更新（不用重启）。
-        let updated = warp::test::request()
-            .method("PUT")
-            .path("/api/settings/limits")
+        let updated = crate::http_test::TestRequest::put("/api/settings/limits")
             .json(&serde_json::json!({
                 "rpm": 600,
                 "tpm": 2_000_000,
                 "max_concurrency": 16,
             }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(updated.status(), 200);
         assert_eq!(state.global_limits().rpm, 600);
@@ -3365,11 +2786,9 @@ mod tests {
         assert_eq!(state.global_limits().max_concurrency, 16);
 
         // 省略 tpm 的旧前端请求体仍可接受，缺省为 0（不限）。
-        let legacy = warp::test::request()
-            .method("PUT")
-            .path("/api/settings/limits")
+        let legacy = crate::http_test::TestRequest::put("/api/settings/limits")
             .json(&serde_json::json!({ "rpm": 60, "max_concurrency": 8 }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(legacy.status(), 200);
         assert_eq!(state.global_limits().tpm, 0);
@@ -3380,11 +2799,9 @@ mod tests {
             serde_json::json!({ "tpm": 1_000_000_001u64 }),
             serde_json::json!({ "max_concurrency": 100_001 }),
         ] {
-            let rejected = warp::test::request()
-                .method("PUT")
-                .path("/api/settings/limits")
+            let rejected = crate::http_test::TestRequest::put("/api/settings/limits")
                 .json(&bad)
-                .reply(&crate::routes(state.clone()))
+                .send(state.clone())
                 .await;
             assert_eq!(rejected.status(), 400, "{bad}");
         }
@@ -3396,36 +2813,28 @@ mod tests {
     async fn admin_token_can_be_set_and_cleared_but_never_read() {
         let state = test_state().await;
 
-        let set = warp::test::request()
-            .method("PUT")
-            .path("/api/settings/admin-token")
+        let set = crate::http_test::TestRequest::put("/api/settings/admin-token")
             .json(&serde_json::json!({ "token": "s3cret" }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(set.status(), 200);
 
         // 设置之后，无令牌的请求必须被拒。
-        let denied = warp::test::request()
-            .method("GET")
-            .path("/api/channels")
-            .reply(&crate::routes(state.clone()))
+        let denied = crate::http_test::TestRequest::get("/api/channels")
+            .send(state.clone())
             .await;
         assert_eq!(denied.status(), 401);
 
         // 带上正确令牌可以通过，并能清除。
-        let cleared = warp::test::request()
-            .method("PUT")
-            .path("/api/settings/admin-token")
+        let cleared = crate::http_test::TestRequest::put("/api/settings/admin-token")
             .header("x-admin-token", "s3cret")
             .json(&serde_json::json!({ "token": null }))
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         assert_eq!(cleared.status(), 200);
 
-        let open = warp::test::request()
-            .method("GET")
-            .path("/api/channels")
-            .reply(&crate::routes(state))
+        let open = crate::http_test::TestRequest::get("/api/channels")
+            .send(state.clone())
             .await;
         assert_eq!(open.status(), 200);
     }
@@ -3433,10 +2842,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_channel_yields_404_not_500() {
         let state = test_state().await;
-        let response = warp::test::request()
-            .method("GET")
-            .path("/api/channels/424242")
-            .reply(&crate::routes(state))
+        let response = crate::http_test::TestRequest::get("/api/channels/424242")
+            .send(state.clone())
             .await;
         assert_eq!(response.status(), 404);
     }
@@ -3453,10 +2860,8 @@ mod tests {
         let state = test_state().await;
 
         // 1. GET /api/crypto/public-key 无需鉴权即可访问
-        let pk_res = warp::test::request()
-            .method("GET")
-            .path("/api/crypto/public-key")
-            .reply(&crate::routes(state.clone()))
+        let pk_res = crate::http_test::TestRequest::get("/api/crypto/public-key")
+            .send(state.clone())
             .await;
         assert_eq!(pk_res.status(), 200);
 
@@ -3500,11 +2905,9 @@ mod tests {
         });
 
         // 4. POST /api/channels 发送加密信封
-        let create_res = warp::test::request()
-            .method("POST")
-            .path("/api/channels")
+        let create_res = crate::http_test::TestRequest::post("/api/channels")
             .json(&envelope)
-            .reply(&crate::routes(state.clone()))
+            .send(state.clone())
             .await;
         if create_res.status() != 200 {
             panic!(
@@ -3537,13 +2940,9 @@ mod tests {
     #[tokio::test]
     async fn auth_session_and_cookie_login_logout_flow() {
         let state = test_state().await;
-        let routes = crate::routes(state.clone());
-
         // 1. 未配置令牌时：/api/auth/session 返回 configured: false, authenticated: true
-        let res = warp::test::request()
-            .method("GET")
-            .path("/api/auth/session")
-            .reply(&routes)
+        let res = crate::http_test::TestRequest::get("/api/auth/session")
+            .send(state.clone())
             .await;
         assert_eq!(res.status(), 200);
         let val: serde_json::Value = serde_json::from_slice(res.body()).unwrap();
@@ -3551,11 +2950,9 @@ mod tests {
         assert_eq!(val["data"]["authenticated"], true);
 
         // 2. 配置管理令牌
-        let set_res = warp::test::request()
-            .method("PUT")
-            .path("/api/settings/admin-token")
+        let set_res = crate::http_test::TestRequest::put("/api/settings/admin-token")
             .json(&serde_json::json!({ "token": "admin-secret-pwd" }))
-            .reply(&routes)
+            .send(state.clone())
             .await;
         assert_eq!(set_res.status(), 200);
         let cookie_header = set_res
@@ -3569,38 +2966,30 @@ mod tests {
         assert!(cookie_header.contains("SameSite=Strict"));
 
         // 3. 无 Cookie 访问受保护接口返回 401
-        let blocked = warp::test::request()
-            .method("GET")
-            .path("/api/settings/ip-limits")
-            .reply(&routes)
+        let blocked = crate::http_test::TestRequest::get("/api/settings/ip-limits")
+            .send(state.clone())
             .await;
         assert_eq!(blocked.status(), 401);
 
         // 4. 携带生成的 Cookie 访问受保护接口成功
         let session_val = cookie_header.split(';').next().unwrap();
-        let authed = warp::test::request()
-            .method("GET")
-            .path("/api/settings/ip-limits")
+        let authed = crate::http_test::TestRequest::get("/api/settings/ip-limits")
             .header("cookie", session_val)
-            .reply(&routes)
+            .send(state.clone())
             .await;
         assert_eq!(authed.status(), 200);
 
         // 5. 错误 Token 登录被拒绝
-        let wrong_login = warp::test::request()
-            .method("POST")
-            .path("/api/auth/login")
+        let wrong_login = crate::http_test::TestRequest::post("/api/auth/login")
             .json(&serde_json::json!({ "token": "wrong-token" }))
-            .reply(&routes)
+            .send(state.clone())
             .await;
         assert_eq!(wrong_login.status(), 401);
 
         // 6. 正确 Token 登录成功并获取新 Cookie
-        let login_res = warp::test::request()
-            .method("POST")
-            .path("/api/auth/login")
+        let login_res = crate::http_test::TestRequest::post("/api/auth/login")
             .json(&serde_json::json!({ "token": "admin-secret-pwd" }))
-            .reply(&routes)
+            .send(state.clone())
             .await;
         assert_eq!(login_res.status(), 200);
         let new_cookie = login_res
@@ -3612,10 +3001,8 @@ mod tests {
         assert!(new_cookie.contains("refract_session="));
 
         // 7. 登出清除 Cookie
-        let logout_res = warp::test::request()
-            .method("POST")
-            .path("/api/auth/logout")
-            .reply(&routes)
+        let logout_res = crate::http_test::TestRequest::post("/api/auth/logout")
+            .send(state.clone())
             .await;
         assert_eq!(logout_res.status(), 200);
         let clear_cookie = logout_res

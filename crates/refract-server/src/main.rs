@@ -1,11 +1,7 @@
 //! Refract 服务器入口。
 //!
-//! 单二进制部署：加载配置 → 打开数据库 → 装配状态 → 启动 warp → 优雅关闭。
+//! 单二进制部署：加载配置 → 打开数据库 → 装配状态 → 启动 xitca-web → 优雅关闭。
 //! 前端产物通过 `rust-embed` 编译进二进制，部署时只需拷贝一个文件。
-
-// warp 的 filter 组合是一棵编译期类型树，整个 API 的路由 or 起来后深度
-// 超过了默认的 128 递归上限（rustc 计算 layout 时报错）。
-#![recursion_limit = "256"]
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -95,109 +91,132 @@ impl Config {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     init_tracing();
 
-    let config = Config::load()?;
-    tracing::info!(
-        listen = %config.listen,
-        database = %config.database,
-        require_auth = config.require_auth,
-        "starting refract"
-    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
 
-    let db = Database::open(&config.database)
-        .await
-        .with_context(|| format!("failed to open database at `{}`", config.database))?;
+    let (config, db, state) = rt.block_on(async {
+        let config = Config::load()?;
+        tracing::info!(
+            listen = %config.listen,
+            database = %config.database,
+            require_auth = config.require_auth,
+            "starting refract"
+        );
 
-    let client = UpstreamClient::new(config.upstream())
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to build the upstream HTTP client")?;
-    let explicit_master_key = config
-        .master_key
-        .as_deref()
-        .and_then(|s| refract_store::parse_master_key(s).ok());
-    if explicit_master_key.is_some() {
-        tracing::info!("channel credential encryption enabled (master key from environment)");
-    }
+        let db = Database::open(&config.database)
+            .await
+            .with_context(|| format!("failed to open database at `{}`", config.database))?;
 
-    let state = AppState::bootstrap_with_master_key(
-        db.clone(),
-        client,
-        config.require_auth,
-        explicit_master_key,
-    )
-    .await
-    .context("failed to load configuration from the database")?;
-
-    if explicit_master_key.is_none() {
-        if state.master_key().is_some() {
-            tracing::info!(
-                "channel credential encryption enabled (master key from database settings)"
-            );
-        } else {
-            tracing::info!("channel credentials stored in plaintext (no master key configured)");
+        let client = UpstreamClient::new(config.upstream())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("failed to build the upstream HTTP client")?;
+        let explicit_master_key = config
+            .master_key
+            .as_deref()
+            .and_then(|s| refract_store::parse_master_key(s).ok());
+        if explicit_master_key.is_some() {
+            tracing::info!("channel credential encryption enabled (master key from environment)");
         }
-    }
-    apply_bootstrap_admin_token(&config, &state).await?;
-    enforce_exposure_policy(&config, &state).await?;
-    warn_on_empty_config(&state);
-    let maintenance = tokio::spawn(log_retention_loop(state.clone()));
+
+        let state = AppState::bootstrap_with_master_key(
+            db.clone(),
+            client,
+            config.require_auth,
+            explicit_master_key,
+        )
+        .await
+        .context("failed to load configuration from the database")?;
+
+        if explicit_master_key.is_none() {
+            if state.master_key().is_some() {
+                tracing::info!(
+                    "channel credential encryption enabled (master key from database settings)"
+                );
+            } else {
+                tracing::info!(
+                    "channel credentials stored in plaintext (no master key configured)"
+                );
+            }
+        }
+        apply_bootstrap_admin_token(&config, &state).await?;
+        enforce_exposure_policy(&config, &state).await?;
+        warn_on_empty_config(&state);
+        Ok::<_, anyhow::Error>((config, db, state))
+    })?;
+
+    let maintenance = rt.spawn(log_retention_loop(state.clone()));
     // 自动禁用渠道的定时重测自愈（间隔从设置读取，0 = 关闭）。
-    let retest = tokio::spawn(refract_api::notify::auto_retest_loop(state.clone()));
+    let retest = rt.spawn(refract_api::notify::auto_retest_loop(state.clone()));
     // 数据库自动备份循环（间隔从设置读取，0 = 关闭）。
-    let backup = tokio::spawn(refract_api::backup::auto_backup_loop(state.clone()));
+    let backup = rt.spawn(refract_api::backup::auto_backup_loop(state.clone()));
+
     // 显式配置套接字（允许地址/端口重用），支持开发与重启时瞬时接管监听
-    let socket = match config.listen {
-        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-    };
-    socket.set_reuseaddr(true)?;
-    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
-    let _ = socket.set_reuseport(true);
-    socket
-        .bind(config.listen)
-        .with_context(|| format!("failed to bind {}", config.listen))?;
-    let listener = socket
-        .listen(1024)
-        .with_context(|| format!("failed to listen on {}", config.listen))?;
-    let local = listener.local_addr().unwrap_or(config.listen);
+    let (std_listener, local) = rt.block_on(async {
+        let socket = match config.listen {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
+        socket.set_reuseaddr(true)?;
+        #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+        let _ = socket.set_reuseport(true);
+        socket
+            .bind(config.listen)
+            .with_context(|| format!("failed to bind {}", config.listen))?;
+        let listener = socket
+            .listen(1024)
+            .with_context(|| format!("failed to listen on {}", config.listen))?;
+        let local = listener.local_addr().unwrap_or(config.listen);
+        let std_listener = listener
+            .into_std()
+            .context("failed to convert listener to std")?;
+        std_listener
+            .set_nonblocking(true)
+            .context("failed to set listener nonblocking")?;
+        Ok::<_, anyhow::Error>((std_listener, local))
+    })?;
 
     tracing::info!(address = %local, "refract is listening");
 
     // 优雅关闭必须有上限：挂着的 SSE 长连接可以合法地存活几分钟，无上限的
     // drain 会让 systemd/docker 在超时后直接 SIGKILL —— 那比我们主动截断更糟。
-    let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
-    let mut server = tokio::spawn(
-        warp::serve(refract_api::routes(state))
-            .incoming(listener)
-            .graceful(async {
-                let _ = drain_rx.await;
-            })
-            .run(),
-    );
-
-    shutdown_signal().await;
-    let _ = drain_tx.send(());
+    let (handle, wait) =
+        refract_api::start_server(state, std_listener).context("failed to start xitca-server")?;
+    let force = handle.clone();
     let grace = Duration::from_secs(config.shutdown_grace_secs);
-    if tokio::time::timeout(grace, &mut server).await.is_err() {
-        tracing::warn!(
-            grace_secs = config.shutdown_grace_secs,
-            "in-flight requests did not drain in time; forcing shutdown"
-        );
-        server.abort();
-        let _ = server.await;
-    }
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    rt.spawn(async move {
+        shutdown_signal().await;
+        handle.stop(true);
+        tokio::select! {
+            _ = drained_rx => {}
+            () = tokio::time::sleep(grace) => {
+                tracing::warn!(
+                    grace_secs = grace.as_secs(),
+                    "in-flight requests did not drain in time; forcing shutdown"
+                );
+                force.stop(false);
+            }
+        }
+    });
+
+    wait().context("xitca-server exited with error")?;
+    let _ = drained_tx.send(());
 
     maintenance.abort();
-    let _ = maintenance.await;
     retest.abort();
-    let _ = retest.await;
     backup.abort();
-    let _ = backup.await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    db.close().await;
+    rt.block_on(async {
+        let _ = maintenance.await;
+        let _ = retest.await;
+        let _ = backup.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        db.close().await;
+    });
     tracing::info!("shutdown complete");
     Ok(())
 }

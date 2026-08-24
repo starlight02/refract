@@ -8,9 +8,15 @@
 //! SPA fallback 的边界很关键：找不到的路径回 `index.html`，**但 API 前缀除外**。
 //! 不排除的话，一个拼错的 `/api/chanels` 会返回 200 + HTML，前端 `response.json()`
 //! 抛出语法错误，用户看到的是「Unexpected token <」而不是 404。
-use warp::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, VARY};
-use warp::http::{HeaderValue, StatusCode};
-use warp::{Filter, Reply, filters::BoxedFilter};
+
+use xitca_web::body::ResponseBody;
+use xitca_web::handler::params::Params;
+use xitca_web::http::{
+    HeaderMap, HeaderValue, Method, StatusCode, WebResponse,
+    header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, VARY},
+};
+
+use crate::error::AppError;
 
 /// 编译期内嵌的前端产物。
 ///
@@ -48,19 +54,39 @@ impl ContentEncoding {
     }
 }
 
-/// 静态资源路由。
-pub fn routes() -> BoxedFilter<(warp::reply::Response,)> {
-    warp::get()
-        .and(warp::path::tail())
-        .and(warp::header::optional::<String>("accept-encoding"))
-        .and(warp::header::optional::<String>("if-none-match"))
-        .and_then(
-            |tail: warp::path::Tail, accept_encoding: Option<String>, inm: Option<String>| async move {
-                serve(tail.as_str(), accept_encoding.as_deref(), inm.as_deref())
-                    .ok_or_else(warp::reject::not_found)
-            },
-        )
-        .boxed()
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// `GET /`
+pub async fn root(headers: &HeaderMap) -> Result<WebResponse, AppError> {
+    respond("", headers)
+}
+
+/// `/{*path}` 兜底。不包 `get()`：xitca 先按路径命中再判方法，
+/// 只挂 GET 会把 `POST /v1/typo` 收成 405。非 GET 一律当未匹配。
+pub async fn asset(
+    method: &Method,
+    Params(path): Params<String>,
+    headers: &HeaderMap,
+) -> Result<WebResponse, AppError> {
+    if *method != Method::GET {
+        return Err(AppError::NotFound {
+            path: format!("/{}", path.trim_start_matches('/')),
+        });
+    }
+    respond(&path, headers)
+}
+
+fn respond(path: &str, headers: &HeaderMap) -> Result<WebResponse, AppError> {
+    serve(
+        path,
+        header_str(headers, "accept-encoding"),
+        header_str(headers, "if-none-match"),
+    )
+    .ok_or_else(|| AppError::NotFound {
+        path: format!("/{}", path.trim_start_matches('/')),
+    })
 }
 
 /// 根据客户端 `Accept-Encoding` 协商选择最佳资源（优先 br，其次 gzip，最后未压缩）。
@@ -98,7 +124,7 @@ fn serve(
     path: &str,
     accept_encoding: Option<&str>,
     if_none_match: Option<&str>,
-) -> Option<warp::reply::Response> {
+) -> Option<WebResponse> {
     let trimmed = path.trim_start_matches('/');
 
     // API 前缀不走静态资源，也不走 fallback。裸前缀（`/api` 本身）同样
@@ -106,7 +132,7 @@ fn serve(
     // 会拿到 200 + HTML 而不是 404。
     if API_PREFIXES
         .iter()
-        .any(|p| trimmed.starts_with(p) || trimmed == p.trim_end_matches('/'))
+        .any(|prefix| trimmed.starts_with(prefix) || trimmed == prefix.trim_end_matches('/'))
     {
         return None;
     }
@@ -126,19 +152,20 @@ fn serve(
     let (orig_path, index, encoding) = select_asset("index.html", accept_encoding)?;
     Some(render(orig_path, index, encoding, if_none_match))
 }
+
 /// 渲染一个资源为 HTTP 响应。
 fn render(
     path: &str,
     file: rust_embed::EmbeddedFile,
     encoding: ContentEncoding,
     if_none_match: Option<&str>,
-) -> warp::reply::Response {
+) -> WebResponse {
     let etag = format!("\"{}\"", hex_digest(&file.metadata.sha256_hash()));
 
-    if if_none_match.is_some_and(|v| v == etag) {
+    if if_none_match.is_some_and(|value| value == etag) {
         // 命中缓存：回 304，不发 body。对日志页这种频繁刷新的场景省下整个 bundle。
-        let mut response =
-            warp::reply::with_status(warp::reply(), StatusCode::NOT_MODIFIED).into_response();
+        let mut response = WebResponse::new(ResponseBody::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
         if let Ok(value) = HeaderValue::from_str(&etag) {
             response.headers_mut().insert(ETAG, value);
         }
@@ -157,7 +184,7 @@ fn render(
         std::borrow::Cow::Owned(vec) => bytes::Bytes::from(vec),
     };
     let mime = mime_guess::from_path(path).first_or_octet_stream();
-    let mut response = warp::reply::Response::new(body.into());
+    let mut response = WebResponse::new(ResponseBody::bytes(body));
 
     let headers = response.headers_mut();
     if let Ok(value) = HeaderValue::from_str(mime.as_ref()) {

@@ -273,7 +273,7 @@ refract-protocol  IR + 四协议 codec + 流式转码器。依赖 core。纯函�
 refract-store     SQLite 持久化 + 具体仓储类型（ChannelRepo 等）。依赖 core。
 refract-upstream  HTTP 客户端、地址解析、凭据注入、SSE 解析。依赖 core+protocol。
 refract-router    候选收集、排序、加权随机、重试、熔断、健康度、执行器。依赖 core+protocol+store+upstream。
-refract-api       warp filter：网关端点 + 管理 REST。依赖全部。
+refract-api       xitca-web：网关端点 + 管理 REST。依赖全部。
 refract-server    二进制：配置加载、装配、嵌入前端、优雅关闭。
 ```
 
@@ -339,5 +339,5 @@ packages/contracts
 | router   | 表驱动测试，覆盖 native_first 开关、优先级分层、加权随机（固定 seed）         |
 | store    | 内存 SQLite，仓储 CRUD + 迁移                                                 |
 | upstream | `wiremock` 假上游，覆盖地址解析矩阵、SSE 解析、超时重试                       |
-| api      | warp `test::request()`，端到端 filter 测试                                    |
+| api      | 进程内 `TestRequest`，端到端 handler 测试                                      |
 | 前端     | Vite+ check/build、Vitest、真实 Rust 服务上的 Playwright E2E + 多视口视觉验收 |

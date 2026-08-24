@@ -8,95 +8,96 @@
 //! 鉴权：支持 `Authorization: Bearer` 头、`?key=` 查询参数，以及浏览器
 //! Realtime 客户端使用的 `openai-insecure-api-key.*` WebSocket 子协议。
 
+use std::mem;
+
 use futures_util::{SinkExt, StreamExt};
+use http_ws::{CloseReason, Message, ws};
 use refract_core::{GatewayError, Protocol};
 use tokio_tungstenite::tungstenite;
-use warp::{Filter, Rejection, Reply, filters::BoxedFilter};
+use xitca_web::WebContext;
+use xitca_web::body::{ResponseBody, StreamDataBody};
+use xitca_web::error::Error as WebError;
+use xitca_web::http::{HeaderValue, WebResponse};
 
-use crate::auth::{Principal, authenticate};
-use crate::error::ProtocolRejection;
-use crate::state::{AppState, with_state};
+use crate::auth::{Principal, require_gateway};
+use crate::error::{AppError, ProtocolRejection};
+use crate::state::AppState;
 
-/// `GET /v1/realtime` 路由。
-pub fn routes(state: AppState) -> BoxedFilter<(warp::reply::Response,)> {
-    warp::path!("v1" / "realtime")
-        .and(warp::query::<RealtimeQuery>())
-        .and(authenticate(state.authenticator(), Protocol::Chat))
-        .and(warp::header::optional::<String>("sec-websocket-protocol"))
-        .and(warp::ws())
-        .and(with_state(state))
-        .and_then(
-            |query: RealtimeQuery,
-             principal: Principal,
-             protocols: Option<String>,
-             ws: warp::ws::Ws,
-             state: AppState| async move {
-                let request_id = uuid::Uuid::new_v4().to_string();
-                // 升级前完成路由决策：模型不可路由时给出正常的 HTTP 错误，
-                // 而不是让客户端拿到一个立刻断开的 101。
-                let model = query.model.clone().ok_or_else(|| {
-                    ProtocolRejection::reject_with_id(
-                        GatewayError::invalid_request("query parameter `model` is required"),
-                        Protocol::Chat,
-                        request_id.clone(),
-                    )
-                })?;
-                if !principal.allows_model(&model) {
-                    return Err(ProtocolRejection::reject_with_id(
-                        GatewayError::new(
-                            refract_core::ErrorKind::PermissionDenied,
-                            format!("this API key is not allowed to use model `{model}`"),
-                        ),
-                        Protocol::Chat,
-                        request_id,
-                    ));
-                }
-                crate::gateway::enforce_rate_limit(
-                    &state,
-                    &principal,
-                    Protocol::Chat,
-                    &request_id,
-                )?;
-                let concurrency_permit =
-                    crate::gateway::enforce_global_limits(&state, Protocol::Chat, &request_id)?;
-                let target = resolve_target(&state, &principal, &model)?;
-                let response_id = request_id.clone();
-                let upgrade = ws.on_upgrade(move |socket| {
-                    bridge(state, socket, target, model, request_id, concurrency_permit)
-                });
-                let mut response = upgrade.into_response();
-                response.headers_mut().insert(
-                    "x-refract-request-id",
-                    response_id.parse().expect("UUID is a valid header value"),
-                );
-                if protocols
-                    .as_deref()
-                    .is_some_and(|offered| offered.split(',').any(|item| item.trim() == "realtime"))
-                {
-                    response.headers_mut().insert(
-                        "sec-websocket-protocol",
-                        "realtime".parse().expect("static header value"),
-                    );
-                }
-                Ok::<_, Rejection>(response)
-            },
-        )
-        .boxed()
+/// `GET /v1/realtime`
+pub async fn realtime(mut ctx: WebContext<'_, AppState>) -> Result<WebResponse, WebError> {
+    let state = ctx.state().clone();
+    let query = ctx.req().uri().query().unwrap_or("");
+    let model = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, _)| name == "model")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty());
+    let protocols = ctx
+        .req()
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let headers = ctx.req().headers().clone();
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    let model = model.ok_or_else(|| {
+        AppError::Protocol(ProtocolRejection::with_id(
+            GatewayError::invalid_request("query parameter `model` is required"),
+            Protocol::Chat,
+            request_id.clone(),
+        ))
+    })?;
+    let principal =
+        require_gateway(&state, &headers, ctx.req().uri().query(), Protocol::Chat).await?;
+    if !principal.allows_model(&model) {
+        return Err(AppError::Protocol(ProtocolRejection::with_id(
+            GatewayError::new(
+                refract_core::ErrorKind::PermissionDenied,
+                format!("this API key is not allowed to use model `{model}`"),
+            ),
+            Protocol::Chat,
+            request_id,
+        ))
+        .into());
+    }
+    crate::gateway::enforce_rate_limit(&state, &principal, Protocol::Chat, &request_id)?;
+    let concurrency_permit =
+        crate::gateway::enforce_global_limits(&state, Protocol::Chat, &request_id)?;
+    let target = resolve_target(&state, &principal, &model)?;
+
+    let body = mem::take(ctx.body_get_mut());
+    let (decode, mut response, tx) =
+        ws(ctx.req(), StreamDataBody::new(body)).map_err(WebError::from_service)?;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-refract-request-id", value);
+    }
+    if protocols
+        .as_deref()
+        .is_some_and(|offered| offered.split(',').any(|item| item.trim() == "realtime"))
+    {
+        response.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static("realtime"),
+        );
+    }
+
+    tokio::task::spawn_local(bridge(
+        state,
+        decode,
+        tx,
+        target,
+        model,
+        request_id,
+        concurrency_permit,
+    ));
+
+    Ok(response.map(|body| ResponseBody::boxed(StreamDataBody::new(body))))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct RealtimeQuery {
-    model: Option<String>,
-}
-
-/// 一次桥接的目标参数。在升级前解析完毕，回调里不再需要路由知识。
 struct BridgeTarget {
-    /// 上游 WS 地址（含 `?model=` 上游名）。
     url: String,
-    /// 上游凭据。
     credential: String,
-    /// 渠道快照，记日志用。
-    channel_id: i64,
+    channel_id: refract_core::ChannelId,
     channel_name: String,
     api_key_id: Option<i64>,
     upstream_model: String,
@@ -108,7 +109,7 @@ fn resolve_target(
     state: &AppState,
     principal: &Principal,
     model: &str,
-) -> Result<BridgeTarget, Rejection> {
+) -> Result<BridgeTarget, AppError> {
     let channels = state.channels();
     let allowed: Vec<_> = channels
         .iter()
@@ -121,20 +122,22 @@ fn resolve_target(
             .plan(allowed.iter().copied(), model, Protocol::Chat, &mut rng)
     };
     // Realtime 只有 OpenAI 形状，转码无从谈起：只保留原生 chat 端点。
-    route.attempts.retain(|c| c.protocol() == Protocol::Chat);
+    route
+        .attempts
+        .retain(|candidate| candidate.protocol() == Protocol::Chat);
     let prioritized = state.executor().prioritize(&route);
     let Some(candidate) = prioritized.first().map(|&index| route.attempts[index]) else {
-        return Err(ProtocolRejection::reject(
+        return Err(AppError::Protocol(ProtocolRejection::new(
             GatewayError::not_found(format!(
                 "no chat-protocol channel provides model `{model}` for realtime"
             )),
             Protocol::Chat,
-        ));
+        )));
     };
 
     let upstream_model = candidate.upstream_model();
     let url = realtime_url(candidate.address(), upstream_model)
-        .map_err(|error| ProtocolRejection::reject(error, Protocol::Chat))?;
+        .map_err(|error| AppError::Protocol(ProtocolRejection::new(error, Protocol::Chat)))?;
 
     Ok(BridgeTarget {
         url,
@@ -215,29 +218,29 @@ fn realtime_url(
 }
 
 /// 双向桥接主体。任何一侧断开都会把关闭传导到另一侧。
-async fn bridge(
+async fn bridge<S>(
     state: AppState,
-    client: warp::ws::WebSocket,
+    mut client_rx: S,
+    mut client_tx: http_ws::ResponseSender,
     target: BridgeTarget,
     model: String,
     request_id: String,
     _concurrency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) {
+) where
+    S: StreamExt<Item = Result<Message, http_ws::WsError<xitca_web::error::BodyError>>> + Unpin,
+{
     let started = std::time::Instant::now();
 
     let upstream = connect_upstream(&target).await;
-    let (mut client_tx, mut client_rx) = client.split();
-
     let mut upstream = match upstream {
         Ok(socket) => socket,
         Err(error) => {
             tracing::warn!(%error, channel = %target.channel_name, "realtime upstream connect failed");
-            // 已经 101 了，只能用 close frame 告知失败原因。
             let _ = client_tx
-                .send(warp::ws::Message::close_with(
-                    1011_u16,
-                    format!("upstream connect failed: {error}"),
-                ))
+                .close(Some(CloseReason {
+                    code: http_ws::CloseCode::Error,
+                    description: Some(format!("upstream connect failed: {error}")),
+                }))
                 .await;
             log_session(&state, &target, &request_id, &model, started, 502).await;
             return;
@@ -248,13 +251,13 @@ async fn bridge(
     loop {
         tokio::select! {
             inbound = client_rx.next() => match inbound {
+                Some(Ok(Message::Close(_))) => {
+                    client_closed_clean = true;
+                    let _ = upstream.send(tungstenite::Message::Close(None)).await;
+                    break;
+                }
                 Some(Ok(message)) => {
-                    if message.is_close() {
-                        client_closed_clean = true;
-                        let _ = upstream.send(tungstenite::Message::Close(None)).await;
-                        break;
-                    }
-                    let Some(converted) = to_tungstenite(message) else { continue };
+                    let Some(converted) = to_upstream(message) else { continue };
                     if upstream.send(converted).await.is_err() {
                         break;
                     }
@@ -266,43 +269,40 @@ async fn bridge(
             },
             outbound = upstream.next() => match outbound {
                 Some(Ok(tungstenite::Message::Close(frame))) => {
-                    let code = frame.as_ref().map_or(1000, |f| u16::from(f.code));
-                    // 只有正常结束类关闭（1000/1001）算干净收尾；上游用
-                    // 1011 之类的异常码断开时，会话日志里必须留痕，
-                    // 不能记成 200 成功。
+                    let code = frame.as_ref().map_or(1000, |item| u16::from(item.code));
                     client_closed_clean = matches!(code, 1000 | 1001);
                     if !client_closed_clean {
                         tracing::debug!(
                             code,
-                            reason = %frame.as_ref().map_or("", |f| f.reason.as_str()),
+                            reason = %frame.as_ref().map_or("", |item| item.reason.as_str()),
                             "realtime upstream closed session abnormally"
                         );
                     }
-                    let message = match frame {
-                        Some(frame) => warp::ws::Message::close_with(
-                            u16::from(frame.code),
-                            frame.reason.to_string(),
-                        ),
-                        None => warp::ws::Message::close(),
-                    };
-                    let _ = client_tx.send(message).await;
+                    let reason = frame.map(|item| CloseReason {
+                        code: close_code(u16::from(item.code)),
+                        description: Some(item.reason.to_string()),
+                    });
+                    let _ = client_tx.close(reason).await;
                     break;
                 }
                 Some(Ok(message)) => {
-                    let Some(converted) = to_warp(message) else { continue };
-                    if client_tx.send(converted).await.is_err() {
+                    let Some(converted) = to_client(message) else { continue };
+                    if send_client(&client_tx, converted).await.is_err() {
                         break;
                     }
                 }
                 Some(Err(error)) => {
                     tracing::debug!(%error, "realtime upstream stream error");
                     let _ = client_tx
-                        .send(warp::ws::Message::close_with(1011_u16, "upstream error"))
+                        .close(Some(CloseReason {
+                            code: http_ws::CloseCode::Error,
+                            description: Some("upstream error".into()),
+                        }))
                         .await;
                     break;
                 }
                 None => {
-                    let _ = client_tx.send(warp::ws::Message::close()).await;
+                    let _ = client_tx.close(None::<CloseReason>).await;
                     break;
                 }
             },
@@ -320,9 +320,9 @@ async fn connect_upstream(target: &BridgeTarget) -> Result<UpstreamSocket, Strin
     use tungstenite::client::IntoClientRequest;
     let mut request = target
         .url
-        .as_str()
+        .clone()
         .into_client_request()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     let headers = request.headers_mut();
     headers.insert(
         "authorization",
@@ -340,36 +340,57 @@ async fn connect_upstream(target: &BridgeTarget) -> Result<UpstreamSocket, Strin
 
     let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     Ok(socket)
 }
 
-/// warp 帧 → tungstenite 帧。返回 `None` 的帧类型无需转发。
-fn to_tungstenite(message: warp::ws::Message) -> Option<tungstenite::Message> {
-    if message.is_text() {
-        let text = message.to_str().ok()?.to_owned();
-        Some(tungstenite::Message::text(text))
-    } else if message.is_binary() {
-        Some(tungstenite::Message::binary(message.into_bytes()))
-    } else if message.is_ping() {
-        Some(tungstenite::Message::Ping(message.into_bytes()))
-    } else if message.is_pong() {
-        Some(tungstenite::Message::Pong(message.into_bytes()))
-    } else {
-        None
+/// 客户端帧 → tungstenite 帧。
+fn to_upstream(message: Message) -> Option<tungstenite::Message> {
+    match message {
+        Message::Text(text) => Some(tungstenite::Message::text(
+            String::from_utf8_lossy(&text).into_owned(),
+        )),
+        Message::Binary(data) => Some(tungstenite::Message::binary(data.to_vec())),
+        Message::Ping(data) => Some(tungstenite::Message::Ping(data.to_vec().into())),
+        Message::Pong(data) => Some(tungstenite::Message::Pong(data.to_vec().into())),
+        Message::Close(_) | Message::Continuation(_) | Message::Nop => None,
     }
 }
 
-/// tungstenite 帧 → warp 帧。
-fn to_warp(message: tungstenite::Message) -> Option<warp::ws::Message> {
+/// tungstenite 帧 → 客户端帧。
+fn to_client(message: tungstenite::Message) -> Option<Message> {
     match message {
-        tungstenite::Message::Text(text) => Some(warp::ws::Message::text(text.as_str())),
-        tungstenite::Message::Binary(data) => Some(warp::ws::Message::binary(data.to_vec())),
-        tungstenite::Message::Ping(data) => Some(warp::ws::Message::ping(data.to_vec())),
-        tungstenite::Message::Pong(data) => Some(warp::ws::Message::pong(data.to_vec())),
-        // Close 在主循环里单独处理；Frame 是底层变体，connect_async 不会给。
+        tungstenite::Message::Text(text) => Some(Message::Text(text.as_bytes().to_vec().into())),
+        tungstenite::Message::Binary(data) => Some(Message::Binary(data)),
+        tungstenite::Message::Ping(data) => Some(Message::Ping(data)),
+        tungstenite::Message::Pong(data) => Some(Message::Pong(data)),
         tungstenite::Message::Close(_) | tungstenite::Message::Frame(_) => None,
     }
+}
+
+async fn send_client(
+    tx: &http_ws::ResponseSender,
+    message: Message,
+) -> Result<(), http_ws::ProtocolError> {
+    match message {
+        Message::Text(text) => tx.text(text).await,
+        Message::Binary(data) => tx.binary(data).await,
+        Message::Ping(data) => tx.ping(data).await,
+        Message::Pong(data) => tx.pong(data).await,
+        Message::Close(reason) => {
+            let mut tx = tx
+                .downgrade()
+                .upgrade()
+                .ok_or(http_ws::ProtocolError::SendClosed)?;
+            tx.close(reason).await
+        }
+        Message::Continuation(item) => tx.continuation(item).await,
+        Message::Nop => Ok(()),
+    }
+}
+
+fn close_code(code: u16) -> http_ws::CloseCode {
+    http_ws::CloseCode::from(code)
 }
 
 /// 把一次 Realtime 会话记进请求日志。token 计量不解析（usage 藏在事件流
@@ -418,10 +439,12 @@ async fn log_session(
 
 #[cfg(test)]
 mod tests {
+    use futures_util::{SinkExt, StreamExt};
     use refract_core::{
         Channel, ChannelEndpoint, ChannelKind, Credential, ModelEntry, UpstreamAddress,
     };
     use refract_store::Database;
+    use tokio_tungstenite::tungstenite;
 
     use super::*;
 
@@ -501,24 +524,44 @@ mod tests {
         state
     }
 
+    async fn serve_app(state: AppState) -> (std::net::SocketAddr, impl FnOnce()) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_listener = listener.into_std().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let (handle, wait) = crate::start_server(state, std_listener).expect("listen");
+        let join = std::thread::spawn(move || {
+            let _ = wait();
+        });
+        let stop = move || {
+            handle.stop(true);
+            let _ = join.join();
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, stop)
+    }
+
     #[tokio::test]
     async fn realtime_bridges_text_frames_both_ways() {
         let upstream = spawn_ws_echo_upstream().await;
         let state = state_with_channel(&upstream).await;
+        let (addr, stop) = serve_app(state.clone()).await;
 
-        let mut client = warp::test::ws()
-            .path("/v1/realtime?model=gpt-realtime")
-            .handshake(routes(state.clone()))
+        let url = format!("ws://{addr}/v1/realtime?model=gpt-realtime");
+        let (mut client, _) = tokio_tungstenite::connect_async(url)
             .await
             .expect("websocket handshake succeeds");
 
         client
-            .send(warp::ws::Message::text(r#"{"type":"session.update"}"#))
-            .await;
-        let reply = client.recv().await.expect("bridged reply");
-        assert_eq!(reply.to_str().unwrap(), r#"echo:{"type":"session.update"}"#);
+            .send(tungstenite::Message::text(r#"{"type":"session.update"}"#))
+            .await
+            .unwrap();
+        let reply = client.next().await.expect("bridged reply").unwrap();
+        assert_eq!(
+            reply.to_text().unwrap(),
+            r#"echo:{"type":"session.update"}"#
+        );
 
-        // 主动关闭后会话被记入日志。
         drop(client);
         let mut logged = false;
         for _ in 0..100 {
@@ -535,16 +578,17 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        stop();
         assert!(logged, "realtime session should be logged");
     }
 
     #[tokio::test]
     async fn realtime_requires_a_routable_model() {
         let state = state_with_channel("http://127.0.0.1:1").await;
-        let result = warp::test::ws()
-            .path("/v1/realtime?model=ghost")
-            .handshake(routes(state))
-            .await;
+        let (addr, stop) = serve_app(state).await;
+        let url = format!("ws://{addr}/v1/realtime?model=ghost");
+        let result = tokio_tungstenite::connect_async(url).await;
+        stop();
         assert!(result.is_err(), "unknown model must fail before upgrade");
     }
 

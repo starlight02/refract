@@ -99,6 +99,6 @@ Vapor 已并入 Vue core 的 vapor 分支；旧 [`vuejs/core-vapor`](https://git
 
 ## 6. 已落地版本与工程边界
 
-后端工作区使用 Rust 2024 edition、最低 Rust `1.94`，HTTP 服务为 `warp 0.4.3`，异步运行时 `tokio 1.53`，上游客户端 `reqwest 0.13`，存储为 `sqlx 0.9` + SQLite。前端使用 Vue 3.6 RC Vapor、Vite+ `0.2.8`、Vite 8、Tailwind 4、Reka UI 2 和 Liquid Glass Vue 1。
+后端工作区使用 Rust 2024 edition、最低 Rust `1.98`，HTTP 服务为 `xitca-web 0.8.2`，异步运行时 `tokio 1.53`，上游客户端 `reqwest 0.13`，存储为 `sqlx 0.9` + SQLite。前端使用 Vue 3.6 RC Vapor、Vite+ `0.2.8`、Vite 8、Tailwind 4、Reka UI 2 和 Liquid Glass Vue 1。
 
 依赖版本以锁文件为可复现事实；“最新”指实施时从官方 registry 解析到的当前版本，而不是无锁的浮动依赖。发布升级必须重新跑后端全工作区测试、Vite+ 检查/测试/构建以及浏览器视觉验收。
