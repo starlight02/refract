@@ -41,7 +41,7 @@ import type {
   UpstreamAddress,
 } from '@refract/contracts'
 import { encryptPayload } from './crypto'
-import { tryParseJson } from '@/utils/async'
+import { readErrorEnvelope } from '@/utils/error'
 
 /** 后端返回的错误信封。 */
 export interface ErrorEnvelope {
@@ -84,8 +84,8 @@ export class ApiError extends Error {
 export const AUTH_REQUIRED_EVENT = 'refract:auth-required'
 
 /**
- * 后端不可达 / 恢复时派发的事件名（dev 下 cargo 编译窗口、生产下服务重启）。
- * App.vue 据此显示 / 隐藏「后端启动中」横幅并重试。
+ * 后端真的连不上时派发（dev 代理 503、或 fetch 网络失败）。
+ * HTTP 业务错误（无渠道、上游 5xx 等）不走这里，直接把信封抛给调用方。
  */
 export const BACKEND_DOWN_EVENT = 'refract:backend-down'
 export const BACKEND_RESTORED_EVENT = 'refract:backend-restored'
@@ -117,9 +117,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     finalBody = await encryptPayload(body)
   }
 
-  // 后端不可达（dev 的 cargo 编译窗口、生产的服务重启）时，GET 自动重试
-  // 到后端恢复为止 —— 打开着的页面不需要手动刷新。只重试 GET：这类失败
-  // 意味着请求从未送达（连接被拒），但写操作仍交给用户显式重试更稳妥。
+  // 只有「请求没送到」才重试 GET：dev 编译窗口、进程重启、断网。
+  // 已经拿到 HTTP 响应的业务错误（无渠道、上游失败）必须立刻抛给 UI。
   const retriable = method === 'GET'
   for (let attempt = 0; ; attempt += 1) {
     let response: Response
@@ -131,30 +130,30 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
         body: finalBody === undefined ? undefined : JSON.stringify(finalBody),
       })
     } catch (e) {
-      // fetch 本身抛错 = 连 vite/网关都没够到。与 503 同等对待。
-      window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
-      if (retriable && attempt < UNAVAILABLE_RETRY_MAX) {
-        await sleep(UNAVAILABLE_RETRY_MS)
-        continue
+      if (e instanceof DOMException && e.name === 'AbortError') throw e
+      if (e instanceof TypeError) {
+        window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
+        if (retriable && attempt < UNAVAILABLE_RETRY_MAX) {
+          await sleep(UNAVAILABLE_RETRY_MS)
+          continue
+        }
       }
-      throw new ApiError(0, 'backend_unavailable', '后端不可达，请稍后重试', String(e))
+      const message = e instanceof Error && e.message ? e.message : '网络请求失败'
+      throw new ApiError(0, 'network_error', message, String(e))
     }
 
     if (!response.ok) {
-      // 管理 API 的 401/403 值得一个全局恢复入口，而不只是让当前页面报错。
-      // 先派发再抛异常：监听者（App.vue）打开令牌弹窗，调用方照常拿到错误。
       if (response.status === 401 || response.status === 403) {
         window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
       }
 
-      // 后端总是回 ErrorEnvelope，但网络层故障（502 网关页、连接重置）
-      // 可能给出 HTML。解析失败时退回状态码文本，不能让 UI 崩在这里。
-      const envelope: ErrorEnvelope = tryParseJson<ErrorEnvelope>(await response.text()) ?? {
-        code: 'network_error',
-        message: `${response.status} ${response.statusText}`,
-      }
+      const envelope = readErrorEnvelope(
+        await response.text(),
+        response.status,
+        response.statusText,
+      )
 
-      // dev 代理在后端编译期间回结构化 503（见 vite.config.ts）。
+      // 仅 dev 代理的结构化 503 表示「进程不在」。生产 503（无可用渠道等）是业务错误。
       if (response.status === 503 && envelope.code === 'backend_unavailable') {
         window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
         if (retriable && attempt < UNAVAILABLE_RETRY_MAX) {
@@ -163,12 +162,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
         }
       }
 
-      throw new ApiError(
-        response.status,
-        envelope.code ?? 'unknown',
-        envelope.message ?? 'request failed',
-        envelope.detail,
-      )
+      throw new ApiError(response.status, envelope.code, envelope.message, envelope.detail)
     }
     window.dispatchEvent(new CustomEvent(BACKEND_RESTORED_EVENT))
 
@@ -199,17 +193,20 @@ export async function download(path: string, fallbackName: string): Promise<void
   try {
     response = await fetch(path, { headers, credentials: 'same-origin' })
   } catch (e) {
-    window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
-    throw new ApiError(0, 'backend_unavailable', '后端不可达，请稍后重试', String(e))
+    if (e instanceof DOMException && e.name === 'AbortError') throw e
+    if (e instanceof TypeError) {
+      window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
+    }
+    const message = e instanceof Error && e.message ? e.message : '网络请求失败'
+    throw new ApiError(0, 'network_error', message, String(e))
   }
 
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
       window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
     }
-    const body = tryParseJson<ErrorEnvelope>(await response.text())
-    const message = body?.message ?? `${response.status} ${response.statusText}`
-    throw new ApiError(response.status, 'download_failed', message)
+    const envelope = readErrorEnvelope(await response.text(), response.status, response.statusText)
+    throw new ApiError(response.status, envelope.code, envelope.message, envelope.detail)
   }
 
   const disposition = response.headers.get('content-disposition') ?? ''

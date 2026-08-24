@@ -90,12 +90,8 @@ onMounted(() => window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired))
 onBeforeUnmount(() => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired))
 
 /**
- * 后端不可达横幅。
- *
- * dev 下 cargo watch 重编译（几秒到几分钟）、生产下服务重启，期间所有
- * API 都会失败。客户端层已经对 GET 静默重试；这里补上体感 —— 显示一条
- * 「后端启动中」横幅并轮询 `/health/live`，恢复后自动消失，用户不需要
- * 猜「是我配置错了还是它还没起来」。
+ * 后端连不上时的横幅。只在 fetch 网络失败或 dev 代理 503 时出现，
+ * 业务 4xx/5xx 走页面自己的错误文案，不再谎称「正在编译」。
  */
 const backendDown = ref(false)
 let healthTimer: ReturnType<typeof setInterval> | null = null
@@ -171,7 +167,7 @@ const version = __APP_VERSION__
         role="status"
       >
         <AppIcon name="spinner" class="animate-spin text-warning shrink-0" :size="15" />
-        <span>后端启动中（编译或重启），就绪后自动恢复</span>
+        <span>无法连接后端，正在重试…</span>
       </div>
     </Transition>
     <header
