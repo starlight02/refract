@@ -74,7 +74,7 @@ For a personal gateway this is the right trade — hard mid-stream cutoffs would
 
 Each gateway key can additionally carry per-minute limits: requests per minute and tokens per minute (0 = unlimited). Windows are fixed calendar minutes kept in gateway memory — a restart clears them, which is acceptable because limits are protective, not billing. TPM is "post-paid, pre-checked": token usage is booked after a request completes, and a new request is rejected once the current window is already at or over the cap, so one large request may overshoot before the next one is blocked. Rejections return 429 with a `Retry-After` header pointing at the next window.
 
-Independent of key limits, **Settings → 全局限制** carries gateway-wide fuses that apply to *all* traffic, including unauthenticated local mode where per-key limits provide no protection at all (0 = unlimited for every field):
+Independent of key limits, **Settings → 全局限制** carries gateway-wide fuses that apply to _all_ traffic, including unauthenticated local mode where per-key limits provide no protection at all (0 = unlimited for every field):
 
 - **全局 RPM** — requests per minute across the whole gateway.
 - **全局 TPM** — tokens per minute across the whole gateway. RPM alone cannot stop "few requests × huge context": a runaway agent resending a 200k-token context stays within RPM 60 while burning 12M input tokens a minute. Global TPM is the only fuse that catches that, and unlike per-key TPM it books usage even when no gateway key is in play.
@@ -193,6 +193,7 @@ git push origin main --tags
 ```
 
 The `.github/workflows/release.yml` pipeline will:
+
 1. Install the root pnpm workspace and build the embedded admin plus standalone homepage once;
 2. Compile native release binaries for Linux (x64/arm64 musl), macOS (Intel/Apple Silicon), and Windows with the admin embedded;
 3. Publish the binary archives, a standalone homepage tarball, and auto-generated release notes;

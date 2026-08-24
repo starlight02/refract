@@ -22,7 +22,7 @@ ChannelKind = Chat | Responses | Messages | Gemini | Aggregate
 
 前四种是 **单协议渠道**，`Aggregate` 是 **聚合渠道**：一个渠道内挂载 1~4 个协议端点，每个端点有独立的 URL / key / 模型集 / 协议转换策略，并按显式优先级排序。
 
-这个模型能表达 new-api 表达不了的东西：*"我的中转站同时提供 OpenAI 和 Anthropic 两种协议，且 Anthropic 那条线走另一个域名和另一把 key，claude 系模型应该优先走原生 Anthropic 端点。"*
+这个模型能表达 new-api 表达不了的东西：_"我的中转站同时提供 OpenAI 和 Anthropic 两种协议，且 Anthropic 那条线走另一个域名和另一把 key，claude 系模型应该优先走原生 Anthropic 端点。"_
 
 ## 2. 领域模型
 
@@ -33,6 +33,7 @@ enum Protocol { Chat, Responses, Messages, Gemini }
 ```
 
 四个值同时扮演三种角色：
+
 1. **入口协议** — 客户端打进来用的协议（由 HTTP 路径决定）。
 2. **渠道原生协议** — 上游端点真正说的协议。
 3. **转换目标** — 协议转换开关里勾选的协议。
@@ -53,11 +54,11 @@ struct UpstreamAddress {
 
 解析规则（`resolve(protocol) -> Url`）：
 
-| unofficial | full_address | 行为 |
-|---|---|---|
-| false | — | 用协议默认官方地址：base + 协议默认 prefix + 协议默认 path |
-| true | false | `base_url + version_prefix + path`，三段任一为空则回落到协议默认值；拼接后**校验**路径与协议匹配 |
-| true | true | 直接用 `base_url` 原样作为完整 URL，**不拼接、不校验** |
+| unofficial | full_address | 行为                                                                                             |
+| ---------- | ------------ | ------------------------------------------------------------------------------------------------ |
+| false      | —            | 用协议默认官方地址：base + 协议默认 prefix + 协议默认 path                                       |
+| true       | false        | `base_url + version_prefix + path`，三段任一为空则回落到协议默认值；拼接后**校验**路径与协议匹配 |
+| true       | true         | 直接用 `base_url` 原样作为完整 URL，**不拼接、不校验**                                           |
 
 `full_address = true` 时仍会替换显式的 `{model}` 与 `{action}` 占位符；未写占位符的地址完全由用户负责，网关不会猜测或改写路径。
 
@@ -71,6 +72,7 @@ struct TranscodePolicy {
 ```
 
 判定 `can_serve(inbound, native)`：
+
 - `inbound == native` → 永远允许（原生直通）
 - `!enabled` → 拒绝
 - `enabled && accepted.contains(inbound)` → 允许（需要转换）
@@ -227,6 +229,7 @@ enum StreamEvent {
 ```
 
 各协议的编码器是**状态机**，因为：
+
 - Anthropic 要求严格的 `message_start → content_block_start → deltas → content_block_stop → message_delta → message_stop` 序列，且 `content_block` 有 index。
 - Responses API 要求 `response.created → response.output_item.added → response.content_part.added → deltas → ... → response.completed`，且每个事件带递增 `sequence_number`。
 - OpenAI Chat 的 tool_calls delta 用 `index` 累积，首帧带 `id`/`name`，后续只带 `arguments` 片段。
@@ -330,11 +333,11 @@ packages/contracts
 
 ## 8. 测试策略
 
-| 层 | 方式 |
-|---|---|
-| protocol | 纯单元测试 + `insta` 快照，四协议两两互转的黄金样例 |
-| router | 表驱动测试，覆盖 native_first 开关、优先级分层、加权随机（固定 seed） |
-| store | 内存 SQLite，仓储 CRUD + 迁移 |
-| upstream | `wiremock` 假上游，覆盖地址解析矩阵、SSE 解析、超时重试 |
-| api | warp `test::request()`，端到端 filter 测试 |
-| 前端 | Vite+ check/build、Vitest、真实 Rust 服务上的 Playwright E2E + 多视口视觉验收 |
+| 层       | 方式                                                                          |
+| -------- | ----------------------------------------------------------------------------- |
+| protocol | 纯单元测试 + `insta` 快照，四协议两两互转的黄金样例                           |
+| router   | 表驱动测试，覆盖 native_first 开关、优先级分层、加权随机（固定 seed）         |
+| store    | 内存 SQLite，仓储 CRUD + 迁移                                                 |
+| upstream | `wiremock` 假上游，覆盖地址解析矩阵、SSE 解析、超时重试                       |
+| api      | warp `test::request()`，端到端 filter 测试                                    |
+| 前端     | Vite+ check/build、Vitest、真实 Rust 服务上的 Playwright E2E + 多视口视觉验收 |
