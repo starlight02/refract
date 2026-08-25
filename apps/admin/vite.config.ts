@@ -189,6 +189,9 @@ export default defineConfig({
           groups: [
             { name: 'vue', test: /node_modules[\\/](?:@?vue|vue-router|pinia)/ },
             { name: 'reka', test: /node_modules[\\/]reka-ui/ },
+            // Effect 运行时几乎不随业务改动。单独拆开，避免和 client/useAction
+            // 打成一块后每次改 API 封装都让用户重下整份 fiber 调度器。
+            { name: 'effect', test: /node_modules[\\/]effect/ },
           ],
         },
       },

@@ -40,6 +40,18 @@ import type {
   StatsSummary,
   UpstreamAddress,
 } from '@refract/contracts'
+import { TaggedError } from 'effect/Data'
+import {
+  type Effect,
+  catchTag,
+  fail,
+  gen,
+  promise,
+  retry,
+  runPromise,
+  tryPromise,
+} from 'effect/Effect'
+import { spaced } from 'effect/Schedule'
 import { encryptPayload } from './crypto'
 import { readErrorEnvelope } from '@/utils/error'
 
@@ -50,18 +62,20 @@ export interface ErrorEnvelope {
   detail?: string
 }
 
-/** API 调用失败。 */
-export class ApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-    readonly detail?: string,
-  ) {
-    super(message)
-    this.name = 'ApiError'
-  }
-
+/**
+ * API 调用失败。
+ *
+ * 用 `TaggedError` 而不是裸 `Error` 子类：带上 `_tag` 才能被 `catchTag`
+ * 精确捕获，让「哪种失败该重试」由类型系统而不是注释来保证。它仍然是真正的
+ * `Error`（`instanceof Error` 成立、带 stack），所以既有的 `instanceof ApiError`
+ * 判断和 devtools 体验都不变。
+ */
+export class ApiError extends TaggedError('ApiError')<{
+  readonly status: number
+  readonly code: string
+  readonly message: string
+  readonly detail?: string | undefined
+}> {
   /** 是否是「没找到」—— UI 常需要把它和真实故障区别对待。 */
   get isNotFound(): boolean {
     return this.status === 404
@@ -72,6 +86,18 @@ export class ApiError extends Error {
     return this.status === 401 || this.status === 403
   }
 }
+
+/**
+ * 「请求根本没送到」—— 全局唯一允许重试的失败。
+ *
+ * 为什么单独立一个标签，而不是在 ApiError 上加个布尔字段：重试策略靠标签判定，
+ * 编译器于是能保证业务错误（无可用渠道、上游 5xx）永远不可能被误重试 ——
+ * 这正是原先那个手写循环靠注释约束、却随时可能被改坏的地方。
+ * 重试耗尽后由 `catchTag` 换回里面那个要给 UI 看的 ApiError。
+ */
+class BackendUnavailable extends TaggedError('BackendUnavailable')<{
+  readonly api: ApiError
+}> {}
 
 /**
  * 管理 API 返回 401/403 时派发的事件名。
@@ -93,8 +119,8 @@ export const BACKEND_RESTORED_EVENT = 'refract:backend-restored'
 const UNAVAILABLE_RETRY_MS = 1_500
 const UNAVAILABLE_RETRY_MAX = 40
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function announce(event: string): void {
+  window.dispatchEvent(new CustomEvent(event))
 }
 
 /**
@@ -107,74 +133,98 @@ interface Envelope<T> {
   data: T
 }
 
+/** fetch 自身失败（请求没送出去）时的归一化。 */
+function fetchFailure(error: unknown): ApiError | BackendUnavailable | DOMException {
+  // 中断不是失败：原样抛回，调用方既有的 AbortError 判断继续生效。
+  if (error instanceof DOMException && error.name === 'AbortError') return error
+  const message = error instanceof Error && error.message ? error.message : '网络请求失败'
+  const api = new ApiError({
+    status: 0,
+    code: 'network_error',
+    message,
+    detail: String(error),
+  })
+  // TypeError 是浏览器对「连不上」的唯一信号。
+  if (error instanceof TypeError) {
+    announce(BACKEND_DOWN_EVENT)
+    return new BackendUnavailable({ api })
+  }
+  return api
+}
+
+/** 非 2xx 响应 → 带标签的失败。 */
+function httpFailure(response: Response): Effect<never, ApiError | BackendUnavailable> {
+  return gen(function* () {
+    if (response.status === 401 || response.status === 403) announce(AUTH_REQUIRED_EVENT)
+
+    const envelope = readErrorEnvelope(
+      yield* promise(() => response.text()),
+      response.status,
+      response.statusText,
+    )
+    const api = new ApiError({
+      status: response.status,
+      code: envelope.code,
+      message: envelope.message,
+      detail: envelope.detail,
+    })
+
+    // 仅 dev 代理的结构化 503 表示「进程不在」。生产 503（无可用渠道等）是业务错误。
+    if (response.status === 503 && envelope.code === 'backend_unavailable') {
+      announce(BACKEND_DOWN_EVENT)
+      return yield* fail(new BackendUnavailable({ api }))
+    }
+    return yield* fail(api)
+  })
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {}
   if (body !== undefined) headers['content-type'] = 'application/json'
 
-  // 端到端传输加密：对所有向后端发送的写操作 Payload 自动走 Web Crypto 信封加密
-  let finalBody = body
-  if (body !== undefined && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
-    finalBody = await encryptPayload(body)
-  }
+  // 端到端传输加密：所有写操作的 Payload 自动走 Web Crypto 信封加密。
+  // 放在重试之外 —— 密文和请求体一一对应，重算只是白烧 CPU。
+  const payload =
+    body !== undefined && (method === 'POST' || method === 'PUT' || method === 'PATCH')
+      ? await encryptPayload(body)
+      : body
+  const serialized = payload === undefined ? undefined : JSON.stringify(payload)
 
-  // 只有「请求没送到」才重试 GET：dev 编译窗口、进程重启、断网。
-  // 已经拿到 HTTP 响应的业务错误（无渠道、上游失败）必须立刻抛给 UI。
-  const retriable = method === 'GET'
-  for (let attempt = 0; ; attempt += 1) {
-    let response: Response
-    try {
-      response = await fetch(path, {
-        method,
-        headers,
-        credentials: 'same-origin',
-        body: finalBody === undefined ? undefined : JSON.stringify(finalBody),
-      })
-    } catch (e) {
-      if (e instanceof DOMException && e.name === 'AbortError') throw e
-      if (e instanceof TypeError) {
-        window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
-        if (retriable && attempt < UNAVAILABLE_RETRY_MAX) {
-          await sleep(UNAVAILABLE_RETRY_MS)
-          continue
-        }
-      }
-      const message = e instanceof Error && e.message ? e.message : '网络请求失败'
-      throw new ApiError(0, 'network_error', message, String(e))
-    }
+  const exchange = gen(function* () {
+    const response = yield* tryPromise({
+      try: (signal) =>
+        fetch(path, { method, headers, credentials: 'same-origin', body: serialized, signal }),
+      catch: fetchFailure,
+    })
 
-    if (!response.ok) {
-      if (response.status === 401 || response.status === 403) {
-        window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
-      }
-
-      const envelope = readErrorEnvelope(
-        await response.text(),
-        response.status,
-        response.statusText,
-      )
-
-      // 仅 dev 代理的结构化 503 表示「进程不在」。生产 503（无可用渠道等）是业务错误。
-      if (response.status === 503 && envelope.code === 'backend_unavailable') {
-        window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
-        if (retriable && attempt < UNAVAILABLE_RETRY_MAX) {
-          await sleep(UNAVAILABLE_RETRY_MS)
-          continue
-        }
-      }
-
-      throw new ApiError(response.status, envelope.code, envelope.message, envelope.detail)
-    }
-    window.dispatchEvent(new CustomEvent(BACKEND_RESTORED_EVENT))
+    if (!response.ok) return yield* httpFailure(response)
+    announce(BACKEND_RESTORED_EVENT)
 
     if (response.status === 204) return undefined as T
-    const text = await response.text()
+    const text = yield* promise(() => response.text())
     if (!text) return undefined as T
 
     const parsed = JSON.parse(text) as Envelope<T> | T
     return parsed && typeof parsed === 'object' && 'data' in parsed
       ? (parsed as Envelope<T>).data
       : (parsed as T)
-  }
+  })
+
+  // 只有 GET 才重试：已经拿到 HTTP 响应的业务错误必须立刻抛给 UI，
+  // 而非幂等的写操作重放会产生重复副作用。
+  const attempted =
+    method === 'GET'
+      ? exchange.pipe(
+          retry({
+            times: UNAVAILABLE_RETRY_MAX,
+            while: (error) => error instanceof BackendUnavailable,
+            schedule: spaced(UNAVAILABLE_RETRY_MS),
+          }),
+        )
+      : exchange
+
+  // 重试耗尽后把内部标签换回要展示给 UI 的那个错误。
+  return runPromise(attempted.pipe(catchTag('BackendUnavailable', (failure) => fail(failure.api))))
 }
 
 /**
@@ -186,38 +236,26 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
  * 文件名优先取 `content-disposition`（服务端生成、含时间戳），
  * 拿不到时退回调用方给的默认名。
  */
-export async function download(path: string, fallbackName: string): Promise<void> {
-  const headers: Record<string, string> = {}
+export function download(path: string, fallbackName: string): Promise<void> {
+  const save = gen(function* () {
+    const response = yield* tryPromise({
+      try: (signal) => fetch(path, { credentials: 'same-origin', signal }),
+      catch: fetchFailure,
+    })
+    if (!response.ok) return yield* httpFailure(response)
 
-  let response: Response
-  try {
-    response = await fetch(path, { headers, credentials: 'same-origin' })
-  } catch (e) {
-    if (e instanceof DOMException && e.name === 'AbortError') throw e
-    if (e instanceof TypeError) {
-      window.dispatchEvent(new CustomEvent(BACKEND_DOWN_EVENT))
-    }
-    const message = e instanceof Error && e.message ? e.message : '网络请求失败'
-    throw new ApiError(0, 'network_error', message, String(e))
-  }
+    const disposition = response.headers.get('content-disposition') ?? ''
+    const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1] ?? fallbackName
+    const url = URL.createObjectURL(yield* promise(() => response.blob()))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = filename
+    anchor.click()
+    // 下载是异步启动的：立刻 revoke 可能抢在浏览器读取 blob 之前。
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+  })
 
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
-    }
-    const envelope = readErrorEnvelope(await response.text(), response.status, response.statusText)
-    throw new ApiError(response.status, envelope.code, envelope.message, envelope.detail)
-  }
-
-  const disposition = response.headers.get('content-disposition') ?? ''
-  const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1] ?? fallbackName
-  const url = URL.createObjectURL(await response.blob())
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  // 下载是异步启动的：立刻 revoke 可能抢在浏览器读取 blob 之前。
-  window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+  return runPromise(save.pipe(catchTag('BackendUnavailable', (failure) => fail(failure.api))))
 }
 
 /** 仅把 URL 查询串支持的标量写进去；拒绝对象被悄悄编码成 `[object Object]`。 */
@@ -419,18 +457,20 @@ export const models = {
  * JSON 拆包在这里没有意义。鉴权失败仍派发全局事件，让令牌弹窗出现。
  */
 export const playground = {
-  chat: async (body: Record<string, unknown>): Promise<Response> => {
+  chat: (body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> => {
     const headers: Record<string, string> = { 'content-type': 'application/json' }
-    const response = await fetch('/api/playground/chat', {
+    return fetch('/api/playground/chat', {
       method: 'POST',
       headers,
       credentials: 'same-origin',
       body: JSON.stringify(body),
+      signal,
+    }).then((response) => {
+      if (response.status === 401 || response.status === 403) {
+        window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+      }
+      return response
     })
-    if (response.status === 401 || response.status === 403) {
-      window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
-    }
-    return response
   },
 }
 

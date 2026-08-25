@@ -11,19 +11,18 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
-import { useToastStore } from '@/stores/toast'
+import { useAction } from '@/composables/useAction'
 import GlassSwitch from '@/components/GlassSwitch.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import {
   backup,
-  type ImportResult,
   auth as authApi,
   backups as backupsApi,
   data as dataApi,
   settings,
 } from '@/api/client'
-import { settle, tryParseJson } from '@/utils/async'
+import { orElse, parseJson } from '@/utils/effect'
 import { toErrorMessage } from '@/utils/error'
 import type {
   AffinityKeySource,
@@ -42,11 +41,10 @@ import type {
   SelectionMode,
 } from '@refract/contracts'
 
-const toastStore = useToastStore()
-const isSubmitting = ref(false)
+const saveSettings = useAction('保存失败', { toast: true })
+const reloadSectionAction = useAction('加载失败')
 const sectionErrors = ref<Record<string, string | null>>({})
 const loading = ref(true)
-const saving = ref(false)
 const saved = ref(false)
 const loadError = ref<string | null>(null)
 const saveError = ref<string | null>(null)
@@ -271,8 +269,7 @@ const affinity = ref<AffinitySettings>({
 })
 const affinityRules = ref<AffinityRuleDraft[]>([])
 const affinityStats = ref<AffinityStatsResponse | null>(null)
-const affinityClearing = ref(false)
-const affinityNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
+const clearAffinity = useAction('清除失败', { toast: true })
 
 function sourceToRow(source: AffinityKeySource): SourceRow {
   if (source.kind === 'header') return { kind: 'header', value: source.name }
@@ -446,24 +443,18 @@ function applyAffinityPreset(preset: (typeof AFFINITY_PRESETS)[number]) {
 
 /** 清空已建立的绑定缓存；不影响规则本身。 */
 async function clearAffinityBindings() {
-  if (affinityClearing.value) return
-  affinityClearing.value = true
-  affinityNotice.value = null
-  try {
-    const res = await settings.clearAffinity()
-    affinityNotice.value = { tone: 'success', text: `已清除 ${res.cleared} 条绑定。` }
-    toastStore.success(`已清除 ${res.cleared} 条绑定。`)
-    await refreshAffinityStats()
-  } catch (e) {
-    affinityNotice.value = { tone: 'danger', text: toErrorMessage(e, '清除失败') }
-    toastStore.danger(affinityNotice.value.text)
-  } finally {
-    affinityClearing.value = false
-  }
+  if (clearAffinity.busy) return
+  await clearAffinity.run(
+    () => settings.clearAffinity(),
+    (res) => {
+      void refreshAffinityStats()
+      return `已清除 ${res.cleared} 条绑定。`
+    },
+  )
 }
 
 async function refreshAffinityStats() {
-  affinityStats.value = (await settle(settings.affinityStats())) ?? null
+  affinityStats.value = await orElse(() => settings.affinityStats(), null)
 }
 
 function applySettled<T>(
@@ -477,7 +468,7 @@ function applySettled<T>(
 
 async function reloadSection(section: string) {
   sectionErrors.value[section] = null
-  try {
+  const ok = await reloadSectionAction.run(async () => {
     switch (section) {
       case 'policy': {
         const p = await settings.routingPolicy()
@@ -550,20 +541,20 @@ async function reloadSection(section: string) {
         break
       }
     }
-  } catch (e) {
-    sectionErrors.value[section] = toErrorMessage(e, '加载失败')
-  }
+    return true
+  })
+  if (ok === undefined) sectionErrors.value[section] = reloadSectionAction.error
 }
 
 function onBeforeUnload(e: BeforeUnloadEvent) {
-  if (isDirty.value && !isSubmitting.value) {
+  if (isDirty.value && !saveSettings.busy) {
     e.preventDefault()
     e.returnValue = ''
   }
 }
 
 onBeforeRouteLeave(() => {
-  if (isDirty.value && !isSubmitting.value) {
+  if (isDirty.value && !saveSettings.busy) {
     const confirm = window.confirm('有未保存的系统设置，确定要离开吗？')
     if (!confirm) return false
   }
@@ -571,120 +562,115 @@ onBeforeRouteLeave(() => {
 
 onMounted(async () => {
   window.addEventListener('beforeunload', onBeforeUnload)
-  try {
-    const [
-      pRes,
-      retentionRes,
-      bRes,
-      pricesRes,
-      bodiesRes,
-      notifyRes,
-      limitsRes,
-      emptyRetryRes,
-      affRes,
-      ipLimitsRes,
-      backupRes,
-      webhookSecretRes,
-      masterKeyRes,
-    ] = await Promise.allSettled([
-      settings.routingPolicy(),
-      settings.logRetention(),
-      settings.breakerPolicy(),
-      settings.pricing(),
-      settings.logBodies(),
-      settings.notify(),
-      settings.globalLimits(),
-      settings.emptyResponseRetry(),
-      settings.affinity(),
-      settings.ipLimits(),
-      settings.backupSettings(),
-      settings.webhookSecret(),
-      settings.masterKey(),
-    ])
+  const [
+    pRes,
+    retentionRes,
+    bRes,
+    pricesRes,
+    bodiesRes,
+    notifyRes,
+    limitsRes,
+    emptyRetryRes,
+    affRes,
+    ipLimitsRes,
+    backupRes,
+    webhookSecretRes,
+    masterKeyRes,
+  ] = await Promise.allSettled([
+    settings.routingPolicy(),
+    settings.logRetention(),
+    settings.breakerPolicy(),
+    settings.pricing(),
+    settings.logBodies(),
+    settings.notify(),
+    settings.globalLimits(),
+    settings.emptyResponseRetry(),
+    settings.affinity(),
+    settings.ipLimits(),
+    settings.backupSettings(),
+    settings.webhookSecret(),
+    settings.masterKey(),
+  ])
 
-    applySettled(pRes, 'policy', (p) => {
-      policy.value = p
-      policySnapshot = JSON.stringify(p)
-    })
-    applySettled(retentionRes, 'retention', (r) => {
-      retentionDays.value = r.days
-      retentionSnapshot = r.days
-    })
-    applySettled(bRes, 'breaker', (b) => {
-      breaker.value = b
-      breakerSnapshot = JSON.stringify(b)
-    })
-    applySettled(pricesRes, 'pricing', (pr) => {
-      pricing.value = pr
-      pricingSnapshot = JSON.stringify(pr)
-    })
-    if (bodiesRes.status === 'fulfilled') {
-      logBodies.value = bodiesRes.value.enabled
-      logBodiesSnapshot = bodiesRes.value.enabled
-    } else {
-      sectionErrors.value.retention ??= toErrorMessage(bodiesRes.reason, '加载失败')
-    }
-    applySettled(notifyRes, 'notify', (n) => {
-      notify.value = { ...n, webhook_url: n.webhook_url ?? '' }
-      notifySnapshot = JSON.stringify(notify.value)
-    })
-    applySettled(limitsRes, 'limits', (l) => {
-      limits.value = l
-      limitsSnapshot = JSON.stringify(l)
-    })
-    applySettled(emptyRetryRes, 'emptyRetry', (er) => {
-      emptyResponseRetry.value = er
-      emptyResponseRetrySnapshot = JSON.stringify(er)
-    })
-    applySettled(affRes, 'affinity', (aff) => {
-      affinity.value = aff
-      affinityRules.value = aff.rules.map(ruleToDraft)
-      affinitySnapshot = JSON.stringify(affinityCurrent())
-      void refreshAffinityStats()
-    })
-    if (ipLimitsRes.status === 'fulfilled') {
-      ipLimits.value = ipLimitsRes.value
-      ipLimitsSnapshot = JSON.stringify(ipLimitsRes.value)
-    } else {
-      sectionErrors.value.limits ??= toErrorMessage(ipLimitsRes.reason, '加载失败')
-    }
-    applySettled(backupRes, 'backup', (b) => {
-      backupCfg.value = b
-      backupSnapshot = JSON.stringify(b)
-    })
-    applySettled(webhookSecretRes, 'webhookSecret', (ws) => {
-      webhookSecretConfigured.value = ws.configured
-    })
-    applySettled(masterKeyRes, 'masterKey', (mk) => {
-      masterKeyConfigured.value = mk.configured
-    })
-
-    const allSettledList = [
-      pRes,
-      retentionRes,
-      bRes,
-      pricesRes,
-      bodiesRes,
-      notifyRes,
-      limitsRes,
-      emptyRetryRes,
-      affRes,
-      ipLimitsRes,
-      backupRes,
-      webhookSecretRes,
-      masterKeyRes,
-    ]
-    if (allSettledList.every((r) => r.status === 'rejected')) {
-      loadError.value = '全部设置项加载失败，请检查网络或后端状态'
-    }
-
-    const stats = await settle(dataApi.stats())
-    if (stats) dbStats.value = stats
-  } catch (e) {
-    loadError.value = toErrorMessage(e, '加载失败')
-  } finally {
-    loading.value = false
+  applySettled(pRes, 'policy', (p) => {
+    policy.value = p
+    policySnapshot = JSON.stringify(p)
+  })
+  applySettled(retentionRes, 'retention', (r) => {
+    retentionDays.value = r.days
+    retentionSnapshot = r.days
+  })
+  applySettled(bRes, 'breaker', (b) => {
+    breaker.value = b
+    breakerSnapshot = JSON.stringify(b)
+  })
+  applySettled(pricesRes, 'pricing', (pr) => {
+    pricing.value = pr
+    pricingSnapshot = JSON.stringify(pr)
+  })
+  if (bodiesRes.status === 'fulfilled') {
+    logBodies.value = bodiesRes.value.enabled
+    logBodiesSnapshot = bodiesRes.value.enabled
+  } else {
+    sectionErrors.value.retention ??= toErrorMessage(bodiesRes.reason, '加载失败')
   }
+  applySettled(notifyRes, 'notify', (n) => {
+    notify.value = { ...n, webhook_url: n.webhook_url ?? '' }
+    notifySnapshot = JSON.stringify(notify.value)
+  })
+  applySettled(limitsRes, 'limits', (l) => {
+    limits.value = l
+    limitsSnapshot = JSON.stringify(l)
+  })
+  applySettled(emptyRetryRes, 'emptyRetry', (er) => {
+    emptyResponseRetry.value = er
+    emptyResponseRetrySnapshot = JSON.stringify(er)
+  })
+  applySettled(affRes, 'affinity', (aff) => {
+    affinity.value = aff
+    affinityRules.value = aff.rules.map(ruleToDraft)
+    affinitySnapshot = JSON.stringify(affinityCurrent())
+    void refreshAffinityStats()
+  })
+  if (ipLimitsRes.status === 'fulfilled') {
+    ipLimits.value = ipLimitsRes.value
+    ipLimitsSnapshot = JSON.stringify(ipLimitsRes.value)
+  } else {
+    sectionErrors.value.limits ??= toErrorMessage(ipLimitsRes.reason, '加载失败')
+  }
+  applySettled(backupRes, 'backup', (b) => {
+    backupCfg.value = b
+    backupSnapshot = JSON.stringify(b)
+  })
+  applySettled(webhookSecretRes, 'webhookSecret', (ws) => {
+    webhookSecretConfigured.value = ws.configured
+  })
+  applySettled(masterKeyRes, 'masterKey', (mk) => {
+    masterKeyConfigured.value = mk.configured
+  })
+
+  const allSettledList = [
+    pRes,
+    retentionRes,
+    bRes,
+    pricesRes,
+    bodiesRes,
+    notifyRes,
+    limitsRes,
+    emptyRetryRes,
+    affRes,
+    ipLimitsRes,
+    backupRes,
+    webhookSecretRes,
+    masterKeyRes,
+  ]
+  if (allSettledList.every((r) => r.status === 'rejected')) {
+    loadError.value = '全部设置项加载失败，请检查网络或后端状态'
+  }
+
+  const stats = await orElse(() => dataApi.stats())
+  if (stats) dbStats.value = stats
+  loading.value = false
 })
 
 onBeforeUnmount(() => {
@@ -692,6 +678,7 @@ onBeforeUnmount(() => {
 })
 
 async function save() {
+  saveSettings.clear()
   if (!policyValid.value) {
     saveError.value = '路由策略不合法：最大重试 0–32 次（0 = 不限），单请求上游调用上限 0–255'
     return
@@ -733,113 +720,102 @@ async function save() {
       '亲和规则不合法：名称需非空且唯一、每条规则至少一个来源、header 名不能为空、body 路径需以 / 开头、TTL 需为 1–604800 的整数'
     return
   }
-  isSubmitting.value = true
-  saving.value = true
   saveError.value = null
   saved.value = false
-  const savedSections: string[] = []
-  try {
-    if (policyDirty.value) {
-      const p = await settings.setRoutingPolicy(policy.value)
-      policy.value = p
-      policySnapshot = JSON.stringify(p)
-      savedSections.push('路由策略')
-    }
-    if (retentionDirty.value) {
-      const retention = await settings.setLogRetention(retentionDays.value)
-      retentionDays.value = retention.days
-      retentionSnapshot = retention.days
-      savedSections.push('日志保留')
-    }
-    if (breakerDirty.value) {
-      const b = await settings.setBreakerPolicy(breaker.value)
-      breaker.value = b
-      breakerSnapshot = JSON.stringify(b)
-      savedSections.push('熔断')
-    }
-    if (pricingDirty.value) {
-      const prices = await settings.setPricing(pricing.value)
-      pricing.value = prices
-      pricingSnapshot = JSON.stringify(prices)
-      savedSections.push('价表')
-    }
-    if (logBodiesDirty.value) {
-      const bodies = await settings.setLogBodies(logBodies.value)
-      logBodies.value = bodies.enabled
-      logBodiesSnapshot = bodies.enabled
-      savedSections.push('正文快照')
-    }
-    if (limitsDirty.value) {
-      const saved_ = await settings.setGlobalLimits(limits.value)
-      limits.value = saved_
-      limitsSnapshot = JSON.stringify(saved_)
-      savedSections.push('全局限制')
-    }
-    if (ipLimitsDirty.value) {
-      const saved_ = await settings.setIpLimits(ipLimits.value)
-      ipLimits.value = saved_
-      ipLimitsSnapshot = JSON.stringify(saved_)
-      savedSections.push('IP 限制')
-    }
-    if (backupDirty.value) {
-      // 目录留空归一成 null：后端语义「用内置默认目录」，且与 GET 回显形状一致。
-      const saved_ = await settings.setBackupSettings({
-        ...backupCfg.value,
-        directory: backupCfg.value.directory?.trim() || null,
+  await saveSettings.run(
+    async () => {
+      const savedSections: string[] = []
+      const step = (name: string, dirty: boolean, task: () => Promise<void>): Promise<void> => {
+        if (!dirty) return Promise.resolve()
+        return task().then(
+          () => {
+            savedSections.push(name)
+          },
+          (error: unknown) => {
+            const prefix =
+              savedSections.length > 0 ? `部分已保存（${savedSections.join('、')}）。` : ''
+            throw new Error(`${prefix}${toErrorMessage(error, '保存失败')}`)
+          },
+        )
+      }
+      await step('路由策略', policyDirty.value, async () => {
+        const p = await settings.setRoutingPolicy(policy.value)
+        policy.value = p
+        policySnapshot = JSON.stringify(p)
       })
-      backupCfg.value = saved_
-      backupSnapshot = JSON.stringify(saved_)
-      savedSections.push('自动备份')
-    }
-    if (emptyResponseRetryDirty.value) {
-      const saved_ = await settings.setEmptyResponseRetry(emptyResponseRetry.value)
-      emptyResponseRetry.value = saved_
-      emptyResponseRetrySnapshot = JSON.stringify(saved_)
-      savedSections.push('空回复重试')
-    }
-    if (notifyDirty.value) {
-      const saved_ = await settings.setNotify({
-        webhook_url: notify.value.webhook_url?.trim() || null,
-        retest_minutes: notify.value.retest_minutes,
+      await step('日志保留', retentionDirty.value, async () => {
+        const retention = await settings.setLogRetention(retentionDays.value)
+        retentionDays.value = retention.days
+        retentionSnapshot = retention.days
       })
-      notify.value = { ...saved_, webhook_url: saved_.webhook_url ?? '' }
-      notifySnapshot = JSON.stringify(notify.value)
-      savedSections.push('通知')
-    }
-    if (affinityDirty.value) {
-      const saved_ = await settings.setAffinity(affinityCurrent())
-      affinity.value = saved_
-      affinityRules.value = saved_.rules.map(ruleToDraft)
-      affinitySnapshot = JSON.stringify(affinityCurrent())
-      void refreshAffinityStats()
-      savedSections.push('亲和性')
-    }
-    saved.value = true
-    toastStore.success('已保存')
-  } catch (e) {
-    const prefix = savedSections.length > 0 ? `部分已保存（${savedSections.join('、')}）。` : ''
-    saveError.value = `${prefix}${toErrorMessage(e, '保存失败')}`
-    toastStore.danger(saveError.value)
-  } finally {
-    saving.value = false
-    isSubmitting.value = false
-  }
+      await step('熔断', breakerDirty.value, async () => {
+        const b = await settings.setBreakerPolicy(breaker.value)
+        breaker.value = b
+        breakerSnapshot = JSON.stringify(b)
+      })
+      await step('价表', pricingDirty.value, async () => {
+        const prices = await settings.setPricing(pricing.value)
+        pricing.value = prices
+        pricingSnapshot = JSON.stringify(prices)
+      })
+      await step('正文快照', logBodiesDirty.value, async () => {
+        const bodies = await settings.setLogBodies(logBodies.value)
+        logBodies.value = bodies.enabled
+        logBodiesSnapshot = bodies.enabled
+      })
+      await step('全局限制', limitsDirty.value, async () => {
+        const saved_ = await settings.setGlobalLimits(limits.value)
+        limits.value = saved_
+        limitsSnapshot = JSON.stringify(saved_)
+      })
+      await step('IP 限制', ipLimitsDirty.value, async () => {
+        const saved_ = await settings.setIpLimits(ipLimits.value)
+        ipLimits.value = saved_
+        ipLimitsSnapshot = JSON.stringify(saved_)
+      })
+      await step('自动备份', backupDirty.value, async () => {
+        const saved_ = await settings.setBackupSettings({
+          ...backupCfg.value,
+          directory: backupCfg.value.directory?.trim() || null,
+        })
+        backupCfg.value = saved_
+        backupSnapshot = JSON.stringify(saved_)
+      })
+      await step('空回复重试', emptyResponseRetryDirty.value, async () => {
+        const saved_ = await settings.setEmptyResponseRetry(emptyResponseRetry.value)
+        emptyResponseRetry.value = saved_
+        emptyResponseRetrySnapshot = JSON.stringify(saved_)
+      })
+      await step('通知', notifyDirty.value, async () => {
+        const saved_ = await settings.setNotify({
+          webhook_url: notify.value.webhook_url?.trim() || null,
+          retest_minutes: notify.value.retest_minutes,
+        })
+        notify.value = { ...saved_, webhook_url: saved_.webhook_url ?? '' }
+        notifySnapshot = JSON.stringify(notify.value)
+      })
+      await step('亲和性', affinityDirty.value, async () => {
+        const saved_ = await settings.setAffinity(affinityCurrent())
+        affinity.value = saved_
+        affinityRules.value = saved_.rules.map(ruleToDraft)
+        affinitySnapshot = JSON.stringify(affinityCurrent())
+        void refreshAffinityStats()
+      })
+    },
+    () => {
+      saved.value = true
+      return '已保存'
+    },
+  )
 }
 
-const notifyTesting = ref(false)
-const notifyTestResult = ref<string | null>(null)
+const testNotify = useAction('发送失败')
 
 async function sendTestNotification() {
-  notifyTesting.value = true
-  notifyTestResult.value = null
-  try {
-    await settings.testNotify()
-    notifyTestResult.value = '已发送 —— 去通知渠道确认收到'
-  } catch (e) {
-    notifyTestResult.value = toErrorMessage(e, '发送失败')
-  } finally {
-    notifyTesting.value = false
-  }
+  await testNotify.run(
+    () => settings.testNotify(),
+    () => '已发送 —— 去通知渠道确认收到',
+  )
 }
 
 // ── Webhook 签名密钥 ──
@@ -848,32 +824,19 @@ async function sendTestNotification() {
 const webhookSecretConfigured = ref(false)
 const webhookSecretDraft = ref('')
 const showWebhookSecret = ref(false)
-const webhookSecretBusy = ref(false)
-const webhookSecretNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
+const saveWebhookSecret = useAction('保存失败', { toast: true })
 
 async function applyWebhookSecret() {
-  if (webhookSecretBusy.value) return
-  webhookSecretBusy.value = true
-  webhookSecretNotice.value = null
-  try {
-    const secret = webhookSecretDraft.value.trim()
-    const res = await settings.setWebhookSecret(secret || null)
-    webhookSecretConfigured.value = res.configured
-    webhookSecretDraft.value = ''
-    webhookSecretNotice.value = {
-      tone: 'success',
-      text: secret ? '签名密钥已保存，webhook 请求将携带签名头。' : '签名密钥已清除。',
-    }
-    toastStore.success(webhookSecretNotice.value.text)
-  } catch (e) {
-    webhookSecretNotice.value = {
-      tone: 'danger',
-      text: toErrorMessage(e, '保存失败'),
-    }
-    toastStore.danger(webhookSecretNotice.value.text)
-  } finally {
-    webhookSecretBusy.value = false
-  }
+  if (saveWebhookSecret.busy) return
+  const secret = webhookSecretDraft.value.trim()
+  await saveWebhookSecret.run(
+    () => settings.setWebhookSecret(secret || null),
+    (res) => {
+      webhookSecretConfigured.value = res.configured
+      webhookSecretDraft.value = ''
+      return secret ? '签名密钥已保存，webhook 请求将携带签名头。' : '签名密钥已清除。'
+    },
+  )
 }
 
 // ── 凭据静态加密 ──
@@ -881,105 +844,74 @@ async function applyWebhookSecret() {
 const masterKeyConfigured = ref(false)
 const masterKeyDraft = ref('')
 const showMasterKey = ref(false)
-const masterKeyBusy = ref(false)
-const masterKeyNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
+const saveMasterKey = useAction('保存失败', { toast: true })
 
 /** 启用或更换主密钥；留空保存即清除（之后新凭据回到明文存储）。 */
 async function applyMasterKey() {
-  if (masterKeyBusy.value) return
-  masterKeyBusy.value = true
-  masterKeyNotice.value = null
-  try {
-    const key = masterKeyDraft.value.trim()
-    const res = await settings.setMasterKey(key || null)
-    masterKeyConfigured.value = res.configured
-    masterKeyDraft.value = ''
-    masterKeyNotice.value = {
-      tone: 'success',
-      text: key ? '主密钥已保存。' : '主密钥已清除，新凭据将明文存储。',
-    }
-    toastStore.success(masterKeyNotice.value.text)
-  } catch (e) {
-    masterKeyNotice.value = {
-      tone: 'danger',
-      text: toErrorMessage(e, '保存失败'),
-    }
-    toastStore.danger(masterKeyNotice.value.text)
-  } finally {
-    masterKeyBusy.value = false
-  }
+  if (saveMasterKey.busy) return
+  const key = masterKeyDraft.value.trim()
+  await saveMasterKey.run(
+    () => settings.setMasterKey(key || null),
+    (res) => {
+      masterKeyConfigured.value = res.configured
+      masterKeyDraft.value = ''
+      return key ? '主密钥已保存。' : '主密钥已清除，新凭据将明文存储。'
+    },
+  )
 }
 
 // ── 备份文件管理 ──
 const backupFiles = ref<BackupFile[]>([])
 const backupListLoading = ref(false)
-const backupFileBusy = ref(false)
+const createBackup = useAction('备份失败', { toast: true })
+const downloadBackup = useAction('下载失败', { toast: true })
+const removeBackup = useAction('删除失败', { toast: true })
 const downloadingBackupName = ref<string | null>(null)
 const deletingBackupName = ref<string | null>(null)
 /** 待确认删除的备份文件名 —— 删除不可恢复，沿用渠道列表的二次确认模式。 */
 const pendingBackupDelete = ref<string | null>(null)
-const backupFileNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
 
 async function refreshBackupFiles() {
   backupListLoading.value = true
-  try {
-    backupFiles.value = (await settle(backupsApi.list())) ?? []
-  } finally {
-    backupListLoading.value = false
-  }
+  backupFiles.value = await orElse(() => backupsApi.list(), [])
+  backupListLoading.value = false
 }
 
 /** 立即生成一份备份，成功后刷新列表。 */
 async function createBackupFile() {
-  if (backupFileBusy.value) return
-  backupFileBusy.value = true
-  backupFileNotice.value = null
-  try {
-    const res = await backupsApi.create()
-    backupFileNotice.value = { tone: 'success', text: `备份已创建：${res.name}` }
-    toastStore.success(backupFileNotice.value.text)
-    await refreshBackupFiles()
-  } catch (e) {
-    backupFileNotice.value = { tone: 'danger', text: toErrorMessage(e, '备份失败') }
-    toastStore.danger(backupFileNotice.value.text)
-  } finally {
-    backupFileBusy.value = false
-  }
+  if (createBackup.busy) return
+  await createBackup.run(
+    () => backupsApi.create(),
+    (res) => {
+      void refreshBackupFiles()
+      return `备份已创建：${res.name}`
+    },
+  )
 }
 
 /** 带管理令牌下载指定备份（裸 <a href> 不带令牌会 401）。 */
 async function downloadBackupFile(name: string) {
   if (downloadingBackupName.value) return
   downloadingBackupName.value = name
-  backupFileNotice.value = null
-  try {
-    await backupsApi.download(name)
-    backupFileNotice.value = { tone: 'success', text: `已下载：${name}` }
-    toastStore.success(backupFileNotice.value.text)
-  } catch (e) {
-    backupFileNotice.value = { tone: 'danger', text: toErrorMessage(e, '下载失败') }
-    toastStore.danger(backupFileNotice.value.text)
-  } finally {
-    downloadingBackupName.value = null
-  }
+  await downloadBackup.run(
+    () => backupsApi.download(name),
+    () => `已下载：${name}`,
+  )
+  downloadingBackupName.value = null
 }
 
 async function deleteBackupFile(name: string) {
   if (deletingBackupName.value) return
   deletingBackupName.value = name
-  backupFileNotice.value = null
-  try {
-    await backupsApi.remove(name)
-    pendingBackupDelete.value = null
-    backupFileNotice.value = { tone: 'success', text: `已删除：${name}` }
-    toastStore.success(backupFileNotice.value.text)
-    await refreshBackupFiles()
-  } catch (e) {
-    backupFileNotice.value = { tone: 'danger', text: toErrorMessage(e, '删除失败') }
-    toastStore.danger(backupFileNotice.value.text)
-  } finally {
-    deletingBackupName.value = null
-  }
+  await removeBackup.run(
+    () => backupsApi.remove(name),
+    () => {
+      pendingBackupDelete.value = null
+      void refreshBackupFiles()
+      return `已删除：${name}`
+    },
+  )
+  deletingBackupName.value = null
 }
 
 onMounted(() => {
@@ -1002,11 +934,13 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
 const sessionActive = ref(true)
 const tokenDraft = ref('')
 const showTokenDraft = ref(false)
-const tokenBusy = ref(false)
-const tokenNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
+const applyAdminToken = useAction('设置失败', { toast: true })
+const clearAdminToken = useAction('关闭失败', { toast: true })
+const logoutSession = useAction('退出失败', { toast: true })
+const tokenBusy = computed(() => applyAdminToken.busy || clearAdminToken.busy || logoutSession.busy)
 
 onMounted(async () => {
-  const s = await settle(authApi.session())
+  const s = await orElse(() => authApi.session())
   if (s) sessionActive.value = s.authenticated
 })
 
@@ -1018,118 +952,74 @@ onMounted(async () => {
 async function applyToken() {
   const token = tokenDraft.value.trim()
   if (!token || tokenBusy.value) return
-  tokenBusy.value = true
-  tokenNotice.value = null
-  try {
-    await settings.setAdminToken(token)
-    sessionActive.value = true
-    tokenDraft.value = ''
-    tokenNotice.value = { tone: 'success', text: '令牌已生效，会话已更新。' }
-    toastStore.success('令牌已生效，会话已更新。')
-  } catch (e) {
-    tokenNotice.value = {
-      tone: 'danger',
-      text: toErrorMessage(e, '设置失败'),
-    }
-    toastStore.danger(tokenNotice.value.text)
-  } finally {
-    tokenBusy.value = false
-  }
+  await applyAdminToken.run(
+    () => settings.setAdminToken(token),
+    () => {
+      sessionActive.value = true
+      tokenDraft.value = ''
+      return '令牌已生效，会话已更新。'
+    },
+  )
 }
 
 /** 关闭管理鉴权：服务端清除令牌哈希与 Cookie。 */
 async function clearToken() {
   if (tokenBusy.value) return
-  tokenBusy.value = true
-  tokenNotice.value = null
-  try {
-    await settings.setAdminToken(null)
-    sessionActive.value = true
-    tokenNotice.value = { tone: 'success', text: '管理鉴权已关闭。' }
-    toastStore.success('管理鉴权已关闭。')
-  } catch (e) {
-    tokenNotice.value = {
-      tone: 'danger',
-      text: toErrorMessage(e, '关闭失败'),
-    }
-    toastStore.danger(tokenNotice.value.text)
-  } finally {
-    tokenBusy.value = false
-  }
+  await clearAdminToken.run(
+    () => settings.setAdminToken(null),
+    () => {
+      sessionActive.value = true
+      return '管理鉴权已关闭。'
+    },
+  )
 }
 
 /** 登出当前控制台会话 */
 async function logout() {
   if (tokenBusy.value) return
-  tokenBusy.value = true
-  try {
-    await authApi.logout()
-    window.location.reload()
-  } catch (e) {
-    toastStore.danger(toErrorMessage(e, '退出失败'))
-  } finally {
-    tokenBusy.value = false
-  }
+  await logoutSession.run(
+    () => authApi.logout(),
+    () => {
+      window.location.reload()
+    },
+  )
 }
 
 // ── 数据备份 ──
 
-const exportBusy = ref(false)
-const importBusy = ref(false)
+const exportBackupAction = useAction('导出失败', { toast: true })
+const importBackupAction = useAction('导入失败', { toast: true })
+const downloadDbBackupAction = useAction('备份失败', { toast: true })
 const importMode = ref<'merge' | 'replace'>('merge')
-const backupNotice = ref<{ tone: 'success' | 'danger'; text: string } | null>(null)
 const importFileInput = ref<HTMLInputElement | null>(null)
 /** 待确认的替换导入：文件已解析但还没提交，等用户二次确认。 */
 const pendingReplace = ref<{ name: string; payload: unknown } | null>(null)
 
 /** 导出全量配置并触发浏览器下载。 */
 async function exportBackup() {
-  if (exportBusy.value) return
-  exportBusy.value = true
-  backupNotice.value = null
-  try {
-    const document_ = await backup.export()
-    const blob = new Blob([JSON.stringify(document_, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `refract-backup-${new Date().toISOString().slice(0, 10)}.json`
-    a.click()
-    // 下载由浏览器异步启动，立即 revoke 可能抢在它读取 blob 之前。
-    window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
-    backupNotice.value = {
-      tone: 'success',
-      text: '备份已下载。文件包含渠道凭据明文，请像保管密钥一样保管它。',
-    }
-    toastStore.success('备份已下载')
-  } catch (e) {
-    backupNotice.value = { tone: 'danger', text: toErrorMessage(e, '导出失败') }
-    toastStore.danger(backupNotice.value.text)
-  } finally {
-    exportBusy.value = false
-  }
+  if (exportBackupAction.busy) return
+  await exportBackupAction.run(
+    () => backup.export(),
+    (document_) => {
+      const blob = new Blob([JSON.stringify(document_, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `refract-backup-${new Date().toISOString().slice(0, 10)}.json`
+      a.click()
+      window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+      return '备份已下载'
+    },
+  )
 }
-
-const dbBackupBusy = ref(false)
 
 /** 下载 SQLite 在线热备（带鉴权；裸 <a href> 不带管理令牌会 401）。 */
 async function downloadDatabaseBackup() {
-  if (dbBackupBusy.value) return
-  dbBackupBusy.value = true
-  backupNotice.value = null
-  try {
-    await dataApi.backup()
-    backupNotice.value = {
-      tone: 'success',
-      text: '数据库备份已下载，包含全部请求日志，体积较大请妥善保管。',
-    }
-    toastStore.success('数据库备份已下载')
-  } catch (e) {
-    backupNotice.value = { tone: 'danger', text: toErrorMessage(e, '备份失败') }
-    toastStore.danger(backupNotice.value.text)
-  } finally {
-    dbBackupBusy.value = false
-  }
+  if (downloadDbBackupAction.busy) return
+  await downloadDbBackupAction.run(
+    () => dataApi.backup(),
+    () => '数据库备份已下载',
+  )
 }
 
 /**
@@ -1139,15 +1029,14 @@ async function downloadDatabaseBackup() {
 async function importBackup(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
-  // 允许连续选择同一个文件重新导入。
   input.value = ''
-  if (!file || importBusy.value) return
+  if (!file || importBackupAction.busy) return
 
-  backupNotice.value = null
+  importBackupAction.clear()
   pendingReplace.value = null
-  const parsed = tryParseJson(await file.text())
+  const parsed = parseJson(await file.text())
   if (parsed === undefined) {
-    backupNotice.value = { tone: 'danger', text: '文件不是有效的 JSON' }
+    importBackupAction.notice = { tone: 'danger', text: '文件不是有效的 JSON' }
     return
   }
 
@@ -1175,33 +1064,22 @@ function skippedDetail(kind: string, names: string[]): string {
 }
 
 async function runImport(payload: unknown) {
-  importBusy.value = true
-  backupNotice.value = null
-  try {
-    const result: ImportResult = await backup.import(payload, importMode.value)
-    const detail = [
-      skippedDetail('渠道', result.skipped_channels ?? []),
-      skippedDetail('密钥', result.skipped_keys ?? []),
-    ]
-      .filter(Boolean)
-      .join(' ')
-    backupNotice.value = {
-      tone: 'success',
-      text:
+  await importBackupAction.run(
+    () => backup.import(payload, importMode.value),
+    (result) => {
+      const detail = [
+        skippedDetail('渠道', result.skipped_channels ?? []),
+        skippedDetail('密钥', result.skipped_keys ?? []),
+      ]
+        .filter(Boolean)
+        .join(' ')
+      return (
         `导入完成：渠道 +${result.channels_imported}（跳过 ${result.channels_skipped}），` +
         `密钥 +${result.keys_imported}（跳过 ${result.keys_skipped}）。` +
-        (detail ? ` ${detail}` : ''),
-    }
-    toastStore.success(backupNotice.value.text)
-  } catch (e) {
-    backupNotice.value = {
-      tone: 'danger',
-      text: toErrorMessage(e, '导入失败'),
-    }
-    toastStore.danger(backupNotice.value.text)
-  } finally {
-    importBusy.value = false
-  }
+        (detail ? ` ${detail}` : '')
+      )
+    },
+  )
 }
 </script>
 
@@ -1652,15 +1530,15 @@ async function runImport(payload: unknown) {
               <button
                 type="button"
                 class="glass-button-ghost glass-button-ghost-danger px-3 py-2 text-sm disabled:opacity-50"
-                :disabled="affinityClearing"
+                :disabled="clearAffinity.busy"
                 @click="clearAffinityBindings"
               >
                 <AppIcon
-                  :name="affinityClearing ? 'spinner' : 'trash'"
-                  :class="affinityClearing ? 'animate-spin' : ''"
+                  :name="clearAffinity.busy ? 'spinner' : 'trash'"
+                  :class="clearAffinity.busy ? 'animate-spin' : ''"
                   :size="13"
                 />
-                {{ affinityClearing ? '清除中…' : '清空绑定' }}
+                {{ clearAffinity.busy ? '清除中…' : '清空绑定' }}
               </button>
             </div>
             <p v-if="affinityStats" class="mt-2 text-xs text-ink-faint">
@@ -1784,15 +1662,15 @@ async function runImport(payload: unknown) {
           <button
             type="button"
             class="glass-button-ghost inline-flex items-center gap-1.5 px-3 py-2 text-sm"
-            :disabled="dbBackupBusy"
+            :disabled="downloadDbBackupAction.busy"
             @click="downloadDatabaseBackup"
           >
             <AppIcon
-              :name="dbBackupBusy ? 'spinner' : 'download'"
-              :class="dbBackupBusy ? 'animate-spin' : ''"
+              :name="downloadDbBackupAction.busy ? 'spinner' : 'download'"
+              :class="downloadDbBackupAction.busy ? 'animate-spin' : ''"
               :size="14"
             />
-            {{ dbBackupBusy ? '生成备份中…' : '下载数据库备份' }}
+            {{ downloadDbBackupAction.busy ? '生成备份中…' : '下载数据库备份' }}
           </button>
         </div>
       </section>
@@ -1928,16 +1806,16 @@ async function runImport(payload: unknown) {
             <button
               type="button"
               class="glass-button-ghost shrink-0 px-3 py-2 text-sm"
-              :disabled="notifyTesting || notifyDirty || !notify.webhook_url"
+              :disabled="testNotify.busy || notifyDirty || !notify.webhook_url"
               :title="notifyDirty ? '先保存设置再测试' : '发送一条测试通知'"
               @click="sendTestNotification"
             >
-              <AppIcon v-if="notifyTesting" name="spinner" class="animate-spin mr-1" :size="13" />
-              {{ notifyTesting ? '发送中…' : '发送测试' }}
+              <AppIcon v-if="testNotify.busy" name="spinner" class="animate-spin mr-1" :size="13" />
+              {{ testNotify.busy ? '发送中…' : '发送测试' }}
             </button>
           </div>
-          <span v-if="notifyTestResult" class="text-xs text-ink-soft">
-            {{ notifyTestResult }}
+          <span v-if="testNotify.notice?.text" class="text-xs text-ink-soft">
+            {{ testNotify.notice?.text }}
           </span>
         </label>
 
@@ -1989,17 +1867,17 @@ async function runImport(payload: unknown) {
               type="button"
               class="glass-button-ghost px-3 py-1.5 text-xs disabled:opacity-50"
               :disabled="
-                webhookSecretBusy || (!webhookSecretConfigured && !webhookSecretDraft.trim())
+                saveWebhookSecret.busy || (!webhookSecretConfigured && !webhookSecretDraft.trim())
               "
               @click="applyWebhookSecret"
             >
               <AppIcon
-                v-if="webhookSecretBusy"
+                v-if="saveWebhookSecret.busy"
                 name="spinner"
                 class="animate-spin mr-1"
                 :size="13"
               />
-              {{ webhookSecretBusy ? '保存中…' : '保存签名密钥' }}
+              {{ saveWebhookSecret.busy ? '保存中…' : '保存签名密钥' }}
             </button>
           </div>
           <p class="text-xs text-ink-faint">
@@ -2193,7 +2071,7 @@ async function runImport(payload: unknown) {
           type="button"
           class="glass-button-primary px-5 py-2.5 text-sm font-medium disabled:opacity-50"
           :disabled="
-            saving ||
+            saveSettings.busy ||
             !isDirty ||
             !retentionValid ||
             !breakerValid ||
@@ -2208,11 +2086,13 @@ async function runImport(payload: unknown) {
           "
           @click="save"
         >
-          <AppIcon v-if="saving" name="spinner" class="animate-spin mr-1.5" :size="15" />
-          {{ saving ? '保存中…' : '保存设置' }}
+          <AppIcon v-if="saveSettings.busy" name="spinner" class="animate-spin mr-1.5" :size="15" />
+          {{ saveSettings.busy ? '保存中…' : '保存设置' }}
         </button>
 
-        <p v-if="saveError" class="ml-2 text-sm text-danger">{{ saveError }}</p>
+        <p v-if="saveSettings.error ?? saveError" class="ml-2 text-sm text-danger">
+          {{ saveSettings.error ?? saveError }}
+        </p>
       </div>
 
       <!-- 管理令牌 -->
@@ -2321,29 +2201,29 @@ async function runImport(payload: unknown) {
           <button
             type="button"
             class="glass-button-primary flex items-center gap-1.5 px-4 py-2 text-sm font-medium disabled:opacity-50"
-            :disabled="exportBusy"
+            :disabled="exportBackupAction.busy"
             @click="exportBackup"
           >
             <AppIcon
-              :name="exportBusy ? 'spinner' : 'download'"
-              :class="exportBusy ? 'animate-spin' : ''"
+              :name="exportBackupAction.busy ? 'spinner' : 'download'"
+              :class="exportBackupAction.busy ? 'animate-spin' : ''"
               :size="15"
             />
-            {{ exportBusy ? '导出中…' : '导出备份' }}
+            {{ exportBackupAction.busy ? '导出中…' : '导出备份' }}
           </button>
 
           <button
             type="button"
             class="glass-button-ghost px-4 py-2 text-sm font-medium"
-            :disabled="importBusy"
+            :disabled="importBackupAction.busy"
             @click="importFileInput?.click()"
           >
             <AppIcon
-              :name="importBusy ? 'spinner' : 'upload'"
-              :class="importBusy ? 'animate-spin' : ''"
+              :name="importBackupAction.busy ? 'spinner' : 'upload'"
+              :class="importBackupAction.busy ? 'animate-spin' : ''"
               :size="15"
             />
-            {{ importBusy ? '导入中…' : '导入备份' }}
+            {{ importBackupAction.busy ? '导入中…' : '导入备份' }}
           </button>
           <input
             ref="importFileInput"
@@ -2392,11 +2272,16 @@ async function runImport(payload: unknown) {
             <button
               type="button"
               class="inline-flex items-center gap-1 rounded-lg bg-danger px-3.5 py-1.5 text-xs font-medium text-white hover:brightness-105 disabled:opacity-50"
-              :disabled="importBusy"
+              :disabled="importBackupAction.busy"
               @click="confirmReplaceImport"
             >
-              <AppIcon v-if="importBusy" name="spinner" class="animate-spin" :size="12" />
-              {{ importBusy ? '替换中…' : '确认替换' }}
+              <AppIcon
+                v-if="importBackupAction.busy"
+                name="spinner"
+                class="animate-spin"
+                :size="12"
+              />
+              {{ importBackupAction.busy ? '替换中…' : '确认替换' }}
             </button>
             <button type="button" @click="pendingReplace = null">取消</button>
           </div>

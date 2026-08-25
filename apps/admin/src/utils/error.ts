@@ -1,3 +1,5 @@
+import { parseJson } from '@/utils/effect'
+
 /**
  * 把任意拒绝值收成一句可展示的文案。
  * Error（含 ApiError）透出 message；有独立 detail 时拼上，避免只剩空壳状态码。
@@ -19,10 +21,8 @@ export function readErrorEnvelope(
   status: number,
   statusText: string,
 ): { code: string; message: string; detail?: string } {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text) as unknown
-  } catch {
+  const parsed = parseJson(text)
+  if (parsed === undefined) {
     return { code: 'http_error', message: `${status} ${statusText}`.trim() }
   }
   if (!parsed || typeof parsed !== 'object') {

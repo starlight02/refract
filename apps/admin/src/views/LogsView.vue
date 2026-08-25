@@ -8,16 +8,15 @@
  *
  * 展开行才显示错误详情：错误信息通常很长，平铺会把表格撑烂。
  */
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { useLogsStore } from '@/stores/logs'
 import { useChannelsStore } from '@/stores/channels'
 import { numOr } from '@/utils/num'
-import { tryParseJson } from '@/utils/async'
-import { toErrorMessage } from '@/utils/error'
-import { useToastStore } from '@/stores/toast'
+import { useAction } from '@/composables/useAction'
+import { parseJson } from '@/utils/effect'
 import { logs as logsApi } from '@/api/client'
 import {
   DialogContent,
@@ -31,7 +30,6 @@ import type { Protocol, RequestLog } from '@refract/contracts'
 
 const store = useLogsStore()
 const channelsStore = useChannelsStore()
-const toastStore = useToastStore()
 
 // ── 自动刷新 ──
 // 排障时最常见的动作是「重发请求 → 切回来看日志」，自动刷新省掉手动刷新。
@@ -102,10 +100,7 @@ function toUtcStamp(local: string): string | undefined {
 const expanded = ref<Set<number>>(new Set())
 /** 清理确认与结果提示。 */
 const pruneDays = ref(30)
-const pruning = ref(false)
-const pruneNotice = ref<string | null>(null)
-/** 导出失败提示。 */
-const exportNotice = ref<string | null>(null)
+const pruneLogs = reactive(useAction('清理失败', { toast: true }))
 
 const PROTOCOLS: Protocol[] = ['chat', 'responses', 'messages', 'gemini']
 
@@ -142,60 +137,49 @@ function resetFilter() {
   store.fetch({})
 }
 
-const exportingAll = ref(false)
+const exportAllLogs = reactive(useAction('导出失败', { toast: true }))
 const pageExported = ref(false)
 
 /** 按当前筛选下载全量 NDJSON（上限 5 万行，服务端拼装）。 */
 async function exportAll() {
-  if (exportingAll.value) return
-  exportingAll.value = true
-  exportNotice.value = null
-  try {
-    await logsApi.export(store.filter)
-    toastStore.success('日志导出已开始')
-  } catch (e) {
-    exportNotice.value = toErrorMessage(e, '导出失败')
-    toastStore.danger(exportNotice.value)
-  } finally {
-    exportingAll.value = false
-  }
+  if (exportAllLogs.busy) return
+  await exportAllLogs.run(
+    () => logsApi.export(store.filter),
+    () => '日志导出已开始',
+  )
 }
 
 // ── 完整请求详情 ──
 // 正文可能几十 KB，列表接口从不带它；点开时按 id 单独取。
 const detail = ref<RequestLog | null>(null)
-const detailLoading = ref(false)
+const loadDetail = reactive(useAction('加载失败'))
 const detailLoadingId = ref<number | null>(null)
-const detailError = ref<string | null>(null)
 const detailOpen = computed(
-  () => detailLoading.value || detail.value !== null || detailError.value !== null,
+  () => loadDetail.busy || detail.value !== null || loadDetail.error !== null,
 )
 
 async function openDetail(id: number) {
-  detailLoading.value = true
   detailLoadingId.value = id
-  detailError.value = null
   detail.value = null
-  try {
-    detail.value = await logsApi.get(id)
-  } catch (e) {
-    detailError.value = toErrorMessage(e, '加载失败')
-  } finally {
-    detailLoading.value = false
-    detailLoadingId.value = null
-  }
+  await loadDetail.run(
+    () => logsApi.get(id),
+    (row) => {
+      detail.value = row
+    },
+  )
+  detailLoadingId.value = null
 }
 
 function closeDetail() {
   detail.value = null
-  detailError.value = null
-  detailLoading.value = false
+  loadDetail.clear()
+  loadDetail.busy = false
 }
 
 /** 尽力美化 JSON；不是 JSON（流式聚合文本）就原样展示。 */
 function pretty(raw?: string | null): string {
   if (!raw) return ''
-  const parsed = tryParseJson(raw)
+  const parsed = parseJson(raw)
   return parsed === undefined ? raw : JSON.stringify(parsed, null, 2)
 }
 
@@ -207,18 +191,10 @@ function toggleRow(id: number) {
 }
 
 async function prune() {
-  pruning.value = true
-  pruneNotice.value = null
-  try {
-    const removed = await store.prune(numOr(pruneDays.value, 30))
-    pruneNotice.value = `已清理 ${removed} 条`
-    toastStore.success(pruneNotice.value)
-  } catch (e) {
-    pruneNotice.value = toErrorMessage(e, '清理失败')
-    toastStore.danger(pruneNotice.value)
-  } finally {
-    pruning.value = false
-  }
+  await pruneLogs.run(
+    () => store.prune(numOr(pruneDays.value, 30)),
+    (removed) => `已清理 ${removed} 条`,
+  )
 }
 
 /**
@@ -308,16 +284,16 @@ function fullTime(iso: string): string {
         <button
           type="button"
           class="glass-button-ghost"
-          :disabled="exportingAll"
+          :disabled="exportAllLogs.busy"
           title="按当前筛选导出 NDJSON（上限 5 万行）"
           @click="exportAll"
         >
           <AppIcon
-            :name="exportingAll ? 'spinner' : 'upload'"
-            :class="exportingAll ? 'animate-spin' : ''"
+            :name="exportAllLogs.busy ? 'spinner' : 'upload'"
+            :class="exportAllLogs.busy ? 'animate-spin' : ''"
             :size="14"
           />
-          {{ exportingAll ? '导出中…' : '导出全量' }}
+          {{ exportAllLogs.busy ? '导出中…' : '导出全量' }}
         </button>
 
         <div class="glass-pill glass-pill-danger h-[34px] gap-1.5 px-2.5">
@@ -332,15 +308,19 @@ function fullTime(iso: string): string {
           <button
             type="button"
             class="inline-flex items-center gap-1 glass-button-ghost glass-button-ghost-danger !h-[24px] !px-2 text-xs font-medium"
-            :disabled="pruning"
+            :disabled="pruneLogs.busy"
             @click="prune"
           >
-            <AppIcon v-if="pruning" name="spinner" class="animate-spin" :size="11" />
-            {{ pruning ? '清理中…' : '执行' }}
+            <AppIcon v-if="pruneLogs.busy" name="spinner" class="animate-spin" :size="11" />
+            {{ pruneLogs.busy ? '清理中…' : '执行' }}
           </button>
         </div>
-        <span v-if="pruneNotice" class="text-xs text-ink-faint">{{ pruneNotice }}</span>
-        <span v-if="exportNotice" class="text-xs text-danger">{{ exportNotice }}</span>
+        <span v-if="pruneLogs.notice" class="text-xs text-ink-faint">{{
+          pruneLogs.notice.text
+        }}</span>
+        <span v-if="exportAllLogs.error" class="text-xs text-danger">{{
+          exportAllLogs.error
+        }}</span>
       </div>
     </header>
 
@@ -707,10 +687,12 @@ function fullTime(iso: string): string {
             {{ detail?.request_id ?? '' }}
           </DialogDescription>
 
-          <div v-if="detailLoading" class="py-16 text-center">
+          <div v-if="loadDetail.busy" class="py-16 text-center">
             <GlassSpinner size="md" label="正在读取完整请求正文…" />
           </div>
-          <p v-else-if="detailError" class="mt-4 text-sm text-danger">{{ detailError }}</p>
+          <p v-else-if="loadDetail.error" class="mt-4 text-sm text-danger">
+            {{ loadDetail.error }}
+          </p>
 
           <div v-else-if="detail" class="mt-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
             <section>

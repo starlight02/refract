@@ -5,32 +5,26 @@
  * 数据从渠道配置派生而不是单独维护 —— 模型清单的唯一真相是渠道配置，
  * 再存一份就会漂移。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { settings as settingsApi } from '@/api/client'
 import { useChannelsStore } from '@/stores/channels'
-import { toErrorMessage } from '@/utils/error'
+import { useAction } from '@/composables/useAction'
 import type { ModelPrice, Protocol } from '@refract/contracts'
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
 
 const channelsStore = useChannelsStore()
 const pricing = ref<ModelPrice[]>([])
-const loading = ref(true)
-const error = ref<string | null>(null)
+const loadModels = reactive(useAction('加载失败'))
+loadModels.busy = true
 const filter = ref('')
 
 onMounted(async () => {
-  try {
+  await loadModels.run(async () => {
     const [, prices] = await Promise.all([channelsStore.fetch(), settingsApi.pricing()])
     pricing.value = prices
-    if (channelsStore.error) {
-      error.value = channelsStore.error
-    }
-  } catch (e) {
-    error.value = toErrorMessage(e, '加载失败')
-  } finally {
-    loading.value = false
-  }
+    if (channelsStore.error) loadModels.fail(channelsStore.error)
+  })
 })
 
 interface ModelRow {
@@ -109,8 +103,10 @@ function fmtPrice(value: number): string {
       />
     </header>
 
-    <p v-if="error" class="glass border-danger/30 p-4 text-sm text-danger">{{ error }}</p>
-    <div v-else-if="loading" class="py-24 text-center">
+    <p v-if="loadModels.error" class="glass border-danger/30 p-4 text-sm text-danger">
+      {{ loadModels.error }}
+    </p>
+    <div v-else-if="loadModels.busy" class="py-24 text-center">
       <GlassSpinner size="lg" label="正在汇总模型清单与价表…" />
     </div>
     <section v-else-if="rows.length === 0" class="glass glass-specular py-16 text-center">

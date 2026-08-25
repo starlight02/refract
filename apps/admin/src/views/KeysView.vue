@@ -6,7 +6,7 @@
  * 而是把弹窗切成「请立刻复制」状态，并且这个状态只能由用户显式关闭 ——
  * 自动消失会导致密钥永久丢失。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
 import AppIcon from '@/components/AppIcon.vue'
@@ -20,8 +20,8 @@ import {
 } from 'reka-ui'
 import { useKeysStore } from '@/stores/keys'
 import { logs as logsApi } from '@/api/client'
-import { settle } from '@/utils/async'
-import { toErrorMessage } from '@/utils/error'
+import { useAction } from '@/composables/useAction'
+import { orElse } from '@/utils/effect'
 import { numOr } from '@/utils/num'
 import type { ApiKey, KeyUsageStat, NewApiKey } from '@refract/contracts'
 
@@ -31,14 +31,13 @@ const store = useKeysStore()
 const usageByKey = ref<Map<number, KeyUsageStat>>(new Map())
 
 async function refreshUsage() {
-  const stats = await settle(logsApi.byKey(24))
-  usageByKey.value = new Map((stats ?? []).map((s) => [s.api_key_id, s]))
+  const stats = await orElse(() => logsApi.byKey(24), [])
+  usageByKey.value = new Map(stats.map((s) => [s.api_key_id, s]))
 }
 
 /** 弹窗状态机：关闭 → 填表 → 展示明文。 */
 const dialog = ref<'closed' | 'form' | 'created'>('closed')
-const creating = ref(false)
-const createError = ref<string | null>(null)
+const saveKey = reactive(useAction('保存失败'))
 const plaintext = ref('')
 const copied = ref(false)
 const pendingDelete = ref<number | null>(null)
@@ -76,7 +75,7 @@ function openForm() {
     note: '',
     expiresAt: '',
   }
-  createError.value = null
+  saveKey.clear()
   dialog.value = 'form'
 }
 
@@ -94,7 +93,7 @@ function openEdit(key: ApiKey) {
     note: key.note ?? '',
     expiresAt: key.expires_at ? toLocalInput(key.expires_at) : '',
   }
-  createError.value = null
+  saveKey.clear()
   dialog.value = 'form'
 }
 
@@ -132,9 +131,6 @@ function splitList(raw: string): string[] {
 
 async function submit() {
   if (!draft.value.name.trim()) return
-  creating.value = true
-  createError.value = null
-
   const spec: NewApiKey = {
     name: draft.value.name.trim(),
     allowed_models: splitList(draft.value.models),
@@ -149,20 +145,16 @@ async function submit() {
     expires_at: draft.value.expiresAt ? new Date(draft.value.expiresAt).toISOString() : null,
   }
 
-  try {
+  await saveKey.run(async () => {
     if (editingId.value !== null) {
       await store.update(editingId.value, spec)
       closeDialog()
-    } else {
-      const created = await store.create(spec)
-      plaintext.value = created.plaintext
-      dialog.value = 'created'
+      return
     }
-  } catch (e) {
-    createError.value = toErrorMessage(e, '保存失败')
-  } finally {
-    creating.value = false
-  }
+    const created = await store.create(spec)
+    plaintext.value = created.plaintext
+    dialog.value = 'created'
+  })
 }
 
 const resettingId = ref<number | null>(null)
@@ -172,23 +164,20 @@ const deletingId = ref<number | null>(null)
 async function resetUsage(id: number) {
   if (resettingId.value !== null) return
   resettingId.value = id
-  await settle(store.resetUsage(id))
+  await orElse(() => store.resetUsage(id))
   resettingId.value = null
 }
 
 async function copyPlaintext() {
-  copied.value = (await settle(navigator.clipboard.writeText(plaintext.value))) !== undefined
+  copied.value = (await orElse(() => navigator.clipboard.writeText(plaintext.value))) !== undefined
 }
 
 async function destroy(id: number) {
   if (deletingId.value !== null) return
   deletingId.value = id
-  try {
-    await settle(store.remove(id))
-  } finally {
-    deletingId.value = null
-    pendingDelete.value = null
-  }
+  await orElse(() => store.remove(id))
+  deletingId.value = null
+  pendingDelete.value = null
 }
 
 function usagePercent(key: ApiKey): number {
@@ -580,16 +569,21 @@ function isExpired(key: ApiKey): boolean {
                 />
               </label>
 
-              <p v-if="createError" class="text-sm text-danger">{{ createError }}</p>
+              <p v-if="saveKey.error" class="text-sm text-danger">{{ saveKey.error }}</p>
 
               <div class="mt-1 flex items-center gap-3">
                 <button
                   type="submit"
                   class="glass-button-primary px-4 py-2.5 text-sm font-medium disabled:opacity-50"
-                  :disabled="creating || !draft.name.trim()"
+                  :disabled="saveKey.busy || !draft.name.trim()"
                 >
-                  <AppIcon v-if="creating" name="spinner" class="animate-spin mr-1" :size="14" />
-                  {{ creating ? '保存中…' : editingId !== null ? '保存' : '创建' }}
+                  <AppIcon
+                    v-if="saveKey.busy"
+                    name="spinner"
+                    class="animate-spin mr-1"
+                    :size="14"
+                  />
+                  {{ saveKey.busy ? '保存中…' : editingId !== null ? '保存' : '创建' }}
                 </button>
                 <button
                   type="button"

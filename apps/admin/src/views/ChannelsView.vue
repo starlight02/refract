@@ -6,14 +6,15 @@
  * 转换开关全部直接可见，而不是藏在编辑页里。new-api 的列表页只显示名字和
  * 状态，结果每次排查「为什么走了这个渠道」都要点进去看。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, toRef } from 'vue'
 import { useRouter } from 'vue-router'
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { useChannelsStore } from '@/stores/channels'
 import { channels as channelsApi, health as healthApi, settings } from '@/api/client'
-import { settle } from '@/utils/async'
+import { useAction } from '@/composables/useAction'
+import { isSuccess, orElse, settled } from '@/utils/effect'
 import { toErrorMessage } from '@/utils/error'
 import type {
   Channel,
@@ -28,8 +29,9 @@ const store = useChannelsStore()
 
 /** 「原生优先」是全局路由开关（需求 6），放在列表页顶部因为它影响整列的排序语义。 */
 const policy = ref<RoutingPolicy | null>(null)
-const policySaving = ref(false)
-const policyError = ref<string | null>(null)
+const savePolicy = useAction('保存路由策略失败')
+const policySaving = toRef(savePolicy, 'busy')
+const policyError = toRef(savePolicy, 'error')
 
 /** 每个渠道的测试结果，点了才有。 */
 const testResults = ref<Record<number, ChannelTestResult | 'pending'>>({})
@@ -65,13 +67,13 @@ const sorted = computed(() =>
 
 onMounted(async () => {
   await Promise.all([store.fetch(), refreshHealth()])
-  const loaded = await settle(settings.routingPolicy())
+  const loaded = await orElse(() => settings.routingPolicy())
   if (loaded) policy.value = loaded
 })
 
 /** 拉取全量端点健康快照。失败静默 —— 健康是辅助信息，不该挡住渠道列表。 */
 async function refreshHealth() {
-  healthItems.value = (await settle(healthApi.channels())) ?? []
+  healthItems.value = await orElse(() => healthApi.channels(), [])
 }
 
 /** 健康快照此刻是否处于熔断中（到期时刻在未来才算）。 */
@@ -104,26 +106,20 @@ function suspendRemaining(h: EndpointHealth): string {
 async function resetBreaker(h: EndpointHealth) {
   const key = `${h.channel_id}:${h.protocol}`
   resetting.value.add(key)
-  try {
-    await settle(healthApi.reset(h.channel_id, h.protocol))
-  } finally {
-    await refreshHealth()
-    resetting.value.delete(key)
-  }
+  await orElse(() => healthApi.reset(h.channel_id, h.protocol))
+  await refreshHealth()
+  resetting.value.delete(key)
 }
 
 async function setNativeFirst(nativeFirst: boolean) {
   if (!policy.value || policySaving.value) return
   const next: RoutingPolicy = { ...policy.value, native_first: nativeFirst }
-  policySaving.value = true
-  policyError.value = null
-  try {
-    policy.value = await settings.setRoutingPolicy(next)
-  } catch (e) {
-    policyError.value = toErrorMessage(e, '保存路由策略失败')
-  } finally {
-    policySaving.value = false
-  }
+  await savePolicy.run(
+    () => settings.setRoutingPolicy(next),
+    (saved) => {
+      policy.value = saved
+    },
+  )
 }
 
 /** 查询上游余额（仅 OpenAI 兼容渠道有意义）。 */
@@ -137,33 +133,28 @@ function canProbeBalance(ch: Channel): boolean {
 
 async function refreshBalance(ch: Channel) {
   balanceBusy.value[ch.id] = true
-  try {
-    const result = await channelsApi.balance(ch.id)
+  const outcome = await settled(() => channelsApi.balance(ch.id))
+  balanceBusy.value[ch.id] = false
+  if (isSuccess(outcome)) {
     const target = store.items.find((c) => c.id === ch.id)
     if (target) {
-      target.balance = result.balance
+      target.balance = outcome.success.balance
       target.balance_updated_at = new Date().toISOString()
     }
-  } catch (e) {
-    testResults.value[ch.id] = {
-      success: false,
-      message: toErrorMessage(e, '余额查询失败'),
-    }
-  } finally {
-    balanceBusy.value[ch.id] = false
+    return
+  }
+  testResults.value[ch.id] = {
+    success: false,
+    message: toErrorMessage(outcome.failure, '余额查询失败'),
   }
 }
 
 async function runTest(ch: Channel) {
   testResults.value[ch.id] = 'pending'
-  try {
-    testResults.value[ch.id] = await store.test(ch.id)
-  } catch (e) {
-    testResults.value[ch.id] = {
-      success: false,
-      message: toErrorMessage(e, '测试失败'),
-    }
-  }
+  const outcome = await settled(() => store.test(ch.id))
+  testResults.value[ch.id] = isSuccess(outcome)
+    ? outcome.success
+    : { success: false, message: toErrorMessage(outcome.failure, '测试失败') }
 }
 
 /** 一键全测：并发测所有启用中的渠道，各自的结果落在各自的卡片上。 */
@@ -173,11 +164,8 @@ async function runTestAll() {
   const targets = store.items.filter((ch) => ch.enabled)
   if (targets.length === 0 || testingAll.value) return
   testingAll.value = true
-  try {
-    await Promise.allSettled(targets.map((ch) => runTest(ch)))
-  } finally {
-    testingAll.value = false
-  }
+  await Promise.allSettled(targets.map((ch) => runTest(ch)))
+  testingAll.value = false
 }
 
 const deletingId = ref<number | null>(null)
@@ -186,24 +174,18 @@ const copyingId = ref<number | null>(null)
 async function confirmDelete(id: number) {
   if (deletingId.value !== null) return
   deletingId.value = id
-  try {
-    await settle(store.remove(id))
-    pendingDelete.value = null
-  } finally {
-    deletingId.value = null
-  }
+  await orElse(() => store.remove(id))
+  pendingDelete.value = null
+  deletingId.value = null
 }
 
 /** 复制渠道。副本禁用创建，直接跳进编辑页改名与调整。 */
 async function duplicateChannel(id: number) {
   if (copyingId.value !== null) return
   copyingId.value = id
-  try {
-    const copy = await settle(store.duplicate(id))
-    if (copy) router.push(`/channels/${copy.id}/edit`)
-  } finally {
-    copyingId.value = null
-  }
+  const copy = await orElse(() => store.duplicate(id))
+  if (copy) router.push(`/channels/${copy.id}/edit`)
+  copyingId.value = null
 }
 
 // ---------------------------------------------------------------------------
@@ -244,15 +226,12 @@ async function runBulk(action: 'enable' | 'disable' | 'delete') {
     return
   }
   bulkBusy.value = true
-  try {
-    const affected = await settle(store.bulk([...selected.value], action))
-    if (affected === undefined) return
-    selected.value = new Set()
-    bulkConfirmDelete.value = false
-    if (action === 'delete') selecting.value = false
-  } finally {
-    bulkBusy.value = false
-  }
+  const affected = await orElse(() => store.bulk([...selected.value], action))
+  bulkBusy.value = false
+  if (affected === undefined) return
+  selected.value = new Set()
+  bulkConfirmDelete.value = false
+  if (action === 'delete') selecting.value = false
 }
 
 /** 渠道的全部端点协议，用于列表里的徽章组。 */

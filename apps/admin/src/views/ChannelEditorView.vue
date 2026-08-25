@@ -7,9 +7,8 @@
  * 同一套端点编辑器，只是单协议时锁死数量为 1 并同步协议 —— 用户不会
  * 感到自己在填两种不同的表单。
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, toRef, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
-import { useToastStore } from '@/stores/toast'
 import {
   DialogClose,
   DialogContent,
@@ -32,7 +31,8 @@ import {
 import { useChannelsStore } from '@/stores/channels'
 import { channels as channelsApi } from '@/api/client'
 import { numOrNull, numOr } from '@/utils/num'
-import { toErrorMessage } from '@/utils/error'
+import { useAction } from '@/composables/useAction'
+import { parseJson } from '@/utils/effect'
 import type {
   Channel,
   ChannelEndpoint,
@@ -47,7 +47,6 @@ import type {
 const route = useRoute()
 const router = useRouter()
 const store = useChannelsStore()
-const toastStore = useToastStore()
 const pristineSnapshot = ref('')
 const isSubmitting = ref(false)
 
@@ -157,10 +156,14 @@ function blankChannel(): Channel {
 }
 
 const form = ref<Channel>(blankChannel())
-const loading = ref(false)
-const saving = ref(false)
-const destroying = ref(false)
-const saveError = ref<string | null>(null)
+const loadChannel = useAction('加载渠道失败')
+const saveChannel = useAction('保存失败', { toast: true })
+const destroyChannel = useAction('删除失败', { toast: true })
+const probeModels = useAction('探测上游模型列表失败，请检查 Base URL 和密钥是否正确')
+const loading = toRef(loadChannel, 'busy')
+const saving = toRef(saveChannel, 'busy')
+const destroying = toRef(destroyChannel, 'busy')
+const saveError = computed(() => loadChannel.error ?? saveChannel.error ?? destroyChannel.error)
 const showCredential = ref(false)
 /**
  * 端点级 UI 状态一律按协议名索引，而不是数组下标 ——
@@ -207,15 +210,12 @@ const headersText = ref('')
 const paramOverrideError = computed(() => {
   const text = paramOverrideText.value.trim()
   if (!text) return null
-  try {
-    const parsed: unknown = JSON.parse(text)
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return '必须是 JSON 对象'
-    }
-    return null
-  } catch (e) {
-    return `JSON 解析失败：${toErrorMessage(e, '无效 JSON')}`
+  const parsed = parseJson(text)
+  if (parsed === undefined) return 'JSON 解析失败：无效 JSON'
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return '必须是 JSON 对象'
   }
+  return null
 })
 
 /** 每行 `Name: Value`；空行忽略。 */
@@ -269,8 +269,7 @@ onMounted(async () => {
     pristineSnapshot.value = getSnapshot()
     return
   }
-  loading.value = true
-  try {
+  await loadChannel.run(async () => {
     const ch = await channelsApi.get(editingId.value as number)
     ch.empty_response_retry ??= { window_secs: null, max_retries: null }
     form.value = ch
@@ -291,11 +290,7 @@ onMounted(async () => {
       showAdvanced.value = true
     }
     savedProbeConfig.value = probeConfigOf(ch, allCreds)
-  } catch (e) {
-    saveError.value = toErrorMessage(e, '加载渠道失败')
-  } finally {
-    loading.value = false
-  }
+  })
 })
 
 onBeforeUnmount(() => {
@@ -496,33 +491,29 @@ async function openProbeDialog(ep: ChannelEndpoint) {
     filterQuery: '',
   }
 
-  try {
+  const result = await probeModels.run(async () => {
     const effectiveAddress =
       ep.address.unofficial || ep.address.full_address || !!ep.address.base_url
         ? ep.address
         : form.value.address
     const effectiveCredential =
       ep.credential ?? (credentialsText.value.split('\n')[0]?.trim() || '')
-
-    const res = await store.probeDirect({
+    return store.probeDirect({
       protocol: ep.protocol,
       address: effectiveAddress,
       credential: effectiveCredential,
       proxy: form.value.proxy || null,
     })
-
-    probeDialog.value.models = res.models
-    probeDialog.value.loading = false
-    const all = new Set(ep.models.map((m) => m.name))
-    for (const m of res.models) all.add(m.id)
-    probeDialog.value.selected = all
-  } catch (e) {
-    probeDialog.value.loading = false
-    probeDialog.value.error = toErrorMessage(
-      e,
-      '探测上游模型列表失败，请检查 Base URL 和密钥是否正确',
-    )
+  })
+  probeDialog.value.loading = false
+  if (result === undefined) {
+    probeDialog.value.error = probeModels.error
+    return
   }
+  probeDialog.value.models = result.models
+  const all = new Set(ep.models.map((m) => m.name))
+  for (const m of result.models) all.add(m.id)
+  probeDialog.value.selected = all
 }
 
 function toggleProbeSelected(id: string) {
@@ -624,67 +615,64 @@ const canSave = computed(
 async function save() {
   if (!canSave.value) return
   isSubmitting.value = true
-  saving.value = true
-  saveError.value = null
+  loadChannel.clear()
+  destroyChannel.clear()
 
-  const parsedHeaders = parseHeaders(headersText.value)
-  const payload: Channel = {
-    ...form.value,
-    // 数字输入清空时 v-model.number 留下空串，serde 拒收；归一回默认值。
-    priority: numOr(form.value.priority, 0),
-    weight: numOr(form.value.weight, 1),
-    timeout_secs: numOr(form.value.timeout_secs, 0),
-    endpoints: form.value.endpoints.map((ep) => ({ ...ep, order: numOr(ep.order, 0) })),
-    // 可空数字清空即「继承全局」，与价表 cached_input 的空语义一致。
-    empty_response_retry: {
-      window_secs: numOrNull(form.value.empty_response_retry.window_secs),
-      max_retries: numOrNull(form.value.empty_response_retry.max_retries),
+  const saved = await saveChannel.run(
+    async () => {
+      const parsedHeaders = parseHeaders(headersText.value)
+      const payload: Channel = {
+        ...form.value,
+        // 数字输入清空时 v-model.number 留下空串，serde 拒收；归一回默认值。
+        priority: numOr(form.value.priority, 0),
+        weight: numOr(form.value.weight, 1),
+        timeout_secs: numOr(form.value.timeout_secs, 0),
+        endpoints: form.value.endpoints.map((ep) => ({ ...ep, order: numOr(ep.order, 0) })),
+        // 可空数字清空即「继承全局」，与价表 cached_input 的空语义一致。
+        empty_response_retry: {
+          window_secs: numOrNull(form.value.empty_response_retry.window_secs),
+          max_retries: numOrNull(form.value.empty_response_retry.max_retries),
+        },
+        tags: tagsText.value
+          .split(',')
+          .map((t) => t.trim())
+          .filter(Boolean),
+        // 密钥池：一行一把，空行忽略；掩码行由后端按值还原成真实密钥。
+        credential: '',
+        credentials: poolCredentials(),
+        param_override: paramOverrideText.value.trim()
+          ? (JSON.parse(paramOverrideText.value) as Record<string, unknown>)
+          : null,
+        extra_headers: typeof parsedHeaders === 'string' ? [] : parsedHeaders,
+        proxy: form.value.proxy?.trim() || null,
+        note: form.value.note?.trim() || null,
+        test_model: form.value.test_model?.trim() || null,
+      }
+
+      if (isEdit.value) await store.update(payload)
+      else await store.create(payload)
     },
-    tags: tagsText.value
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean),
-    // 密钥池：一行一把，空行忽略；掩码行由后端按值还原成真实密钥。
-    credential: '',
-    credentials: poolCredentials(),
-    param_override: paramOverrideText.value.trim()
-      ? (JSON.parse(paramOverrideText.value) as Record<string, unknown>)
-      : null,
-    extra_headers: typeof parsedHeaders === 'string' ? [] : parsedHeaders,
-    proxy: form.value.proxy?.trim() || null,
-    note: form.value.note?.trim() || null,
-    test_model: form.value.test_model?.trim() || null,
-  }
-
-  try {
-    if (isEdit.value) await store.update(payload)
-    else await store.create(payload)
-    toastStore.success('渠道已保存')
-    router.push('/channels')
-  } catch (e) {
-    saveError.value = toErrorMessage(e, '保存失败')
-    toastStore.danger(saveError.value)
-    isSubmitting.value = false
-  } finally {
-    saving.value = false
-  }
+    () => {
+      router.push('/channels')
+      return '渠道已保存'
+    },
+  )
+  if (saved === undefined) isSubmitting.value = false
 }
 
 async function destroy() {
   if (!isEdit.value || destroying.value) return
   isSubmitting.value = true
-  destroying.value = true
-  try {
-    await store.remove(editingId.value as number)
-    toastStore.success('渠道已删除')
-    router.push('/channels')
-  } catch (e) {
-    saveError.value = toErrorMessage(e, '删除失败')
-    toastStore.danger(saveError.value)
-    isSubmitting.value = false
-  } finally {
-    destroying.value = false
-  }
+  loadChannel.clear()
+  saveChannel.clear()
+  const removed = await destroyChannel.run(
+    () => store.remove(editingId.value as number),
+    () => {
+      router.push('/channels')
+      return '渠道已删除'
+    },
+  )
+  if (removed === undefined) isSubmitting.value = false
 }
 
 /**

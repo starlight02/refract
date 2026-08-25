@@ -6,11 +6,11 @@
  * 日志），与真实客户端唯一的区别是鉴权面 —— 不需要先建一把网关密钥
  * 就能验证渠道配置。
  */
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, toRef } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { models as modelsApi, playground } from '@/api/client'
-import { settle, tryParseJson } from '@/utils/async'
-import { toErrorMessage } from '@/utils/error'
+import { useAction } from '@/composables/useAction'
+import { orElse, parseJson } from '@/utils/effect'
 
 interface ChatTurn {
   role: 'user' | 'assistant'
@@ -24,13 +24,12 @@ const model = ref('')
 const system = ref('')
 const draft = ref('')
 const turns = ref<ChatTurn[]>([])
-const busy = ref(false)
+const chat = useAction('请求失败')
+const busy = toRef(chat, 'busy')
 const scroller = ref<HTMLElement | null>(null)
 
-let controller: AbortController | null = null
-
 onMounted(async () => {
-  modelList.value = (await settle(modelsApi.list())) ?? []
+  modelList.value = await orElse(() => modelsApi.list(), [])
   if (!model.value && modelList.value.length > 0) model.value = modelList.value[0]!
 })
 
@@ -50,7 +49,7 @@ function consumeSse(buffer: string, onDelta: (text: string) => void): string {
       if (!line.startsWith('data:')) continue
       const payload = line.slice(5).trim()
       if (payload === '' || payload === '[DONE]') continue
-      const parsed = tryParseJson<{
+      const parsed = parseJson<{
         choices?: { delta?: { content?: string | null } }[]
       }>(payload)
       const delta = parsed?.choices?.[0]?.delta?.content
@@ -69,7 +68,6 @@ async function send() {
   // 触发依赖更新，Vapor 的细粒度渲染下气泡会永远停在空状态。
   turns.value.push({ role: 'assistant', content: '' })
   const reply = turns.value[turns.value.length - 1]!
-  busy.value = true
   await scrollToEnd()
 
   const messages: { role: string; content: string }[] = []
@@ -80,16 +78,18 @@ async function send() {
     messages.push({ role: turn.role, content: turn.content })
   }
 
-  controller = new AbortController()
-  try {
-    const response = await playground.chat({
-      model: model.value,
-      messages,
-      stream: true,
-    })
+  await chat.run(async (signal) => {
+    const response = await playground.chat(
+      {
+        model: model.value,
+        messages,
+        stream: true,
+      },
+      signal,
+    )
     if (!response.ok) {
       const text = await response.text()
-      const parsed = tryParseJson<{ message?: string; error?: { message?: string } }>(text)
+      const parsed = parseJson<{ message?: string; error?: { message?: string } }>(text)
       reply.error =
         parsed?.error?.message ||
         parsed?.message ||
@@ -114,19 +114,14 @@ async function send() {
       })
       await scrollToEnd()
     }
-  } catch (e) {
-    if (!(e instanceof DOMException && e.name === 'AbortError')) {
-      reply.error = toErrorMessage(e, '请求失败')
-    }
-  } finally {
-    busy.value = false
-    controller = null
-    await scrollToEnd()
-  }
+  })
+  // 取消是静默的（notice 仍为 null）；真正的失败才写到气泡上。
+  if (chat.error) reply.error = chat.error
+  await scrollToEnd()
 }
 
 function stop() {
-  controller?.abort()
+  chat.cancel()
 }
 
 function clear() {

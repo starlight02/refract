@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, toRef } from 'vue'
 import { RouterLink, RouterView } from 'vue-router'
 import {
   DialogContent,
@@ -12,8 +12,8 @@ import {
 import { AUTH_REQUIRED_EVENT, BACKEND_DOWN_EVENT, BACKEND_RESTORED_EVENT, auth } from '@/api/client'
 import AppIcon from '@/components/AppIcon.vue'
 import GlassToastContainer from '@/components/GlassToastContainer.vue'
-import { settle } from '@/utils/async'
-import { toErrorMessage } from '@/utils/error'
+import { useAction } from '@/composables/useAction'
+import { orElse } from '@/utils/effect'
 import { initLiquidGlass } from '@/utils/liquidGlass'
 
 /** 深色模式偏好的存储键。 */
@@ -41,7 +41,7 @@ onMounted(async () => {
     (saved === null && window.matchMedia('(prefers-color-scheme: dark)').matches)
   applyTheme(dark)
 
-  const sess = await settle(auth.session())
+  const sess = await orElse(() => auth.session())
   if (sess?.configured && !sess.authenticated) {
     tokenDialogOpen.value = true
   }
@@ -58,13 +58,14 @@ onMounted(async () => {
 const tokenDialogOpen = ref(false)
 const tokenDraft = ref('')
 const showToken = ref(false)
-const tokenBusy = ref(false)
-const tokenError = ref<string | null>(null)
+const login = useAction('登录失败，请检查管理令牌')
+const tokenBusy = toRef(login, 'busy')
+const tokenError = toRef(login, 'error')
 
 function onAuthRequired() {
   if (!tokenDialogOpen.value) {
     tokenDraft.value = ''
-    tokenError.value = null
+    login.clear()
     tokenDialogOpen.value = true
   }
 }
@@ -72,18 +73,14 @@ function onAuthRequired() {
 async function saveTokenAndReload() {
   const token = tokenDraft.value.trim()
   if (!token || tokenBusy.value) return
-  tokenBusy.value = true
-  tokenError.value = null
-  try {
-    await auth.login(token)
-    tokenDraft.value = ''
-    tokenDialogOpen.value = false
-    window.location.reload()
-  } catch (e) {
-    tokenError.value = toErrorMessage(e, '登录失败，请检查管理令牌')
-  } finally {
-    tokenBusy.value = false
-  }
+  await login.run(
+    () => auth.login(token),
+    () => {
+      tokenDraft.value = ''
+      tokenDialogOpen.value = false
+      window.location.reload()
+    },
+  )
 }
 
 onMounted(() => window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired))

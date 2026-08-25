@@ -4,6 +4,9 @@ packages:
 
 allowBuilds:
   lefthook: true
+  # Effect v4 经 msgpackr 传递引入。它只是 Node 侧的原生加速件，
+  # 浏览器构建 tree-shake 后根本不引用 —— 不为它编译原生模块。
+  msgpackr-extract: false
   vue-demi: true
 
 managePackageManagerVersions: false
@@ -48,3 +51,4 @@ minimumReleaseAgeExclude:
   - '@vue/server-renderer@3.6.0-rc.3'
   - '@vue/shared@3.6.0-rc.3'
   - vue@3.6.0-rc.3
+  - effect@4.0.0-rc.112

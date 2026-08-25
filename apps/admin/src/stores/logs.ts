@@ -2,6 +2,7 @@ import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import { logs } from '@/api/client'
 import type { RequestLog, LogFilter } from '@refract/contracts'
+import { isSuccess, settled } from '@/utils/effect'
 import { toErrorMessage, withStoreError } from './shared'
 
 /** 日志页默认一次取 100 条：再多滚动会卡，再少又不够一屏扫读。 */
@@ -30,16 +31,13 @@ export const useLogsStore = defineStore('logs', () => {
     const seq = ++fetchSeq
     loading.value = true
     error.value = null
-    try {
-      const rows = await logs.query(filter.value)
-      if (seq !== fetchSeq) return
-      items.value = rows
-    } catch (e) {
-      if (seq !== fetchSeq) return
-      error.value = toErrorMessage(e)
-    } finally {
-      if (seq === fetchSeq) loading.value = false
-    }
+    const outcome = await settled(() => logs.query(filter.value))
+    // 陈旧响应直接丢弃：连点筛选时，先发慢回的旧结果既不该覆盖列表，
+    // 也不该把已经过期的失败写成当前错误。
+    if (seq !== fetchSeq) return
+    loading.value = false
+    if (isSuccess(outcome)) items.value = outcome.success
+    else error.value = toErrorMessage(outcome.failure)
   }
 
   /** 清理 N 天前的日志，返回删除条数，并按当前条件刷新列表。 */

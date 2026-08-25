@@ -8,6 +8,7 @@ import type {
   ChannelTestResult,
   UpstreamAddress,
 } from '@refract/contracts'
+import { isSuccess, settled } from '@/utils/effect'
 import { toErrorMessage, withLoading, withStoreError } from './shared'
 
 /**
@@ -59,13 +60,13 @@ export const useChannelsStore = defineStore('channels', () => {
     const i = items.value.findIndex((ch) => ch.id === id)
     const previous = i !== -1 ? items.value[i]!.enabled : null
     if (i !== -1) items.value[i]!.enabled = enabled
-    try {
-      const res = await channels.setEnabled(id, enabled)
-      if (i !== -1) items.value[i]!.enabled = res.enabled
-    } catch (e) {
-      if (i !== -1 && previous !== null) items.value[i]!.enabled = previous
-      error.value = toErrorMessage(e)
+    const outcome = await settled(() => channels.setEnabled(id, enabled))
+    if (isSuccess(outcome)) {
+      if (i !== -1) items.value[i]!.enabled = outcome.success.enabled
+      return
     }
+    if (i !== -1 && previous !== null) items.value[i]!.enabled = previous
+    error.value = toErrorMessage(outcome.failure)
   }
 
   /** 探测上游真实模型列表。返回结果让调用方决定是否一键同步。 */

@@ -2,6 +2,7 @@ import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import { keys } from '@/api/client'
 import type { ApiKey, NewApiKey, CreatedApiKey } from '@refract/contracts'
+import { isSuccess, settled } from '@/utils/effect'
 import { toErrorMessage, withLoading, withStoreError } from './shared'
 
 /**
@@ -55,13 +56,13 @@ export const useKeysStore = defineStore('keys', () => {
     const i = items.value.findIndex((k) => k.id === id)
     const previous = i !== -1 ? items.value[i]!.enabled : null
     if (i !== -1) items.value[i]!.enabled = enabled
-    try {
-      const res = await keys.setEnabled(id, enabled)
-      if (i !== -1) items.value[i]!.enabled = res.enabled
-    } catch (e) {
-      if (i !== -1 && previous !== null) items.value[i]!.enabled = previous
-      error.value = toErrorMessage(e)
+    const outcome = await settled(() => keys.setEnabled(id, enabled))
+    if (isSuccess(outcome)) {
+      if (i !== -1) items.value[i]!.enabled = outcome.success.enabled
+      return
     }
+    if (i !== -1 && previous !== null) items.value[i]!.enabled = previous
+    error.value = toErrorMessage(outcome.failure)
   }
 
   return { items, loading, error, fetch, create, update, resetUsage, remove, toggleEnabled }

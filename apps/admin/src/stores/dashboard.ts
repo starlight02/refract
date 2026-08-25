@@ -2,6 +2,7 @@ import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
 import { logs } from '@/api/client'
 import type { ChannelStat, ModelStat, StatsSummary, TimeBucket } from '@refract/contracts'
+import { isSuccess, settled } from '@/utils/effect'
 import { toErrorMessage } from './shared'
 
 /**
@@ -46,14 +47,11 @@ export const useDashboardStore = defineStore('dashboard', () => {
     const token = ++seq.n
     inflight.value += 1
     error.value = null
-    try {
-      const data = await task()
-      if (token === seq.n) apply(data)
-    } catch (e) {
-      if (token === seq.n) error.value = toErrorMessage(e)
-    } finally {
-      inflight.value -= 1
-    }
+    const outcome = await settled(task)
+    inflight.value -= 1
+    if (token !== seq.n) return
+    if (isSuccess(outcome)) apply(outcome.success)
+    else error.value = toErrorMessage(outcome.failure)
   }
 
   async function fetchSummary(windowHours?: number) {

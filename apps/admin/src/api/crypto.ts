@@ -1,12 +1,5 @@
-/**
- * 传输层端到端加密 (Web Crypto ECDH P-256 + AES-256-GCM)。
- *
- * 在浏览器沙箱内利用原生 Web Cryptography API：
- * 1. 从 `/api/crypto/public-key` 获取并缓存服务端的 P-256 公钥。
- * 2. 对每个发往后端的写操作（POST / PUT），生成一次性临时密钥对 (Ephemeral Keypair)。
- * 3. 协商 256 位共享密钥并采用 AES-256-GCM 加密完整 JSON Payload。
- * 4. 传输过程中网线上只有高熵密文与临时公钥，即使局域网抓包也无法嗅探明文 API 密钥。
- */
+import { squash } from 'effect/Cause'
+import { catchCause, ensuring, fail, gen, promise, runPromise, succeed, sync } from 'effect/Effect'
 
 interface PublicKeyResponse {
   algorithm: string
@@ -52,28 +45,36 @@ export async function getServerPublicKey(): Promise<CryptoKey> {
   if (cachedServerPublicKey) return cachedServerPublicKey
   if (pendingFetch) return pendingFetch
 
-  pendingFetch = (async () => {
-    try {
-      const res = await fetch('/api/crypto/public-key')
+  // ensuring 取代 finally：无论成功、失败还是中断，都要把在飞标记清掉，
+  // 否则一次失败会把后续所有调用永久钉在这个已拒绝的 promise 上。
+  pendingFetch = runPromise(
+    gen(function* () {
+      const res = yield* promise(() => fetch('/api/crypto/public-key'))
       if (!res.ok) {
-        throw new Error(`Failed to fetch server public key: HTTP ${res.status}`)
+        return yield* fail(new Error(`Failed to fetch server public key: HTTP ${res.status}`))
       }
-      const json = (await res.json()) as { data: PublicKeyResponse }
+      const json = yield* promise(() => res.json() as Promise<{ data: PublicKeyResponse }>)
       const rawBytes = base64ToUint8Array(json.data.public_key_raw)
 
-      const cryptoKey = await window.crypto.subtle.importKey(
-        'raw',
-        rawBytes.buffer as ArrayBuffer,
-        { name: 'ECDH', namedCurve: 'P-256' },
-        true,
-        [] as KeyUsage[],
+      const cryptoKey = yield* promise(() =>
+        window.crypto.subtle.importKey(
+          'raw',
+          rawBytes.buffer as ArrayBuffer,
+          { name: 'ECDH', namedCurve: 'P-256' },
+          true,
+          [] as KeyUsage[],
+        ),
       )
       cachedServerPublicKey = cryptoKey
       return cryptoKey
-    } finally {
-      pendingFetch = null
-    }
-  })()
+    }).pipe(
+      ensuring(
+        sync(() => {
+          pendingFetch = null
+        }),
+      ),
+    ),
+  )
 
   return pendingFetch
 }
@@ -82,63 +83,69 @@ export async function getServerPublicKey(): Promise<CryptoKey> {
  * 加密 JSON 载荷为 EncryptedEnvelope。
  * 若环境不支持 Web Crypto 或公钥拉取失败，返回原载荷（后端兼容）。
  */
-export async function encryptPayload(payload: unknown): Promise<unknown> {
+export function encryptPayload(payload: unknown): Promise<unknown> {
   if (!window.crypto?.subtle || payload === undefined || payload === null) {
-    return payload
+    return Promise.resolve(payload)
   }
 
-  try {
-    const serverPubKey = await getServerPublicKey()
+  const sealed = gen(function* () {
+    const serverPubKey = yield* promise(() => getServerPublicKey())
 
     // 1. 生成客户端一次性 Ephemeral 密钥对
-    const clientKeyPair = await window.crypto.subtle.generateKey(
-      { name: 'ECDH', namedCurve: 'P-256' },
-      true,
-      ['deriveBits'],
+    const clientKeyPair = yield* promise(() =>
+      window.crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']),
     )
 
     // 2. 导出客户端临时公钥 (Raw 65 字节)
-    const clientPubRaw = await window.crypto.subtle.exportKey('raw', clientKeyPair.publicKey)
-    const ephemeralPubB64 = arrayBufferToBase64(clientPubRaw)
+    const clientPubRaw = yield* promise(() =>
+      window.crypto.subtle.exportKey('raw', clientKeyPair.publicKey),
+    )
 
     // 3. ECDH 协商 256 位共享密钥 (Z)
-    const sharedBits = await window.crypto.subtle.deriveBits(
-      { name: 'ECDH', public: serverPubKey },
-      clientKeyPair.privateKey,
-      256,
+    const sharedBits = yield* promise(() =>
+      window.crypto.subtle.deriveBits(
+        { name: 'ECDH', public: serverPubKey },
+        clientKeyPair.privateKey,
+        256,
+      ),
     )
 
     // 4. 将共享密钥作为 AES-GCM-256 密钥导入
-    const aesKey = await window.crypto.subtle.importKey(
-      'raw',
-      sharedBits,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt'] as KeyUsage[],
+    const aesKey = yield* promise(() =>
+      window.crypto.subtle.importKey('raw', sharedBits, { name: 'AES-GCM', length: 256 }, false, [
+        'encrypt',
+      ] as KeyUsage[]),
     )
 
     // 5. 生成 12 字节随机 IV
     const iv = window.crypto.getRandomValues(new Uint8Array(12))
 
     // 6. AES-GCM 加密 JSON 字符串
-    const jsonString = JSON.stringify(payload)
-    const encodedPlaintext = new TextEncoder().encode(jsonString)
-    const ciphertextBuffer = await window.crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
-      aesKey,
-      encodedPlaintext,
+    const ciphertextBuffer = yield* promise(() =>
+      window.crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        aesKey,
+        new TextEncoder().encode(JSON.stringify(payload)),
+      ),
     )
 
-    const envelope: EncryptedEnvelope = {
+    return {
       __encrypted: true,
-      ephemeral_pub: ephemeralPubB64,
+      ephemeral_pub: arrayBufferToBase64(clientPubRaw),
       iv: arrayBufferToBase64(iv),
       ciphertext: arrayBufferToBase64(ciphertextBuffer),
-    }
+    } satisfies EncryptedEnvelope
+  })
 
-    return envelope
-  } catch (e) {
-    console.warn('[Refract] Web Crypto E2E encryption fallback to plaintext:', e)
-    return payload
-  }
+  // 任何一步失败都退回明文：后端两种都收，加密是增强而非前提。
+  // catchCause 而不是 catch —— Web Crypto 抛出的是缺陷（defect）而非类型化错误，
+  // 只有连缺陷一起接住才能真正保证降级。
+  return runPromise(
+    sealed.pipe(
+      catchCause((cause) => {
+        console.warn('[Refract] Web Crypto E2E encryption fallback to plaintext:', squash(cause))
+        return succeed(payload)
+      }),
+    ),
+  )
 }
