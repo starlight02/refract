@@ -15,12 +15,12 @@
     "format": "vp fmt"
   },
   "dependencies": {
-    "@lucide/vue": "^1.31.0",
+    "@lucide/vue": "^1.33.0",
     "@refract/contracts": "workspace:*",
     "effect": "4.0.0-rc.112",
     "pinia": "^4.0.3",
     "reka-ui": "^2.10.3",
-    "vue": "~3.6.0-rc.3",
+    "vue": "~3.6.0-rc.5",
     "vue-router": "^5.2.0"
   },
   "devDependencies": {
@@ -37,7 +37,7 @@
     "vite": "catalog:",
     "vite-plugin-compression2": "^2.5.3",
     "vite-plus": "catalog:",
-    "vue-tsc": "^3.3.9"
+    "vue-tsc": "^3.3.11"
   },
   "devEngines": {
     "packageManager": {
