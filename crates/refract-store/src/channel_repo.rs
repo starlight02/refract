@@ -83,20 +83,19 @@ impl ChannelRepo {
     }
 
     /// 写入前加密:无主密钥或已是密文时原样返回(防二次加密)。
-    fn seal(&self, value: &str) -> String {
+    ///
+    /// 加密失败是硬错误 —— 绝不允许凭据以明文落库:一旦明文写进库,
+    /// 会随备份、`VACUUM`、导出等路径扩散,事后再想收回来代价极高。
+    /// 配置了主密钥却加密失败说明运行环境有问题,应当立刻暴露给调用方。
+    fn seal(&self, value: &str) -> Result<String, StoreError> {
         match self.master_key {
             Some(key) if !crate::crypto::is_encrypted(value) => {
-                match crate::crypto::encrypt_credential(value, &key) {
-                    Ok(sealed) => sealed,
-                    Err(error) => {
-                        // 加密失败不阻断写入:落明文好过丢配置,且错误会
-                        // 在日志里留痕,运维可以事后补加密。
-                        tracing::error!(%error, "credential encryption failed, storing plaintext");
-                        value.to_owned()
-                    }
-                }
+                crate::crypto::encrypt_credential(value, &key).map_err(|error| {
+                    tracing::error!(%error, "credential encryption failed, refusing to store plaintext");
+                    StoreError::Encryption(error.to_string())
+                })
             }
-            _ => value.to_owned(),
+            _ => Ok(value.to_owned()),
         }
     }
 
@@ -116,15 +115,18 @@ impl ChannelRepo {
         }
     }
 
-    /// 池写入:逐条加密后序列化;空池仍为 NULL。
-    fn seal_pool(&self, credentials: &[Credential]) -> Option<String> {
-        (!credentials.is_empty()).then(|| {
-            let sealed: Vec<Credential> = credentials
-                .iter()
-                .map(|c| Credential::new(self.seal(c.expose())))
-                .collect();
-            serde_json::to_string(&sealed).expect("credentials serialize")
-        })
+    /// 池写入:逐条加密后序列化;空池仍为 NULL。加密失败时整体中止。
+    fn seal_pool(&self, credentials: &[Credential]) -> Result<Option<String>, StoreError> {
+        if credentials.is_empty() {
+            return Ok(None);
+        }
+        let mut sealed = Vec::with_capacity(credentials.len());
+        for c in credentials {
+            sealed.push(Credential::new(self.seal(c.expose())?));
+        }
+        Ok(Some(
+            serde_json::to_string(&sealed).expect("credentials serialize"),
+        ))
     }
 
     /// 池读出:反序列化后逐条解密。
@@ -190,6 +192,9 @@ impl ChannelRepo {
         tx: &mut sqlx::SqliteConnection,
         channel: &Channel,
     ) -> Result<i64, StoreError> {
+        // 加密可能失败并中止写入，必须在构建 bind 链之前完成。
+        let sealed_credential = self.seal(channel.credential.expose())?;
+        let sealed_pool = self.seal_pool(&channel.credentials)?;
         let id: i64 = sqlx::query(
             "INSERT INTO channels \
              (owner_id, name, kind, enabled, priority, weight, credential, credentials, \
@@ -203,8 +208,8 @@ impl ChannelRepo {
         .bind(channel.enabled)
         .bind(i64::from(channel.priority))
         .bind(i64::from(channel.weight))
-        .bind(self.seal(channel.credential.expose()))
-        .bind(self.seal_pool(&channel.credentials))
+        .bind(sealed_credential)
+        .bind(sealed_pool)
         .bind(channel.key_strategy.as_str())
         .bind(serde_json::to_string(&channel.address).expect("address serializes"))
         .bind(serde_json::to_string(&channel.tags).expect("tags serialize"))
@@ -319,6 +324,8 @@ impl ChannelRepo {
             .validate()
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
 
+        let sealed_credential = self.seal(channel.credential.expose())?;
+        let sealed_pool = self.seal_pool(&channel.credentials)?;
         let mut tx = self.db.pool().begin().await?;
         let affected = sqlx::query(
             "UPDATE channels SET name = ?, kind = ?, enabled = ?, priority = ?, weight = ?, \
@@ -333,8 +340,8 @@ impl ChannelRepo {
         .bind(channel.enabled)
         .bind(i64::from(channel.priority))
         .bind(i64::from(channel.weight))
-        .bind(self.seal(channel.credential.expose()))
-        .bind(self.seal_pool(&channel.credentials))
+        .bind(sealed_credential)
+        .bind(sealed_pool)
         .bind(channel.key_strategy.as_str())
         .bind(serde_json::to_string(&channel.address).expect("address serializes"))
         .bind(serde_json::to_string(&channel.tags).expect("tags serialize"))
@@ -521,6 +528,11 @@ impl ChannelRepo {
         channel_id: i64,
         ep: &ChannelEndpoint,
     ) -> Result<(), StoreError> {
+        let sealed_credential = ep
+            .credential
+            .as_ref()
+            .map(|c| self.seal(c.expose()))
+            .transpose()?;
         sqlx::query(
             "INSERT INTO channel_endpoints \
              (channel_id, protocol, sort_order, enabled, address, credential, models, transcode) \
@@ -531,7 +543,7 @@ impl ChannelRepo {
         .bind(i64::from(ep.order))
         .bind(ep.enabled)
         .bind(serde_json::to_string(&ep.address).expect("address serializes"))
-        .bind(ep.credential.as_ref().map(|c| self.seal(c.expose())))
+        .bind(sealed_credential)
         .bind(serde_json::to_string(&ep.models).expect("models serialize"))
         .bind(serde_json::to_string(&ep.transcode).expect("transcode serializes"))
         .execute(&mut *tx)
@@ -626,7 +638,7 @@ impl ChannelRepo {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use refract_core::{DEFAULT_OWNER_ID, EmptyResponseRetryOverride, ProtocolSet};
+    use refract_core::{DEFAULT_OWNER_ID, EmptyResponseRetryOverride, ParamOverride, ProtocolSet};
 
     async fn repo() -> ChannelRepo {
         ChannelRepo::new(Database::open_in_memory().await.unwrap())
@@ -986,7 +998,12 @@ mod tests {
             version_prefix: None,
             path: None,
         };
-        ch.param_override = Some(serde_json::json!({"temperature": 0.2}));
+        ch.param_override = Some(
+            serde_json::from_value::<ParamOverride>(
+                serde_json::json!({"common": {"temperature": 0.2}}),
+            )
+            .unwrap(),
+        );
         let created = repo.create(&ch).await.unwrap();
         let fetched = repo.get(DEFAULT_OWNER_ID, created.id).await.unwrap();
 
@@ -996,8 +1013,28 @@ mod tests {
             Some("https://odd.example.com/inference")
         );
         assert_eq!(
-            fetched.param_override.unwrap()["temperature"],
+            fetched.param_override.unwrap().common["temperature"],
             serde_json::json!(0.2)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_flat_param_override_loads_as_common() {
+        let repo = repo().await;
+        let created = repo.create(&sample_single()).await.unwrap();
+        sqlx::query("UPDATE channels SET param_override = ? WHERE id = ?")
+            .bind(r#"{"temperature":0.2,"chat":{"top_p":0.9}}"#)
+            .bind(created.id)
+            .execute(repo.db.pool())
+            .await
+            .unwrap();
+
+        let fetched = repo.get(DEFAULT_OWNER_ID, created.id).await.unwrap();
+        let override_ = fetched.param_override.expect("legacy row must load");
+        assert_eq!(override_.common["temperature"], serde_json::json!(0.2));
+        assert_eq!(
+            override_.protocols[&refract_core::Protocol::Chat]["top_p"],
+            serde_json::json!(0.9)
         );
     }
 

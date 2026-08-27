@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use refract_core::{
     Channel, ChannelEndpoint, ChannelKind, Credential, EmptyResponseRetryOverride,
-    EmptyResponseRetryPolicy, ErrorKind, KeyStrategy, ModelEntry, Protocol, ProtocolSet,
-    RoutingPolicy, TranscodePolicy, UpstreamAddress,
+    EmptyResponseRetryPolicy, ErrorKind, KeyStrategy, ModelEntry, ParamOverride, Protocol,
+    ProtocolSet, RoutingPolicy, TranscodePolicy, UpstreamAddress,
 };
 use refract_protocol::codec::CodecSet;
 use refract_protocol::ir::{Message, Role, UnifiedRequest};
@@ -20,6 +20,11 @@ use refract_store::{BreakerPolicy, Database, HealthRepo};
 use serde_json::json;
 use wiremock::matchers::{header, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// 用显式结构构造参数覆盖。
+fn param_override(value: serde_json::Value) -> Option<ParamOverride> {
+    Some(serde_json::from_value(value).unwrap())
+}
 
 fn upstream_client() -> refract_upstream::UpstreamClient {
     refract_upstream::UpstreamClient::new(refract_upstream::UpstreamClientConfig {
@@ -943,7 +948,7 @@ async fn channel_param_override_is_applied_last() {
             ProtocolSet::EMPTY,
         )],
     );
-    ch.param_override = Some(json!({"temperature": 0.9}));
+    ch.param_override = param_override(json!({"common": {"temperature": 0.9}}));
     let channels = vec![ch];
     let health = seeded_health(&channels).await;
     let exec = RouteExecutor::new(
@@ -974,7 +979,7 @@ async fn native_alias_and_override_preserve_unknown_request_fields() {
     let mut ep = endpoint(Protocol::Chat, 0, &server.uri(), ProtocolSet::EMPTY);
     ep.models = vec![ModelEntry::mapped("gpt-4o", "internal-model-v3")];
     let mut ch = channel(1, "rewritten", 0, vec![ep]);
-    ch.param_override = Some(json!({"temperature": 0.9}));
+    ch.param_override = param_override(json!({"common": {"temperature": 0.9}}));
     let channels = vec![ch];
     let health = seeded_health(&channels).await;
     let exec = RouteExecutor::new(
@@ -1814,7 +1819,7 @@ async fn suspended_leaders_no_longer_eat_the_attempt_cap() {
 
 #[tokio::test]
 async fn param_override_protocol_groups_only_touch_their_own_endpoints() {
-    // Chat 端点：顶层键与 chat 分组都应展开；gemini 分组必须被跳过。
+    // Chat 端点：common 与 chat 分组都应展开；gemini 分组必须被跳过。
     let chat_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(chat_ok("ok"))
@@ -1833,10 +1838,12 @@ async fn param_override_protocol_groups_only_touch_their_own_endpoints() {
             ProtocolSet::EMPTY,
         )],
     );
-    chat_channel.param_override = Some(json!({
-        "temperature": 0.5,
-        "chat": {"top_p": 0.9},
-        "gemini": {"generationConfig": {"temperature": 0.0}},
+    chat_channel.param_override = param_override(json!({
+        "common": {"temperature": 0.5},
+        "protocols": {
+            "chat": {"top_p": 0.9},
+            "gemini": {"generationConfig": {"temperature": 0.0}},
+        },
     }));
 
     let channels = vec![chat_channel];
@@ -1860,7 +1867,7 @@ async fn param_override_protocol_groups_only_touch_their_own_endpoints() {
 
     let received = chat_server.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
-    assert_eq!(body["temperature"], json!(0.5), "顶层键对所有端点生效");
+    assert_eq!(body["temperature"], json!(0.5), "common 对所有端点生效");
     assert_eq!(body["top_p"], json!(0.9), "chat 分组在 Chat 端点展开");
     assert!(
         body.get("gemini").is_none() && body.get("chat").is_none(),
@@ -1895,7 +1902,7 @@ async fn param_override_for_other_protocols_keeps_native_bytes_untouched() {
             ProtocolSet::EMPTY,
         )],
     );
-    gemini_channel.param_override = Some(json!({"chat": {"top_p": 0.9}}));
+    gemini_channel.param_override = param_override(json!({"protocols": {"chat": {"top_p": 0.9}}}));
 
     let channels = vec![gemini_channel];
     let health = seeded_health(&channels).await;

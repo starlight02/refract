@@ -35,6 +35,9 @@ pub enum StoreError {
     /// 违反业务不变量。
     #[error("{0}")]
     Invalid(String),
+    /// 凭据静态加密失败。拒绝明文落库，写入中止。
+    #[error("credential encryption failed: {0}")]
+    Encryption(String),
 }
 
 impl StoreError {
@@ -124,8 +127,10 @@ impl Database {
     }
 
     async fn from_options(options: SqliteConnectOptions) -> Result<Self, StoreError> {
+        // WAL 只有一个写者。连接过多只会在 SQLITE_BUSY 上互相踩，
+        // 读多写少的网关 4 个连接已经够用。
         let pool = SqlitePoolOptions::new()
-            .max_connections(8)
+            .max_connections(4)
             .connect_with(options)
             .await?;
         MIGRATOR.run(&pool).await?;

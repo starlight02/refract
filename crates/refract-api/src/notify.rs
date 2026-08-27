@@ -8,6 +8,7 @@
 //!    出事不吭声等于失职。
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use refract_core::{ChannelId, ErrorKind, Protocol};
@@ -187,6 +188,22 @@ impl EventWorker {
     }
 }
 
+/// 进程内复用的 webhook 客户端。每次新建会丢掉连接池。
+static WEBHOOK_CLIENT: LazyLock<Option<reqwest::Client>> =
+    LazyLock::new(
+        || match reqwest::Client::builder().timeout(WEBHOOK_TIMEOUT).build() {
+            Ok(client) => Some(client),
+            Err(error) => {
+                tracing::warn!(%error, "failed to build webhook client");
+                None
+            }
+        },
+    );
+
+fn webhook_client() -> Option<&'static reqwest::Client> {
+    WEBHOOK_CLIENT.as_ref()
+}
+
 /// 发送单条 webhook。负载是通用 JSON —— 一个「自定义 HTTP」出口足以对接
 /// Telegram bot 网桥、Server 酱、飞书自定义机器人等，不内建 N 个平台适配器。
 pub async fn send_webhook(
@@ -205,12 +222,8 @@ pub async fn send_webhook(
         "detail": detail,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    let client = match reqwest::Client::builder().timeout(WEBHOOK_TIMEOUT).build() {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(%error, "failed to build webhook client");
-            return;
-        }
+    let Some(client) = webhook_client() else {
+        return;
     };
     let body_bytes = match serde_json::to_vec(&payload) {
         Ok(b) => b,

@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { AUTH_REQUIRED_EVENT, auth } from '@/api/client'
 import DashboardView from '../views/DashboardView.vue'
 
 const router = createRouter({
@@ -57,6 +58,22 @@ const router = createRouter({
       redirect: '/',
     },
   ],
+})
+
+/** 路由守卫与 App 壳层共享：首次导航可能早于弹窗监听挂载。 */
+export const authGate = { needsLogin: false }
+
+router.beforeEach(async () => {
+  try {
+    const sess = await auth.session()
+    authGate.needsLogin = Boolean(sess.configured && !sess.authenticated)
+    if (authGate.needsLogin) {
+      window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+    }
+  } catch {
+    // 网络错误不挡导航；后端不可达由 App 横幅处理。
+  }
+  return true
 })
 
 // 让路由组件按首字母大写命名，开箱即得正确的页面标题。

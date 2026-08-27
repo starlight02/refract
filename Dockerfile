@@ -54,7 +54,7 @@ ARG TARGETARCH
 # Alpine package revisions rotate out of stable indexes; pin the release branch instead.
 # hadolint ignore=DL3018
 RUN sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${ALPINE_MIRROR}|g" /etc/apk/repositories \
-    && apk add --no-cache ca-certificates curl tzdata \
+    && apk add --no-cache ca-certificates tzdata \
     && addgroup -g 10001 refract \
     && adduser -u 10001 -G refract -s /sbin/nologin -D refract \
     && install -d -o refract -g refract /data
@@ -71,5 +71,5 @@ ENV REFRACT_LISTEN=0.0.0.0:3939 \
 EXPOSE 3939
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:3939/health/ready"]
+    CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3939/health/ready"]
 ENTRYPOINT ["/usr/local/bin/refract-server"]

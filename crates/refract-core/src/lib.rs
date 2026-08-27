@@ -19,7 +19,7 @@ pub use affinity::{
 pub use channel::{
     Channel, ChannelEndpoint, ChannelError, ChannelId, ChannelKind, Credential,
     EmptyResponseRetryOverride, EmptyResponseRetryPolicy, KeyPool, KeyStrategy, ModelEntry,
-    TranscodePolicy,
+    ParamOverride, TranscodePolicy,
 };
 pub use error::{ErrorKind, GatewayError};
 pub use protocol::{AuthScheme, ParseProtocolError, Protocol, ProtocolSet};

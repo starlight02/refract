@@ -98,7 +98,7 @@ aes-gcm = "0.10"
 hex = "0.4"
 # 端到端传输加密：Web Crypto ECDH P-256 与 HKDF-SHA256
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic", "pkcs8", "alloc", "std"] }
-hkdf = "0.12"
+hkdf = "0.13"
 url = "2.5"
 figment = { version = "0.10", features = ["toml", "env"] }
 eventsource-stream = "0.2"

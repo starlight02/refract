@@ -8,21 +8,15 @@
  */
 import { computed, onMounted, ref, toRef } from 'vue'
 import { useRouter } from 'vue-router'
-import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
+import ChannelListCard from '@/components/channels/ChannelListCard.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import { useChannelsStore } from '@/stores/channels'
 import { channels as channelsApi, health as healthApi, settings } from '@/api/client'
 import { useAction } from '@/composables/useAction'
 import { isSuccess, orElse, settled } from '@/utils/effect'
 import { toErrorMessage } from '@/utils/error'
-import type {
-  Channel,
-  ChannelTestResult,
-  EndpointHealth,
-  Protocol,
-  RoutingPolicy,
-} from '@refract/contracts'
+import type { Channel, ChannelTestResult, EndpointHealth, RoutingPolicy } from '@refract/contracts'
 
 const router = useRouter()
 const store = useChannelsStore()
@@ -90,18 +84,6 @@ function suspendedEndpoints(ch: Channel): EndpointHealth[] {
     .filter((h): h is EndpointHealth => h !== undefined && isSuspended(h))
 }
 
-/** 距熔断到期还剩多久，口语化。 */
-function suspendRemaining(h: EndpointHealth): string {
-  if (!h.suspended_until) return ''
-  const ms = new Date(h.suspended_until).getTime() - Date.now()
-  if (ms <= 0) return '即将恢复'
-  const secs = Math.ceil(ms / 1000)
-  if (secs < 60) return `${secs} 秒后自动恢复`
-  const mins = Math.ceil(secs / 60)
-  if (mins < 60) return `${mins} 分钟后自动恢复`
-  return `${Math.ceil(mins / 60)} 小时后自动恢复`
-}
-
 /** 手动解除熔断，立刻让端点重新参与路由。 */
 async function resetBreaker(h: EndpointHealth) {
   const key = `${h.channel_id}:${h.protocol}`
@@ -124,12 +106,6 @@ async function setNativeFirst(nativeFirst: boolean) {
 
 /** 查询上游余额（仅 OpenAI 兼容渠道有意义）。 */
 const balanceBusy = ref<Record<number, boolean>>({})
-
-function canProbeBalance(ch: Channel): boolean {
-  return ch.endpoints.some(
-    (ep) => ep.enabled && (ep.protocol === 'chat' || ep.protocol === 'responses'),
-  )
-}
 
 async function refreshBalance(ch: Channel) {
   balanceBusy.value[ch.id] = true
@@ -234,32 +210,8 @@ async function runBulk(action: 'enable' | 'disable' | 'delete') {
   if (action === 'delete') selecting.value = false
 }
 
-/** 渠道的全部端点协议，用于列表里的徽章组。 */
-function protocols(ch: Channel): Protocol[] {
-  return ch.endpoints.map((e) => e.protocol)
-}
-
-/** 渠道对外暴露的模型总数（去重）。 */
-function modelCount(ch: Channel): number {
-  const names = new Set<string>()
-  for (const ep of ch.endpoints) for (const m of ep.models) names.add(m.name)
-  return names.size
-}
-
-/** 该渠道是否有任何端点开了协议转换。 */
-function hasTranscode(ch: Channel): boolean {
-  return ch.endpoints.some((e) => e.transcode.enabled && e.transcode.accepted.length > 0)
-}
-
 /** 全局处于熔断中的端点数 —— 头部统计里提醒，卡片里定位。 */
 const suspendedCount = computed(() => healthItems.value.filter(isSuspended).length)
-
-function addressLabel(ch: Channel): string {
-  const a = ch.address
-  if (!a.unofficial) return '官方地址'
-  if (a.full_address) return a.base_url || '（未填完整地址）'
-  return [a.base_url, a.version_prefix, a.path].filter(Boolean).join('') || '（未填地址）'
-}
 </script>
 
 <template>
@@ -374,269 +326,31 @@ function addressLabel(ch: Channel): string {
 
     <!-- 渠道卡片 -->
     <div v-else class="flex flex-col gap-3" :class="selecting ? 'pb-24' : ''">
-      <article
+      <ChannelListCard
         v-for="ch in sorted"
         :key="ch.id"
-        class="glass glass-specular glass-interactive p-4"
-        :class="[
-          ch.enabled ? '' : 'opacity-55',
-          selecting && selected.has(ch.id) ? 'ring-2 ring-accent/45' : '',
-          selecting ? 'cursor-pointer select-none' : '',
-        ]"
-        @click="selecting ? toggleSelected(ch.id) : undefined"
-      >
-        <div
-          class="flex flex-col items-stretch gap-4 sm:flex-row sm:items-start sm:justify-between"
-        >
-          <!-- 批量选择模式下的复选框 -->
-          <div v-if="selecting" class="flex shrink-0 items-start pt-0.5">
-            <span
-              class="grid size-5 place-items-center rounded-md border transition-colors"
-              :class="
-                selected.has(ch.id)
-                  ? 'border-accent bg-accent text-white'
-                  : 'border-ink/25 bg-transparent text-transparent'
-              "
-              role="checkbox"
-              :aria-checked="selected.has(ch.id)"
-              :aria-label="`选择 ${ch.name}`"
-            >
-              <AppIcon name="check" :size="12" />
-            </span>
-          </div>
-
-          <!-- 左：身份 -->
-          <div class="min-w-0 flex-1">
-            <div class="flex flex-wrap items-center gap-2">
-              <h3 class="whitespace-nowrap text-base font-semibold text-ink">{{ ch.name }}</h3>
-              <span
-                v-if="ch.kind === 'aggregate'"
-                class="proto-badge"
-                style="color: var(--color-accent)"
-              >
-                聚合
-              </span>
-              <ProtocolBadge
-                v-for="p in protocols(ch)"
-                :key="p"
-                :protocol="p"
-                :compact="ch.kind === 'aggregate' && ch.endpoints.length > 2"
-              />
-
-              <span
-                v-if="hasTranscode(ch)"
-                class="proto-badge"
-                style="color: var(--color-warning)"
-                title="该渠道有端点开启了协议转换"
-              >
-                转换
-              </span>
-
-              <span
-                v-if="ch.auto_disabled"
-                class="proto-badge"
-                style="color: var(--color-danger)"
-                title="连续凭据错误被自动停用；按设置的间隔重测，通过后自动恢复。手动启用可立即清除。"
-              >
-                自动停用
-              </span>
-            </div>
-
-            <div class="mt-1.5 truncate font-mono text-xs text-ink-faint">
-              {{ addressLabel(ch) }}
-            </div>
-
-            <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-faint">
-              <span
-                >优先级
-                <span class="tabular font-medium text-ink-soft">{{ ch.priority }}</span></span
-              >
-              <span
-                >权重 <span class="tabular font-medium text-ink-soft">{{ ch.weight }}</span></span
-              >
-              <span
-                ><span class="tabular font-medium text-ink-soft">{{ modelCount(ch) }}</span>
-                个模型</span
-              >
-              <span v-if="ch.endpoints.length > 1">
-                <span class="tabular font-medium text-ink-soft">{{ ch.endpoints.length }}</span>
-                个端点
-              </span>
-              <span v-if="ch.balance != null" :title="`刷新于 ${ch.balance_updated_at ?? ''}`">
-                余额
-                <span
-                  class="tabular font-medium"
-                  :class="ch.balance < 1 ? 'text-danger' : 'text-ink-soft'"
-                >
-                  ${{ ch.balance.toFixed(2) }}
-                </span>
-              </span>
-              <span v-for="t in ch.tags ?? []" :key="t" class="rounded bg-ink/8 px-1.5 py-0.5">{{
-                t
-              }}</span>
-            </div>
-
-            <!-- 测试结果 -->
-            <div
-              v-if="testResults[ch.id]"
-              class="mt-2.5 rounded-lg px-3 py-2 text-xs"
-              :class="
-                testResults[ch.id] === 'pending'
-                  ? 'bg-ink/5 text-ink-faint'
-                  : (testResults[ch.id] as ChannelTestResult).success
-                    ? 'bg-success/12 text-success'
-                    : 'bg-danger/12 text-danger'
-              "
-            >
-              <template v-if="testResults[ch.id] === 'pending'">测试中…</template>
-              <template v-else>
-                <span class="inline-flex items-center gap-1.5">
-                  <AppIcon
-                    :name="(testResults[ch.id] as ChannelTestResult).success ? 'check' : 'x'"
-                    :size="13"
-                  />
-                  {{ (testResults[ch.id] as ChannelTestResult).message
-                  }}<template v-if="(testResults[ch.id] as ChannelTestResult).latency_ms != null">
-                    · {{ (testResults[ch.id] as ChannelTestResult).latency_ms }}ms</template
-                  >
-                </span>
-              </template>
-            </div>
-
-            <!-- 熔断警示：被熔断的端点仍会被路由（作为最后手段），
-                 但用户有权知道并手动解除。 -->
-            <div
-              v-for="h in suspendedEndpoints(ch)"
-              :key="`susp-${ch.id}-${h.protocol}`"
-              class="mt-2.5 rounded-lg bg-danger/12 px-3 py-2 text-xs text-danger"
-            >
-              <div class="flex flex-wrap items-center gap-2">
-                <span class="font-semibold">{{ h.protocol }} 端点熔断中</span>
-                <span class="text-danger/80">{{ suspendRemaining(h) }}</span>
-                <span>连续失败 {{ h.consecutive_fails }} 次</span>
-                <button
-                  type="button"
-                  class="ml-auto inline-flex items-center gap-1 rounded-md bg-danger/15 px-2 py-1 font-medium hover:bg-danger/25 disabled:opacity-50"
-                  :disabled="resetting.has(`${ch.id}:${h.protocol}`)"
-                  @click="resetBreaker(h)"
-                >
-                  <AppIcon
-                    v-if="resetting.has(`${ch.id}:${h.protocol}`)"
-                    name="spinner"
-                    class="animate-spin"
-                    :size="11"
-                  />
-                  {{ resetting.has(`${ch.id}:${h.protocol}`) ? '解除中…' : '解除熔断' }}
-                </button>
-              </div>
-              <p v-if="h.last_error" class="mt-1.5 line-clamp-2 text-danger/80">
-                {{ h.last_error }}
-              </p>
-            </div>
-          </div>
-
-          <!-- 右：操作。批量选择模式下隐藏 —— 卡片此时是选择目标，不是操作对象。 -->
-          <div
-            v-if="!selecting"
-            class="flex shrink-0 flex-wrap items-center gap-1.5 sm:justify-end"
-          >
-            <GlassSwitch
-              class="mr-1"
-              :model-value="ch.enabled"
-              :label="ch.enabled ? `禁用 ${ch.name}` : `启用 ${ch.name}`"
-              tone="success"
-              @update:model-value="store.toggleEnabled(ch.id, $event)"
-            />
-
-            <button
-              type="button"
-              class="glass-button-ghost px-2.5 py-1.5 text-xs"
-              :disabled="testResults[ch.id] === 'pending' || testingAll"
-              @click="runTest(ch)"
-            >
-              <AppIcon
-                :name="testResults[ch.id] === 'pending' ? 'spinner' : 'bolt'"
-                :class="testResults[ch.id] === 'pending' ? 'animate-spin' : ''"
-                :size="13"
-              />
-              {{ testResults[ch.id] === 'pending' ? '测试中…' : '测试' }}
-            </button>
-
-            <button
-              v-if="canProbeBalance(ch)"
-              type="button"
-              class="glass-button-ghost px-2.5 py-1.5 text-xs"
-              :disabled="balanceBusy[ch.id]"
-              title="查询上游余额（OpenAI 兼容 billing 端点）"
-              @click="refreshBalance(ch)"
-            >
-              <AppIcon
-                :name="balanceBusy[ch.id] ? 'spinner' : 'download'"
-                :class="balanceBusy[ch.id] ? 'animate-spin' : ''"
-                :size="13"
-              />
-              {{ balanceBusy[ch.id] ? '查询中…' : '余额' }}
-            </button>
-
-            <button
-              type="button"
-              class="glass-button-ghost px-2.5 py-1.5 text-xs"
-              :disabled="copyingId === ch.id"
-              @click="duplicateChannel(ch.id)"
-            >
-              <AppIcon
-                :name="copyingId === ch.id ? 'spinner' : 'copy'"
-                :class="copyingId === ch.id ? 'animate-spin' : ''"
-                :size="13"
-              />
-              {{ copyingId === ch.id ? '复制中…' : '复制' }}
-            </button>
-
-            <button
-              type="button"
-              class="glass-button-ghost px-2.5 py-1.5 text-xs"
-              @click="router.push(`/channels/${ch.id}/edit`)"
-            >
-              <AppIcon name="pencil" :size="13" />
-              编辑
-            </button>
-
-            <button
-              v-if="pendingDelete !== ch.id"
-              type="button"
-              class="glass-button-ghost glass-button-ghost-danger px-2.5 py-1.5 text-xs !text-ink-faint hover:!text-danger"
-              @click="pendingDelete = ch.id"
-            >
-              <AppIcon name="trash" :size="13" />
-              删除
-            </button>
-            <template v-else>
-              <button
-                type="button"
-                class="inline-flex items-center gap-1 rounded-lg bg-danger px-3 py-1.5 text-xs font-medium text-white hover:brightness-105 disabled:opacity-50"
-                :disabled="deletingId === ch.id"
-                @click="confirmDelete(ch.id)"
-              >
-                <AppIcon
-                  v-if="deletingId === ch.id"
-                  name="spinner"
-                  class="animate-spin"
-                  :size="12"
-                />
-                {{ deletingId === ch.id ? '删除中…' : '确认' }}
-              </button>
-              <button
-                type="button"
-                class="glass-button-ghost px-2.5 py-1.5 text-xs"
-                :disabled="deletingId === ch.id"
-                @click="pendingDelete = null"
-              >
-                取消
-              </button>
-            </template>
-          </div>
-        </div>
-      </article>
+        :channel="ch"
+        :selecting="selecting"
+        :selected="selected.has(ch.id)"
+        :test-result="testResults[ch.id]"
+        :suspended="suspendedEndpoints(ch)"
+        :resetting="resetting"
+        :testing-all="testingAll"
+        :balance-busy="!!balanceBusy[ch.id]"
+        :copying="copyingId === ch.id"
+        :pending-delete="pendingDelete === ch.id"
+        :deleting="deletingId === ch.id"
+        @select="toggleSelected(ch.id)"
+        @toggle-enabled="store.toggleEnabled(ch.id, $event)"
+        @test="runTest(ch)"
+        @balance="refreshBalance(ch)"
+        @duplicate="duplicateChannel(ch.id)"
+        @edit="router.push(`/channels/${ch.id}/edit`)"
+        @ask-delete="pendingDelete = ch.id"
+        @confirm-delete="confirmDelete(ch.id)"
+        @cancel-delete="pendingDelete = null"
+        @reset-breaker="resetBreaker"
+      />
     </div>
 
     <!-- 批量操作浮动工具条：选择模式专属，固定在视口底部居中。 -->

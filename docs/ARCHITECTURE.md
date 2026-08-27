@@ -100,6 +100,8 @@ struct ChannelEndpoint {
 }
 ```
 
+`param_override` 是显式两段结构：`common` 合并进所有端点请求体，`protocols.<id>` 只在对应协议端点展开。值为 `null` 表示删除该字段。旧扁平对象（协议名键 + 对象值当分组）读入时仍会映射到新结构。
+
 **关键设计：单协议渠道也用 `endpoints` 表达**（长度恒为 1）。这样路由层只认 `(Channel, ChannelEndpoint)` 二元组，不需要分支处理两种渠道形态 —— 聚合与非聚合的差异被压缩到构造期，运行时完全统一。
 
 ### 2.5 路由候选 RouteCandidate

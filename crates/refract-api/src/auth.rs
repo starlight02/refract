@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -95,6 +95,38 @@ pub fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<St
         }
     }
     None
+}
+
+/// 请求是否经 HTTPS 到达（含反代终止 TLS）。
+///
+/// 认 `X-Forwarded-Proto` 首跳与 RFC 7239 `Forwarded: proto=https`。
+/// 本机直连 HTTP 时两者都没有，Cookie 不加 `Secure`，避免浏览器丢掉会话。
+pub fn request_is_https(headers: &HeaderMap) -> bool {
+    if header_string(headers, "x-forwarded-proto").is_some_and(|value| {
+        value
+            .split(',')
+            .next()
+            .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
+    }) {
+        return true;
+    }
+    header_string(headers, "forwarded").is_some_and(|value| {
+        value.split(',').any(|forwarded| {
+            forwarded.split(';').any(|part| {
+                let part = part.trim();
+                let lower = part.to_ascii_lowercase();
+                lower == "proto=https" || lower.starts_with("proto=https")
+            })
+        })
+    })
+}
+
+/// 组装 Session Cookie。`secure` 为真时追加 `Secure`。
+pub fn session_cookie(value: &str, max_age_secs: u64, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{SESSION_COOKIE_NAME}={value}; HttpOnly; SameSite=Strict; Path=/{secure}; Max-Age={max_age_secs}"
+    )
 }
 
 use crate::error::{AppError, ProtocolRejection};
@@ -336,17 +368,22 @@ impl AdminGuard {
         Self::default()
     }
 
+    fn lock_failures(&self) -> MutexGuard<'_, HashMap<IpAddr, (u32, Instant)>> {
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// 检查该 IP 是否处于封禁状态。封禁中返回剩余秒数。
     pub fn check_locked(&self, ip: IpAddr) -> Option<u64> {
         let now = Instant::now();
-        let mut guard = self.failures.lock().expect("admin guard lock");
-        if let Some((failures, until)) = guard.get(&ip) {
-            if *failures >= 5 && *until > now {
-                return Some((*until - now).as_secs().max(1));
+        let mut guard = self.lock_failures();
+        let (failures, until) = guard.get(&ip).copied()?;
+        if failures >= 5 {
+            if until > now {
+                return Some((until - now).as_secs().max(1));
             }
-            if *until <= now {
-                guard.remove(&ip);
-            }
+            guard.remove(&ip);
         }
         None
     }
@@ -354,7 +391,7 @@ impl AdminGuard {
     /// 记录一次鉴权失败，返回是否触发封禁。
     pub fn record_failure(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let mut guard = self.failures.lock().expect("admin guard lock");
+        let mut guard = self.lock_failures();
         let entry = guard.entry(ip).or_insert((0, now));
         entry.0 = entry.0.saturating_add(1);
         if entry.0 >= 5 {
@@ -367,8 +404,7 @@ impl AdminGuard {
 
     /// 成功鉴权后清零该 IP 的失败记录。
     pub fn record_success(&self, ip: IpAddr) {
-        let mut guard = self.failures.lock().expect("admin guard lock");
-        guard.remove(&ip);
+        self.lock_failures().remove(&ip);
     }
 }
 
@@ -723,5 +759,47 @@ mod tests {
             Some("abc.def.123".to_string())
         );
         assert_eq!(extract_cookie_value(header, "non_existent"), None);
+    }
+
+    #[test]
+    fn forwarded_proto_https_marks_the_request_secure() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https,http".parse().unwrap());
+        assert!(request_is_https(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("forwarded", "for=1.2.3.4;proto=https".parse().unwrap());
+        assert!(request_is_https(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!request_is_https(&headers));
+        assert!(!request_is_https(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn session_cookie_adds_secure_only_when_requested() {
+        let plain = session_cookie("ticket", 60, false);
+        assert!(plain.contains("HttpOnly"));
+        assert!(plain.contains("SameSite=Strict"));
+        assert!(!plain.contains("Secure"));
+
+        let https = session_cookie("ticket", 60, true);
+        assert!(https.contains("Secure"));
+        assert!(https.contains("HttpOnly"));
+    }
+
+    #[test]
+    fn admin_guard_locks_after_five_failures_without_wiping_counts() {
+        let guard = AdminGuard::new();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        for n in 1..=4 {
+            assert!(!guard.record_failure(ip), "failure {n} should not lock");
+            assert!(guard.check_locked(ip).is_none());
+        }
+        assert!(guard.record_failure(ip));
+        assert!(guard.check_locked(ip).is_some());
+        guard.record_success(ip);
+        assert!(guard.check_locked(ip).is_none());
     }
 }

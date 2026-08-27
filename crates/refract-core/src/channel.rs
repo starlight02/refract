@@ -5,6 +5,7 @@
 //! 不需要为两种渠道形态写分支。
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::address::UpstreamAddress;
 use crate::protocol::{Protocol, ProtocolSet};
@@ -435,6 +436,83 @@ impl EmptyResponseRetryOverride {
     }
 }
 
+/// 注入上游请求体的渠道级参数覆盖。
+///
+/// 作用域显式分为两段：
+/// - [`common`](Self::common)：合并进**所有**端点的请求体顶层；
+/// - [`protocols`](Self::protocols)：按协议分组，只在请求打到对应协议的端点时
+///   展开，同名字段以组内条目压过 `common`。
+///
+/// 值为 `null` 表示从请求体里**删除**该字段 —— 剥掉某上游不认的字段
+/// （`logprobs`、`reasoning_effort`…）是参数覆盖的高频诉求。
+///
+/// 旧版本曾用「键名恰好是协议名且值为对象」来隐式标记协议分组，而
+/// `chat` / `messages` 本身就是常见的请求体字段名，魔法键名必然误伤。
+/// 反序列化因此仍兼容旧的扁平形状（协议名键 + 对象值 → 协议分组，其余进
+/// `common`），序列化则永远输出显式结构 —— 数据一经保存即完成迁移。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ParamOverride {
+    /// 对所有端点生效的字段。
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub common: serde_json::Map<String, serde_json::Value>,
+    /// 只对对应协议端点生效的字段组。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub protocols: BTreeMap<Protocol, serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ParamOverride {
+    /// 是否为空 —— 空的覆盖等价于没配。
+    pub fn is_empty(&self) -> bool {
+        self.common.is_empty() && self.protocols.is_empty()
+    }
+
+    /// 旧版扁平形状的机械映射，保持旧运行时语义逐字不变。
+    fn from_legacy(map: serde_json::Map<String, serde_json::Value>) -> Self {
+        let mut override_ = ParamOverride::default();
+        for (key, value) in map {
+            // 旧语义：键名是协议名且值为对象 → 该协议的专属分组。
+            if value.is_object()
+                && let Ok(protocol) = key.parse::<Protocol>()
+            {
+                let group = value.as_object().expect("checked above").clone();
+                override_.protocols.insert(protocol, group);
+            } else {
+                override_.common.insert(key, value);
+            }
+        }
+        override_
+    }
+}
+
+/// 显式形状的中间表示，供 [`ParamOverride`] 反序列化复用派生。
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ParamOverrideShape {
+    common: serde_json::Map<String, serde_json::Value>,
+    protocols: BTreeMap<Protocol, serde_json::Map<String, serde_json::Value>>,
+}
+
+impl<'de> Deserialize<'de> for ParamOverride {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(de)?;
+        let serde_json::Value::Object(map) = value else {
+            return Err(serde::de::Error::custom(
+                "param_override must be a JSON object",
+            ));
+        };
+        // 键只含 common / protocols → 显式新形状；其余一律按旧扁平形状映射。
+        if map.keys().all(|key| key == "common" || key == "protocols") {
+            return serde_json::from_value::<ParamOverrideShape>(serde_json::Value::Object(map))
+                .map(|shape| ParamOverride {
+                    common: shape.common,
+                    protocols: shape.protocols,
+                })
+                .map_err(serde::de::Error::custom);
+        }
+        Ok(Self::from_legacy(map))
+    }
+}
+
 /// 上游渠道。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Channel {
@@ -482,15 +560,9 @@ pub struct Channel {
     /// 出站代理。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
-    /// 注入到上游请求体的参数覆盖，必须是 JSON 对象。
-    ///
-    /// 顶层键直接合并进所有端点的请求体；键名恰好是协议名（`chat` /
-    /// `responses` / `messages` / `gemini`）且值为对象时，视为该协议专属的
-    /// 覆盖组，只在打到对应协议端点时展开 —— 聚合渠道用它避免把 Chat 的
-    /// 顶层采样参数盲注进 Gemini（Gemini 的采样参数在 `generationConfig`
-    /// 里，顶层未知字段会被 400 拒绝）。
+    /// 注入上游请求体的参数覆盖；结构与语义见 [`ParamOverride`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub param_override: Option<serde_json::Value>,
+    pub param_override: Option<ParamOverride>,
     /// 备注。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -551,10 +623,6 @@ pub enum ChannelError {
     /// 转换策略把原生协议自身也勾上了 —— 无意义，且暗示配置理解有误。
     #[error("endpoint `{0}` lists its own native protocol as a transcode target")]
     SelfTranscode(Protocol),
-    /// 参数覆盖不是 JSON 对象 —— 执行器只会合并对象，其他形状会被静默忽略，
-    /// 与其让用户困惑「为什么不生效」，不如在保存时就拒绝。
-    #[error("param_override must be a JSON object, got {0}")]
-    ParamOverrideNotObject(&'static str),
     /// 自定义头名不是合法的 HTTP header 名。
     #[error("extra header name `{0}` is not a valid HTTP header name")]
     InvalidExtraHeader(String),
@@ -654,20 +722,6 @@ impl Channel {
 
         if self.address.unofficial && base_url_missing(&self.address) {
             return Err(ChannelError::MissingDefaultUnofficialBaseUrl);
-        }
-
-        if let Some(value) = &self.param_override
-            && !value.is_object()
-        {
-            let kind = match value {
-                serde_json::Value::Null => "null",
-                serde_json::Value::Bool(_) => "a boolean",
-                serde_json::Value::Number(_) => "a number",
-                serde_json::Value::String(_) => "a string",
-                serde_json::Value::Array(_) => "an array",
-                serde_json::Value::Object(_) => unreachable!(),
-            };
-            return Err(ChannelError::ParamOverrideNotObject(kind));
         }
 
         for (name, value) in &self.extra_headers {
@@ -1156,5 +1210,58 @@ mod tests {
             serde_json::from_str::<ChannelKind>(r#""aggregate""#).unwrap(),
             ChannelKind::Aggregate
         );
+    }
+
+    fn override_from_json(json: &str) -> ParamOverride {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn param_override_new_shape_roundtrips() {
+        let po = override_from_json(
+            r#"{"common":{"temperature":0.7,"logprobs":null},"protocols":{"gemini":{"generationConfig":{"topK":40}}}}"#,
+        );
+        assert_eq!(po.common.get("temperature"), Some(&serde_json::json!(0.7)));
+        assert_eq!(po.common.get("logprobs"), Some(&serde_json::Value::Null));
+        let gemini = po.protocols.get(&Protocol::Gemini).unwrap();
+        assert_eq!(
+            gemini.get("generationConfig"),
+            Some(&serde_json::json!({"topK": 40}))
+        );
+
+        let serialized = serde_json::to_string(&po).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ParamOverride>(&serialized).unwrap(),
+            po
+        );
+    }
+
+    #[test]
+    fn param_override_legacy_flat_shape_is_mapped() {
+        // 协议名键 + 对象值 → 协议分组；其余（含协议名键但非对象值）→ common。
+        let po = override_from_json(
+            r#"{"temperature":0.5,"chat":{"top_p":0.9},"messages":[1,2],"gemini":{"generationConfig":{"topK":40}}}"#,
+        );
+        assert_eq!(po.common.len(), 2);
+        assert_eq!(po.common.get("temperature"), Some(&serde_json::json!(0.5)));
+        assert_eq!(po.common.get("messages"), Some(&serde_json::json!([1, 2])));
+        assert_eq!(
+            po.protocols.get(&Protocol::Chat).unwrap().get("top_p"),
+            Some(&serde_json::json!(0.9))
+        );
+        assert!(po.protocols.contains_key(&Protocol::Gemini));
+    }
+
+    #[test]
+    fn param_override_rejects_non_object_and_unknown_protocol() {
+        assert!(serde_json::from_str::<ParamOverride>("[1]").is_err());
+        assert!(serde_json::from_str::<ParamOverride>(r#"{"protocols":{"gpt":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn param_override_empty_is_empty() {
+        assert!(ParamOverride::default().is_empty());
+        let po = override_from_json(r#"{"common":{"a":1}}"#);
+        assert!(!po.is_empty());
     }
 }

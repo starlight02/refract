@@ -70,6 +70,18 @@ export interface EmptyResponseRetryOverride {
 
 // ── 渠道 ──
 
+/**
+ * 注入上游请求体的参数覆盖。
+ *
+ * `common` 对所有端点生效；`protocols` 按协议分组，只在打到对应协议端点时展开。
+ * 值为 `null` 表示删除该字段。不要再把协议名当顶层键 —— `chat` / `messages`
+ * 本身就是常见的请求体字段。
+ */
+export interface ParamOverride {
+  common?: Record<string, unknown>
+  protocols?: Partial<Record<Protocol, Record<string, unknown>>>
+}
+
 export interface Channel {
   id: number
   owner_id: number
@@ -88,7 +100,7 @@ export interface Channel {
   tags: string[]
   timeout_secs: number
   proxy?: string | null
-  param_override?: Record<string, unknown> | null
+  param_override?: ParamOverride | null
   note?: string | null
   /** 因终态错误被网关自动禁用（保留定时重测自愈资格）。 */
   auto_disabled?: boolean

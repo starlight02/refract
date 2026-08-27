@@ -10,6 +10,8 @@ import {
   DialogTitle,
 } from 'reka-ui'
 import { AUTH_REQUIRED_EVENT, BACKEND_DOWN_EVENT, BACKEND_RESTORED_EVENT, auth } from '@/api/client'
+import { CRYPTO_PLAINTEXT_EVENT } from '@/api/crypto'
+import { authGate } from '@/router'
 import AppIcon from '@/components/AppIcon.vue'
 import GlassToastContainer from '@/components/GlassToastContainer.vue'
 import { useAction } from '@/composables/useAction'
@@ -42,7 +44,7 @@ onMounted(async () => {
   applyTheme(dark)
 
   const sess = await orElse(() => auth.session())
-  if (sess?.configured && !sess.authenticated) {
+  if (authGate.needsLogin || (sess?.configured && !sess.authenticated)) {
     tokenDialogOpen.value = true
   }
 })
@@ -123,6 +125,15 @@ onBeforeUnmount(() => {
   if (healthTimer) clearInterval(healthTimer)
 })
 
+const cryptoPlaintext = ref(false)
+
+function onCryptoPlaintext() {
+  cryptoPlaintext.value = true
+}
+
+onMounted(() => window.addEventListener(CRYPTO_PLAINTEXT_EVENT, onCryptoPlaintext))
+onBeforeUnmount(() => window.removeEventListener(CRYPTO_PLAINTEXT_EVENT, onCryptoPlaintext))
+
 /** 桌面侧栏主导航。 */
 const navItems = [
   { name: 'dashboard', label: '仪表盘', icon: 'gauge' },
@@ -165,6 +176,28 @@ const version = __APP_VERSION__
       >
         <AppIcon name="spinner" class="animate-spin text-warning shrink-0" :size="15" />
         <span>无法连接后端，正在重试…</span>
+      </div>
+    </Transition>
+    <Transition
+      enter-active-class="transition-opacity duration-300"
+      enter-from-class="opacity-0"
+      leave-active-class="transition-opacity duration-300"
+      leave-to-class="opacity-0"
+    >
+      <div
+        v-if="cryptoPlaintext"
+        class="glass fixed top-20 left-1/2 z-40 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-2.5 border-warning/30 bg-warning/12 px-4 py-2.5 text-sm font-medium text-ink shadow-[0_12px_32px_-14px_oklch(0%_0_0/0.28)] md:top-3"
+        role="status"
+      >
+        <span>传输加密不可用，敏感请求将以明文发送。请改用 HTTPS 或支持 Web Crypto 的浏览器。</span>
+        <button
+          type="button"
+          class="shrink-0 text-ink-soft hover:text-ink"
+          aria-label="关闭明文传输提示"
+          @click="cryptoPlaintext = false"
+        >
+          关闭
+        </button>
       </div>
     </Transition>
     <header

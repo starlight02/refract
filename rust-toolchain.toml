@@ -1,0 +1,5 @@
+# Single source of truth for the toolchain pin.
+# Keep Dockerfile `rust:1.98-alpine` and Cargo.toml `rust-version = "1.98"` in sync.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

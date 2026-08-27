@@ -151,7 +151,13 @@ pub fn admin_error_reply(err: &GatewayError) -> WebResponse {
         // 上游原始响应对排查渠道配置至关重要 —— 前端会把它折叠展示。
         detail: err.upstream_body.clone(),
     };
-    json_response(status, &envelope)
+    let mut response = json_response(status, &envelope);
+    if let Some(wait) = err.retry_after
+        && let Ok(value) = HeaderValue::from_str(&wait.as_secs().max(1).to_string())
+    {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
 }
 
 fn admin_fallback(status: StatusCode, message: String) -> WebResponse {

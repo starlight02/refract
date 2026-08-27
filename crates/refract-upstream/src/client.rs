@@ -21,6 +21,9 @@ use crate::sse::{ByteStream, SseEvent, SseStream};
 /// 让用户去配一个他们并不理解的日期字符串只会制造支持负担。
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// 渠道级代理 Client 上限。超出后淘汰任意一条，避免地址变动导致无界增长。
+const MAX_PROXY_CLIENTS: usize = 32;
+
 /// 客户端配置。
 #[derive(Debug, Clone)]
 pub struct UpstreamClientConfig {
@@ -516,6 +519,15 @@ impl UpstreamClient {
         }
 
         let client = build_http_client(&self.config, Some(proxy))?;
+        if self.proxy_clients.len() >= MAX_PROXY_CLIENTS
+            && let Some(evict) = self
+                .proxy_clients
+                .iter()
+                .next()
+                .map(|entry| entry.key().clone())
+        {
+            self.proxy_clients.remove(&evict);
+        }
         self.proxy_clients.insert(proxy.to_owned(), client.clone());
         Ok(client)
     }

@@ -12,7 +12,7 @@
 //! 没有密钥可挂账，全局窗口是唯一挡住 token 洪水的地方。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// 全局窗口借用的保留 key。真实密钥 ID 由 SQLite AUTOINCREMENT 生成，从 1 起，
 /// 0 永远不会被占用 —— 全局 RPM/TPM 与每密钥限速因此共用一张表、共用一把锁。
@@ -82,10 +82,16 @@ impl RateLimiter {
         self.admit_at(key_id, rpm, tpm, now)
     }
 
+    fn lock_windows(&self) -> MutexGuard<'_, HashMap<i64, Window>> {
+        self.windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn admit_at(&self, key_id: i64, rpm: i64, tpm: i64, now: u64) -> Result<(), RateExceeded> {
         let minute = now / 60;
         let retry_after_secs = 60 - (now % 60);
-        let mut windows = self.windows.lock().expect("rate windows lock");
+        let mut windows = self.lock_windows();
         prune_stale_windows(&mut windows, minute);
         let window = windows.entry(key_id).or_insert(Window {
             minute,
@@ -117,7 +123,7 @@ impl RateLimiter {
 
     #[cfg(test)]
     fn window_count(&self) -> usize {
-        self.windows.lock().expect("rate windows lock").len()
+        self.lock_windows().len()
     }
 
     /// 请求完成后把 token 用量计入当前窗口。
@@ -130,7 +136,7 @@ impl RateLimiter {
 
     fn add_tokens_at(&self, key_id: i64, tokens: u64, now: u64) {
         let minute = now / 60;
-        let mut windows = self.windows.lock().expect("rate windows lock");
+        let mut windows = self.lock_windows();
         prune_stale_windows(&mut windows, minute);
         let window = windows.entry(key_id).or_insert(Window {
             minute,
@@ -174,7 +180,10 @@ impl IpRateLimiter {
         let now = now_secs();
         let minute = now / 60;
         let retry_after_secs = 60 - (now % 60);
-        let mut windows = self.windows.lock().expect("ip rate windows lock");
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if windows.len() > 10_000 {
             windows.retain(|_, w| w.minute == minute);
         }

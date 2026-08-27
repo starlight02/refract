@@ -1,35 +1,46 @@
 <script setup lang="ts">
 /**
- * 网关设置。
+ * 网关设置编排：加载/保存、脏检查、分块重试。
  *
- * 两块内容：
- * 1. 路由策略 —— 是否原生优先、选择模式、最大重试次数。
- *    设计成「先调到满意再保存」，而不是「改一行就存一次」。
- * 2. 日志保留 —— 后台定时清理请求日志的周期。
- * 3. 管理令牌 —— 首次启动由服务端签发。设置页只负责轮换或显式关闭；
- *    轮换成功时服务端会下发最新 Session Cookie，当前浏览器保持登录。
+ * 各区块 UI 在 `components/settings/`；这里只负责把后端快照和保存闸门串起来。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import { useAction } from '@/composables/useAction'
-import GlassSwitch from '@/components/GlassSwitch.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
 import AppIcon from '@/components/AppIcon.vue'
-import {
-  backup,
-  auth as authApi,
-  backups as backupsApi,
-  data as dataApi,
-  settings,
-} from '@/api/client'
-import { orElse, parseJson } from '@/utils/effect'
+import RoutingPolicySection from '@/components/settings/RoutingPolicySection.vue'
+import AffinitySection from '@/components/settings/AffinitySection.vue'
+import BreakerSection from '@/components/settings/BreakerSection.vue'
+import DataHotBackupSection from '@/components/settings/DataHotBackupSection.vue'
+import GlobalLimitsSection from '@/components/settings/GlobalLimitsSection.vue'
+import NotifySection from '@/components/settings/NotifySection.vue'
+import PricingSection from '@/components/settings/PricingSection.vue'
+import LogRetentionSection from '@/components/settings/LogRetentionSection.vue'
+import AdminIdentitySection from '@/components/settings/AdminIdentitySection.vue'
+import ConfigBackupSection from '@/components/settings/ConfigBackupSection.vue'
+import { data as dataApi, settings } from '@/api/client'
+import { orElse } from '@/utils/effect'
 import { toErrorMessage } from '@/utils/error'
+import {
+  affinityDraftsValid,
+  affinityFromDrafts,
+  ruleToDraft,
+  type AffinityRuleDraft,
+} from '@/utils/affinity-draft'
+import {
+  backupValid,
+  breakerValid,
+  emptyResponseRetryValid,
+  ipLimitsValid,
+  limitsValid,
+  notifyValid,
+  policyValid,
+  pricingValid,
+  retentionValid,
+} from '@/utils/settings-validation'
 import type {
-  AffinityKeySource,
-  AffinityRule,
   AffinitySettings,
-  AffinityStatsResponse,
-  BackupFile,
   BackupSettings,
   BreakerPolicy,
   EmptyResponseRetryPolicy,
@@ -38,14 +49,12 @@ import type {
   ModelPrice,
   NotifySettings,
   RoutingPolicy,
-  SelectionMode,
 } from '@refract/contracts'
 
 const saveSettings = useAction('保存失败', { toast: true })
 const reloadSectionAction = useAction('加载失败')
 const sectionErrors = ref<Record<string, string | null>>({})
 const loading = ref(true)
-const saved = ref(false)
 const loadError = ref<string | null>(null)
 const saveError = ref<string | null>(null)
 
@@ -77,12 +86,17 @@ const emptyResponseRetry = ref<EmptyResponseRetryPolicy>({
 const dbStats = ref<{ db_bytes: number; log_rows: number; oldest_log_at: string | null } | null>(
   null,
 )
-
-function fmtBytes(bytes: number): string {
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
-}
+const affinity = ref<AffinitySettings>({
+  enabled: false,
+  switch_on_success: true,
+  keep_on_channel_disabled: false,
+  max_entries: 100_000,
+  default_ttl_secs: 1800,
+  rules: [],
+})
+const affinityRules = ref<AffinityRuleDraft[]>([])
+const webhookSecretConfigured = ref(false)
+const masterKeyConfigured = ref(false)
 
 /** 上一次从后端拉到的快照，用于判断有没有改过。 */
 let policySnapshot = ''
@@ -95,6 +109,7 @@ let limitsSnapshot = ''
 let ipLimitsSnapshot = ''
 let backupSnapshot = ''
 let emptyResponseRetrySnapshot = ''
+let affinitySnapshot = ''
 
 const policyDirty = computed(() => policySnapshot !== JSON.stringify(policy.value))
 const retentionDirty = computed(() => retentionSnapshot !== retentionDays.value)
@@ -108,60 +123,13 @@ const backupDirty = computed(() => backupSnapshot !== JSON.stringify(backupCfg.v
 const emptyResponseRetryDirty = computed(
   () => emptyResponseRetrySnapshot !== JSON.stringify(emptyResponseRetry.value),
 )
-/** 与后端 GlobalLimits::validate 一致：RPM ≤ 1e6，TPM ≤ 1e9，并发 ≤ 1e5。 */
-const limitsValid = computed(
-  () =>
-    Number.isInteger(limits.value.rpm) &&
-    limits.value.rpm >= 0 &&
-    limits.value.rpm <= 1_000_000 &&
-    Number.isInteger(limits.value.tpm) &&
-    limits.value.tpm >= 0 &&
-    limits.value.tpm <= 1_000_000_000 &&
-    Number.isInteger(limits.value.max_concurrency) &&
-    limits.value.max_concurrency >= 0 &&
-    limits.value.max_concurrency <= 100_000,
-)
-const ipLimitsValid = computed(
-  () =>
-    Number.isInteger(ipLimits.value.rpm) &&
-    ipLimits.value.rpm >= 0 &&
-    ipLimits.value.rpm <= 1_000_000,
-)
-/** 与后端 BackupSettings::validate 一致：间隔 ≤ 8760 小时，保留 1–100 份。 */
-const backupValid = computed(
-  () =>
-    Number.isInteger(backupCfg.value.interval_hours) &&
-    backupCfg.value.interval_hours >= 0 &&
-    backupCfg.value.interval_hours <= 8760 &&
-    Number.isInteger(backupCfg.value.keep) &&
-    backupCfg.value.keep >= 1 &&
-    backupCfg.value.keep <= 100,
-)
-/** 路由策略数值校验：重试 0–32（0=不限），上游调用上限 0–255（u8）。 */
-const policyValid = computed(
-  () =>
-    Number.isInteger(policy.value.max_attempts) &&
-    policy.value.max_attempts >= 0 &&
-    policy.value.max_attempts <= 32 &&
-    Number.isInteger(policy.value.max_upstream_calls) &&
-    policy.value.max_upstream_calls >= 0 &&
-    policy.value.max_upstream_calls <= 255,
-)
-const notifyValid = computed(() => {
-  const url = notify.value.webhook_url?.trim() ?? ''
-  const urlOk = url === '' || url.startsWith('http://') || url.startsWith('https://')
-  const minutes = notify.value.retest_minutes
-  return urlOk && Number.isInteger(minutes) && minutes >= 0 && minutes <= 1440
-})
-const emptyResponseRetryValid = computed(
-  () =>
-    Number.isInteger(emptyResponseRetry.value.window_secs) &&
-    emptyResponseRetry.value.window_secs >= 0 &&
-    emptyResponseRetry.value.window_secs <= 3600 &&
-    Number.isInteger(emptyResponseRetry.value.max_retries) &&
-    emptyResponseRetry.value.max_retries >= 0 &&
-    emptyResponseRetry.value.max_retries <= 100,
-)
+
+function affinityCurrent(): AffinitySettings {
+  return affinityFromDrafts(affinity.value, affinityRules.value)
+}
+
+const affinityDirty = computed(() => affinitySnapshot !== JSON.stringify(affinityCurrent()))
+
 const isDirty = computed(
   () =>
     policyDirty.value ||
@@ -176,286 +144,35 @@ const isDirty = computed(
     emptyResponseRetryDirty.value ||
     affinityDirty.value,
 )
-const retentionValid = computed(
+
+const policyOk = computed(() => policyValid(policy.value))
+const retentionOk = computed(() => retentionValid(retentionDays.value))
+const breakerOk = computed(() => breakerValid(breaker.value))
+const pricingOk = computed(() => pricingValid(pricing.value))
+const notifyOk = computed(() => notifyValid(notify.value))
+const limitsOk = computed(() => limitsValid(limits.value))
+const ipLimitsOk = computed(() => ipLimitsValid(ipLimits.value))
+const backupOk = computed(() => backupValid(backupCfg.value))
+const emptyRetryOk = computed(() => emptyResponseRetryValid(emptyResponseRetry.value))
+const affinityOk = computed(() =>
+  affinityDraftsValid(affinity.value.enabled, affinity.value, affinityRules.value),
+)
+
+const canSave = computed(
   () =>
-    Number.isInteger(retentionDays.value) &&
-    retentionDays.value >= 1 &&
-    retentionDays.value <= 3650,
+    isDirty.value &&
+    !saveSettings.busy &&
+    policyOk.value &&
+    retentionOk.value &&
+    breakerOk.value &&
+    pricingOk.value &&
+    notifyOk.value &&
+    emptyRetryOk.value &&
+    affinityOk.value &&
+    limitsOk.value &&
+    ipLimitsOk.value &&
+    backupOk.value,
 )
-/** 与后端 BreakerPolicy::validate 一致的客户端校验。 */
-const breakerValid = computed(() => {
-  const b = breaker.value
-  return (
-    Number.isInteger(b.failure_threshold) &&
-    b.failure_threshold >= 0 &&
-    b.failure_threshold <= 1000 &&
-    Number.isInteger(b.base_cooldown_secs) &&
-    b.base_cooldown_secs >= 1 &&
-    b.base_cooldown_secs <= 86_400 &&
-    Number.isInteger(b.max_cooldown_secs) &&
-    b.max_cooldown_secs >= b.base_cooldown_secs &&
-    b.max_cooldown_secs <= 86_400
-  )
-})
-/** 与后端 ModelPrice::validate 一致：pattern 非空，价格为非负有限数。 */
-const pricingValid = computed(() =>
-  pricing.value.every(
-    (row) =>
-      row.pattern.trim() !== '' &&
-      Number.isFinite(row.input_per_m) &&
-      row.input_per_m >= 0 &&
-      Number.isFinite(row.output_per_m) &&
-      row.output_per_m >= 0 &&
-      (row.cached_input_per_m == null ||
-        (Number.isFinite(row.cached_input_per_m) && row.cached_input_per_m >= 0)) &&
-      (row.cache_write_per_m == null ||
-        (Number.isFinite(row.cache_write_per_m) && row.cache_write_per_m >= 0)),
-  ),
-)
-
-function addPriceRow() {
-  pricing.value.push({
-    pattern: '',
-    input_per_m: 0,
-    output_per_m: 0,
-    cached_input_per_m: null,
-    cache_write_per_m: null,
-  })
-}
-
-/** number input 清空时 v-model.number 给空串；归一成 null（后端语义：回落输入价）。 */
-function normalizePrice(row: ModelPrice, key: 'cached_input_per_m' | 'cache_write_per_m') {
-  const value = row[key]
-  if (value === undefined || (typeof value === 'string' && value === '') || Number.isNaN(value)) {
-    row[key] = null
-  }
-}
-
-function removePriceRow(index: number) {
-  pricing.value.splice(index, 1)
-}
-
-// ── 渠道亲和性 ──
-
-/**
- * 亲和规则编辑用的一行来源。把判别联合摊平成「kind + 一个值」，
- * 才能直接 v-model；提交时再按 kind 还原成 AffinityKeySource。
- */
-interface SourceRow {
-  kind: 'api_key_id' | 'header' | 'body'
-  /** header 名或 body JSON Pointer；api_key_id 不使用。 */
-  value: string
-}
-
-/** 一条规则的编辑态：来源用行编辑。 */
-interface AffinityRuleDraft {
-  name: string
-  model_regex: string
-  path_regex: string
-  value_regex: string
-  ttl_secs: number | null
-  include_model: boolean
-  skip_retry_on_failure: boolean
-  sources: SourceRow[]
-}
-
-const affinity = ref<AffinitySettings>({
-  enabled: false,
-  switch_on_success: true,
-  keep_on_channel_disabled: false,
-  max_entries: 100_000,
-  default_ttl_secs: 1800,
-  rules: [],
-})
-const affinityRules = ref<AffinityRuleDraft[]>([])
-const affinityStats = ref<AffinityStatsResponse | null>(null)
-const clearAffinity = useAction('清除失败', { toast: true })
-
-function sourceToRow(source: AffinityKeySource): SourceRow {
-  if (source.kind === 'header') return { kind: 'header', value: source.name }
-  if (source.kind === 'body') return { kind: 'body', value: source.path }
-  return { kind: 'api_key_id', value: '' }
-}
-
-function rowToSource(row: SourceRow): AffinityKeySource | null {
-  if (row.kind === 'header') {
-    const name = row.value.trim()
-    return name ? { kind: 'header', name } : null
-  }
-  if (row.kind === 'body') return { kind: 'body', path: row.value.trim() }
-  return { kind: 'api_key_id' }
-}
-
-function ruleToDraft(rule: AffinityRule): AffinityRuleDraft {
-  return {
-    name: rule.name,
-    model_regex: rule.model_regex,
-    path_regex: rule.path_regex,
-    value_regex: rule.value_regex,
-    ttl_secs: rule.ttl_secs ?? null,
-    include_model: rule.include_model,
-    skip_retry_on_failure: rule.skip_retry_on_failure,
-    sources: rule.sources.map(sourceToRow),
-  }
-}
-
-function draftToRule(draft: AffinityRuleDraft): AffinityRule {
-  const sources = draft.sources.map(rowToSource).filter((s): s is AffinityKeySource => s !== null)
-  return {
-    name: draft.name.trim(),
-    model_regex: draft.model_regex,
-    path_regex: draft.path_regex,
-    value_regex: draft.value_regex,
-    // 清空/非法输入视为「用全局默认」：归一成 undefined 省略该字段，
-    // 与后端 skip-serialize 一致，避免脏检测因 null 与缺失差异而常亮。
-    ttl_secs:
-      draft.ttl_secs !== null && Number.isInteger(draft.ttl_secs) && draft.ttl_secs >= 1
-        ? draft.ttl_secs
-        : undefined,
-    include_model: draft.include_model,
-    skip_retry_on_failure: draft.skip_retry_on_failure,
-    sources,
-  }
-}
-/** 与后端 AffinitySettings::validate 一致的客户端校验；关闭时不拦截。 */
-const MAX_AFFINITY_TTL_SECS = 7 * 24 * 3600
-const affinityValid = computed(() => {
-  if (!affinity.value.enabled) return true
-  const a = affinity.value
-  if (!Number.isInteger(a.max_entries) || a.max_entries < 1) return false
-  if (
-    !Number.isInteger(a.default_ttl_secs) ||
-    a.default_ttl_secs < 1 ||
-    a.default_ttl_secs > MAX_AFFINITY_TTL_SECS
-  )
-    return false
-  const seen = new Set<string>()
-  for (const draft of affinityRules.value) {
-    const name = draft.name.trim()
-    if (!name || seen.has(name)) return false
-    seen.add(name)
-    const sources = draft.sources.map(rowToSource).filter(Boolean)
-    if (sources.length === 0) return false
-    for (const row of draft.sources) {
-      if (row.kind === 'header' && !row.value.trim()) return false
-      if (row.kind === 'body') {
-        const path = row.value.trim()
-        if (path !== '' && !path.startsWith('/')) return false
-      }
-    }
-    if (
-      draft.ttl_secs !== null &&
-      (!Number.isInteger(draft.ttl_secs) ||
-        draft.ttl_secs < 1 ||
-        draft.ttl_secs > MAX_AFFINITY_TTL_SECS)
-    )
-      return false
-  }
-  return true
-})
-
-let affinitySnapshot = ''
-
-/** 当前编辑态序列化成后端形状，供脏检测与保存共用。 */
-function affinityCurrent(): AffinitySettings {
-  return {
-    ...affinity.value,
-    rules: affinityRules.value.map(draftToRule),
-  }
-}
-
-const affinityDirty = computed(() => affinitySnapshot !== JSON.stringify(affinityCurrent()))
-
-function addAffinityRule() {
-  affinityRules.value.push({
-    name: `rule-${affinityRules.value.length + 1}`,
-    model_regex: '',
-    path_regex: '',
-    value_regex: '',
-    ttl_secs: null,
-    include_model: true,
-    skip_retry_on_failure: false,
-    sources: [{ kind: 'api_key_id', value: '' }],
-  })
-}
-
-function removeAffinityRule(index: number) {
-  affinityRules.value.splice(index, 1)
-}
-
-function addSourceRow(draft: AffinityRuleDraft) {
-  draft.sources.push({ kind: 'api_key_id', value: '' })
-}
-
-function removeSourceRow(draft: AffinityRuleDraft, index: number) {
-  draft.sources.splice(index, 1)
-}
-
-/** 预设：一键填入常见的亲和规则，省去手填来源。 */
-const AFFINITY_PRESETS: { label: string; desc: string; make: () => AffinityRuleDraft }[] = [
-  {
-    label: '按网关 API 密钥',
-    desc: '同一调用方（下游应用）固定命中同一渠道。',
-    make: () => ({
-      name: 'by-api-key',
-      model_regex: '',
-      path_regex: '',
-      value_regex: '',
-      ttl_secs: null,
-      include_model: true,
-      skip_retry_on_failure: false,
-      sources: [{ kind: 'api_key_id', value: '' }],
-    }),
-  },
-  {
-    label: '按自定义请求头 X-User-Id',
-    desc: '客户端在请求头带会话/用户 ID 时按它绑定。',
-    make: () => ({
-      name: 'by-header-user',
-      model_regex: '',
-      path_regex: '',
-      value_regex: '',
-      ttl_secs: null,
-      include_model: true,
-      skip_retry_on_failure: false,
-      sources: [{ kind: 'header', value: 'X-User-Id' }],
-    }),
-  },
-  {
-    label: '按请求体 user 字段',
-    desc: '从请求体 JSON 的 user 字段取值绑定。',
-    make: () => ({
-      name: 'by-body-user',
-      model_regex: '',
-      path_regex: '',
-      value_regex: '',
-      ttl_secs: null,
-      include_model: true,
-      skip_retry_on_failure: false,
-      sources: [{ kind: 'body', value: '/user' }],
-    }),
-  },
-]
-
-function applyAffinityPreset(preset: (typeof AFFINITY_PRESETS)[number]) {
-  affinityRules.value.push(preset.make())
-}
-
-/** 清空已建立的绑定缓存；不影响规则本身。 */
-async function clearAffinityBindings() {
-  if (clearAffinity.busy) return
-  await clearAffinity.run(
-    () => settings.clearAffinity(),
-    (res) => {
-      void refreshAffinityStats()
-      return `已清除 ${res.cleared} 条绑定。`
-    },
-  )
-}
-
-async function refreshAffinityStats() {
-  affinityStats.value = await orElse(() => settings.affinityStats(), null)
-}
 
 function applySettled<T>(
   result: PromiseSettledResult<T>,
@@ -521,7 +238,6 @@ async function reloadSection(section: string) {
         affinity.value = aff
         affinityRules.value = aff.rules.map(ruleToDraft)
         affinitySnapshot = JSON.stringify(affinityCurrent())
-        void refreshAffinityStats()
         break
       }
       case 'backup': {
@@ -630,7 +346,6 @@ onMounted(async () => {
     affinity.value = aff
     affinityRules.value = aff.rules.map(ruleToDraft)
     affinitySnapshot = JSON.stringify(affinityCurrent())
-    void refreshAffinityStats()
   })
   if (ipLimitsRes.status === 'fulfilled') {
     ipLimits.value = ipLimitsRes.value
@@ -679,49 +394,48 @@ onBeforeUnmount(() => {
 
 async function save() {
   saveSettings.clear()
-  if (!policyValid.value) {
+  if (!policyOk.value) {
     saveError.value = '路由策略不合法：最大重试 0–32 次（0 = 不限），单请求上游调用上限 0–255'
     return
   }
-  if (!retentionValid.value) {
+  if (!retentionOk.value) {
     saveError.value = '日志保留天数必须是 1–3650 的整数'
     return
   }
-  if (!breakerValid.value) {
+  if (!breakerOk.value) {
     saveError.value = '熔断参数不合法：阈值 0–1000，冷却 1–86400 秒且上限不小于起始值'
     return
   }
-  if (!pricingValid.value) {
+  if (!pricingOk.value) {
     saveError.value = '价表不合法：模式不能为空，价格必须是非负数字'
     return
   }
-  if (!notifyValid.value) {
+  if (!notifyOk.value) {
     saveError.value = '通知设置不合法：webhook 需以 http(s):// 开头，重测间隔 0–1440 分钟'
     return
   }
-  if (!limitsValid.value) {
+  if (!limitsOk.value) {
     saveError.value = '全局限制不合法：RPM ≤ 1,000,000，并发 ≤ 100,000'
     return
   }
-  if (!ipLimitsValid.value) {
+  if (!ipLimitsOk.value) {
     saveError.value = '单 IP 限制不合法：RPM ≤ 1,000,000'
     return
   }
-  if (!backupValid.value) {
+  if (!backupOk.value) {
     saveError.value = '自动备份不合法：间隔 ≤ 8760 小时，保留 1–100 份'
     return
   }
-  if (!emptyResponseRetryValid.value) {
+  if (!emptyRetryOk.value) {
     saveError.value = '空回复重试不合法：判定窗口需为 0–3600 秒，最大重试需为 0–100 次'
     return
   }
-  if (!affinityValid.value) {
+  if (!affinityOk.value) {
     saveError.value =
       '亲和规则不合法：名称需非空且唯一、每条规则至少一个来源、header 名不能为空、body 路径需以 / 开头、TTL 需为 1–604800 的整数'
     return
   }
   saveError.value = null
-  saved.value = false
   await saveSettings.run(
     async () => {
       const savedSections: string[] = []
@@ -799,286 +513,9 @@ async function save() {
         affinity.value = saved_
         affinityRules.value = saved_.rules.map(ruleToDraft)
         affinitySnapshot = JSON.stringify(affinityCurrent())
-        void refreshAffinityStats()
       })
     },
-    () => {
-      saved.value = true
-      return '已保存'
-    },
-  )
-}
-
-const testNotify = useAction('发送失败')
-
-async function sendTestNotification() {
-  await testNotify.run(
-    () => settings.testNotify(),
-    () => '已发送 —— 去通知渠道确认收到',
-  )
-}
-
-// ── Webhook 签名密钥 ──
-
-/** 服务端只回 configured 标志，不回明文；草稿为空时 PUT null 清除。 */
-const webhookSecretConfigured = ref(false)
-const webhookSecretDraft = ref('')
-const showWebhookSecret = ref(false)
-const saveWebhookSecret = useAction('保存失败', { toast: true })
-
-async function applyWebhookSecret() {
-  if (saveWebhookSecret.busy) return
-  const secret = webhookSecretDraft.value.trim()
-  await saveWebhookSecret.run(
-    () => settings.setWebhookSecret(secret || null),
-    (res) => {
-      webhookSecretConfigured.value = res.configured
-      webhookSecretDraft.value = ''
-      return secret ? '签名密钥已保存，webhook 请求将携带签名头。' : '签名密钥已清除。'
-    },
-  )
-}
-
-// ── 凭据静态加密 ──
-
-const masterKeyConfigured = ref(false)
-const masterKeyDraft = ref('')
-const showMasterKey = ref(false)
-const saveMasterKey = useAction('保存失败', { toast: true })
-
-/** 启用或更换主密钥；留空保存即清除（之后新凭据回到明文存储）。 */
-async function applyMasterKey() {
-  if (saveMasterKey.busy) return
-  const key = masterKeyDraft.value.trim()
-  await saveMasterKey.run(
-    () => settings.setMasterKey(key || null),
-    (res) => {
-      masterKeyConfigured.value = res.configured
-      masterKeyDraft.value = ''
-      return key ? '主密钥已保存。' : '主密钥已清除，新凭据将明文存储。'
-    },
-  )
-}
-
-// ── 备份文件管理 ──
-const backupFiles = ref<BackupFile[]>([])
-const backupListLoading = ref(false)
-const createBackup = useAction('备份失败', { toast: true })
-const downloadBackup = useAction('下载失败', { toast: true })
-const removeBackup = useAction('删除失败', { toast: true })
-const downloadingBackupName = ref<string | null>(null)
-const deletingBackupName = ref<string | null>(null)
-/** 待确认删除的备份文件名 —— 删除不可恢复，沿用渠道列表的二次确认模式。 */
-const pendingBackupDelete = ref<string | null>(null)
-
-async function refreshBackupFiles() {
-  backupListLoading.value = true
-  backupFiles.value = await orElse(() => backupsApi.list(), [])
-  backupListLoading.value = false
-}
-
-/** 立即生成一份备份，成功后刷新列表。 */
-async function createBackupFile() {
-  if (createBackup.busy) return
-  await createBackup.run(
-    () => backupsApi.create(),
-    (res) => {
-      void refreshBackupFiles()
-      return `备份已创建：${res.name}`
-    },
-  )
-}
-
-/** 带管理令牌下载指定备份（裸 <a href> 不带令牌会 401）。 */
-async function downloadBackupFile(name: string) {
-  if (downloadingBackupName.value) return
-  downloadingBackupName.value = name
-  await downloadBackup.run(
-    () => backupsApi.download(name),
-    () => `已下载：${name}`,
-  )
-  downloadingBackupName.value = null
-}
-
-async function deleteBackupFile(name: string) {
-  if (deletingBackupName.value) return
-  deletingBackupName.value = name
-  await removeBackup.run(
-    () => backupsApi.remove(name),
-    () => {
-      pendingBackupDelete.value = null
-      void refreshBackupFiles()
-      return `已删除：${name}`
-    },
-  )
-  deletingBackupName.value = null
-}
-
-onMounted(() => {
-  void refreshBackupFiles()
-})
-
-const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[] = [
-  {
-    value: 'weighted_random',
-    label: '加权随机（推荐）',
-    desc: '同优先级内按权重随机选取。适合多渠道流量分配。',
-  },
-  { value: 'round_robin', label: '轮询', desc: '同优先级内按顺序轮转。适合等量消耗多家余额。' },
-  { value: 'first', label: '固定首选', desc: '总是命中同优先级内第一个可用渠道。简单但单点。' },
-]
-
-// ── 管理令牌 ──
-
-/** 当前会话状态 */
-const sessionActive = ref(true)
-const tokenDraft = ref('')
-const showTokenDraft = ref(false)
-const applyAdminToken = useAction('设置失败', { toast: true })
-const clearAdminToken = useAction('关闭失败', { toast: true })
-const logoutSession = useAction('退出失败', { toast: true })
-const tokenBusy = computed(() => applyAdminToken.busy || clearAdminToken.busy || logoutSession.busy)
-
-onMounted(async () => {
-  const s = await orElse(() => authApi.session())
-  if (s) sessionActive.value = s.authenticated
-})
-
-/**
- * 启用或更换服务端令牌。
- *
- * 服务端在设置成功后会直接下发最新 Session Cookie，当前浏览器自动保持登录。
- */
-async function applyToken() {
-  const token = tokenDraft.value.trim()
-  if (!token || tokenBusy.value) return
-  await applyAdminToken.run(
-    () => settings.setAdminToken(token),
-    () => {
-      sessionActive.value = true
-      tokenDraft.value = ''
-      return '令牌已生效，会话已更新。'
-    },
-  )
-}
-
-/** 关闭管理鉴权：服务端清除令牌哈希与 Cookie。 */
-async function clearToken() {
-  if (tokenBusy.value) return
-  await clearAdminToken.run(
-    () => settings.setAdminToken(null),
-    () => {
-      sessionActive.value = true
-      return '管理鉴权已关闭。'
-    },
-  )
-}
-
-/** 登出当前控制台会话 */
-async function logout() {
-  if (tokenBusy.value) return
-  await logoutSession.run(
-    () => authApi.logout(),
-    () => {
-      window.location.reload()
-    },
-  )
-}
-
-// ── 数据备份 ──
-
-const exportBackupAction = useAction('导出失败', { toast: true })
-const importBackupAction = useAction('导入失败', { toast: true })
-const downloadDbBackupAction = useAction('备份失败', { toast: true })
-const importMode = ref<'merge' | 'replace'>('merge')
-const importFileInput = ref<HTMLInputElement | null>(null)
-/** 待确认的替换导入：文件已解析但还没提交，等用户二次确认。 */
-const pendingReplace = ref<{ name: string; payload: unknown } | null>(null)
-
-/** 导出全量配置并触发浏览器下载。 */
-async function exportBackup() {
-  if (exportBackupAction.busy) return
-  await exportBackupAction.run(
-    () => backup.export(),
-    (document_) => {
-      const blob = new Blob([JSON.stringify(document_, null, 2)], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `refract-backup-${new Date().toISOString().slice(0, 10)}.json`
-      a.click()
-      window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
-      return '备份已下载'
-    },
-  )
-}
-
-/** 下载 SQLite 在线热备（带鉴权；裸 <a href> 不带管理令牌会 401）。 */
-async function downloadDatabaseBackup() {
-  if (downloadDbBackupAction.busy) return
-  await downloadDbBackupAction.run(
-    () => dataApi.backup(),
-    () => '数据库备份已下载',
-  )
-}
-
-/**
- * 读取选中的备份文件。合并模式直接导入；替换模式先清空再导入、
- * 不可恢复，所以解析后停下来等一次显式确认。
- */
-async function importBackup(event: Event) {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  input.value = ''
-  if (!file || importBackupAction.busy) return
-
-  importBackupAction.clear()
-  pendingReplace.value = null
-  const parsed = parseJson(await file.text())
-  if (parsed === undefined) {
-    importBackupAction.notice = { tone: 'danger', text: '文件不是有效的 JSON' }
-    return
-  }
-
-  if (importMode.value === 'replace') {
-    pendingReplace.value = { name: file.name, payload: parsed }
-    return
-  }
-  await runImport(parsed)
-}
-
-/** 用户确认后执行替换导入。 */
-async function confirmReplaceImport() {
-  const pending = pendingReplace.value
-  if (!pending) return
-  pendingReplace.value = null
-  await runImport(pending.payload)
-}
-
-/** 跳过名单太长会把提示挤成一堵墙：列前几个，其余折成计数。 */
-function skippedDetail(kind: string, names: string[]): string {
-  if (names.length === 0) return ''
-  const shown = names.slice(0, 5).join('、')
-  const rest = names.length > 5 ? ` 等 ${names.length} 个` : ''
-  return `跳过的${kind}：${shown}${rest}。`
-}
-
-async function runImport(payload: unknown) {
-  await importBackupAction.run(
-    () => backup.import(payload, importMode.value),
-    (result) => {
-      const detail = [
-        skippedDetail('渠道', result.skipped_channels ?? []),
-        skippedDetail('密钥', result.skipped_keys ?? []),
-      ]
-        .filter(Boolean)
-        .join(' ')
-      return (
-        `导入完成：渠道 +${result.channels_imported}（跳过 ${result.channels_skipped}），` +
-        `密钥 +${result.keys_imported}（跳过 ${result.keys_skipped}）。` +
-        (detail ? ` ${detail}` : '')
-      )
-    },
+    () => '已保存',
   )
 }
 </script>
@@ -1099,991 +536,74 @@ async function runImport(payload: unknown) {
     </div>
 
     <template v-else>
-      <!-- 路由策略 -->
-      <section class="glass glass-specular flex flex-col gap-5 p-5">
-        <div
-          v-if="sectionErrors.policy"
-          class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-        >
-          <span>加载失败：{{ sectionErrors.policy }}</span>
-          <button
-            type="button"
-            class="font-medium hover:underline"
-            @click="reloadSection('policy')"
-          >
-            重试
-          </button>
-        </div>
-        <h2 class="text-sm font-semibold text-ink-soft uppercase">路由策略</h2>
+      <RoutingPolicySection
+        v-model="policy"
+        v-model:empty-retry="emptyResponseRetry"
+        :load-error="sectionErrors.policy"
+        :empty-retry-error="sectionErrors.emptyRetry"
+        :valid="policyOk"
+        :empty-retry-valid="emptyRetryOk"
+        @retry="reloadSection('policy')"
+        @retry-empty-retry="reloadSection('emptyRetry')"
+      />
 
-        <!-- 原生优先（需求 6） -->
-        <label class="flex cursor-pointer items-center gap-3">
-          <GlassSwitch v-model="policy.native_first" label="原生优先" />
-          <div>
-            <span class="text-sm font-medium">原生优先</span>
-            <p class="mt-0.5 text-xs text-ink-faint">
-              关闭时路由逻辑与 new-api 一致。打开时命中同一模型的原生协议端点始终排在转换端点之前。
-            </p>
-          </div>
-        </label>
+      <AffinitySection
+        v-model="affinity"
+        v-model:rules="affinityRules"
+        :load-error="sectionErrors.affinity"
+        :valid="affinityOk"
+        @retry="reloadSection('affinity')"
+      />
 
-        <!-- 选择模式 -->
-        <div>
-          <span class="mb-2 block text-sm font-medium text-ink-soft">选择模式</span>
-          <div class="flex flex-col gap-2">
-            <label
-              v-for="o in SELECTION_OPTIONS"
-              :key="o.value"
-              class="flex cursor-pointer items-start gap-3 rounded-lg border border-ink/8 px-4 py-3 transition-colors duration-150"
-              :class="
-                policy.selection === o.value
-                  ? 'border-accent/40 bg-accent/8'
-                  : 'hover:bg-ink/[0.03]'
-              "
-            >
-              <input
-                v-model="policy.selection"
-                type="radio"
-                :value="o.value"
-                name="selection"
-                class="mt-0.5 accent-[var(--color-accent)]"
-              />
-              <div>
-                <p class="text-sm font-medium">{{ o.label }}</p>
-                <p class="mt-0.5 text-xs text-ink-faint">{{ o.desc }}</p>
-              </div>
-            </label>
-          </div>
-        </div>
+      <BreakerSection
+        v-model="breaker"
+        :load-error="sectionErrors.breaker"
+        :valid="breakerOk"
+        @retry="reloadSection('breaker')"
+      />
 
-        <!-- 最大重试 -->
-        <label class="flex flex-col gap-1.5">
-          <span class="text-sm font-medium text-ink-soft">
-            最大重试次数
-            <span class="ml-2 font-normal text-ink-faint">
-              0 = 不限。建议 2–3。过大会拉长超时。
-            </span>
-          </span>
-          <input
-            v-model.number="policy.max_attempts"
-            type="number"
-            min="0"
-            max="32"
-            class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
-          />
-        </label>
+      <DataHotBackupSection :db-stats="dbStats" />
 
-        <!-- 单请求上游调用上限 -->
-        <label class="flex flex-col gap-1.5">
-          <span class="text-sm font-medium text-ink-soft">
-            单请求上游调用上限
-            <span class="ml-2 font-normal text-ink-faint">
-              含重试在内的上游调用总次数，0 = 不限，默认 8。
-            </span>
-          </span>
-          <input
-            v-model.number="policy.max_upstream_calls"
-            type="number"
-            min="0"
-            max="255"
-            step="1"
-            inputmode="numeric"
-            aria-label="单请求上游调用次数上限"
-            class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
-          />
-        </label>
-        <p v-if="!policyValid" class="text-xs text-danger" role="alert">
-          最大重试 0–32（0 = 不限）；上游调用上限 0–255。
-        </p>
+      <GlobalLimitsSection
+        v-model="limits"
+        v-model:ip-limits="ipLimits"
+        :load-error="sectionErrors.limits"
+        :valid="limitsOk"
+        :ip-valid="ipLimitsOk"
+        @retry="reloadSection('limits')"
+      />
 
-        <!-- 重试同一渠道 -->
-        <label class="flex cursor-pointer items-center gap-3">
-          <input
-            v-model="policy.retry_same_channel"
-            type="checkbox"
-            class="accent-[var(--color-accent)]"
-          />
-          <span class="text-sm">
-            重试时允许再次命中同一渠道
-            <span class="text-xs text-ink-faint"
-              >—— 建议关闭，否则 500 可能只是上游临时故障，原渠道未必恢复</span
-            >
-          </span>
-        </label>
+      <NotifySection
+        v-model="notify"
+        v-model:secret-configured="webhookSecretConfigured"
+        :load-error="sectionErrors.notify"
+        :secret-load-error="sectionErrors.webhookSecret"
+        :valid="notifyOk"
+        :dirty="notifyDirty"
+        @retry="reloadSection('notify')"
+        @retry-secret="reloadSection('webhookSecret')"
+      />
 
-        <!-- HTTP 200 空回复重试 -->
-        <div class="border-t border-ink/8 pt-4">
-          <div
-            v-if="sectionErrors.emptyRetry"
-            class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-          >
-            <span>加载失败：{{ sectionErrors.emptyRetry }}</span>
-            <button
-              type="button"
-              class="font-medium hover:underline"
-              @click="reloadSection('emptyRetry')"
-            >
-              重试
-            </button>
-          </div>
-          <span class="text-sm font-medium text-ink-soft">上游 200 空回复重试</span>
-          <p class="mt-1 text-xs text-ink-faint">
-            上游返回 HTTP 200 但没有文本、推理、拒答或工具调用，且“完成时刻 −
-            首字节时刻”不超过判定窗口时，在同一渠道重试。任一值为 0 即关闭。
-          </p>
-          <div class="mt-3 grid max-w-md grid-cols-1 gap-4 sm:grid-cols-2">
-            <label class="flex flex-col gap-1.5">
-              <span class="text-xs font-medium text-ink-soft">判定窗口（秒）</span>
-              <input
-                v-model.number="emptyResponseRetry.window_secs"
-                type="number"
-                min="0"
-                max="3600"
-                step="1"
-                inputmode="numeric"
-                class="glass-field tabular px-3 py-2 text-sm outline-none"
-              />
-            </label>
-            <label class="flex flex-col gap-1.5">
-              <span class="text-xs font-medium text-ink-soft">最大重试次数</span>
-              <input
-                v-model.number="emptyResponseRetry.max_retries"
-                type="number"
-                min="0"
-                max="100"
-                step="1"
-                inputmode="numeric"
-                class="glass-field tabular px-3 py-2 text-sm outline-none"
-              />
-            </label>
-          </div>
-          <p v-if="!emptyResponseRetryValid" class="mt-2 text-xs text-danger" role="alert">
-            判定窗口需为 0–3600 秒，最大重试需为 0–100 次。
-          </p>
+      <PricingSection
+        v-model="pricing"
+        :load-error="sectionErrors.pricing"
+        :valid="pricingOk"
+        @retry="reloadSection('pricing')"
+      />
 
-          <label class="mt-4 flex cursor-pointer items-center gap-3 border-t border-ink/8 pt-4">
-            <GlassSwitch
-              v-model="emptyResponseRetry.reject_nonstandard_200"
-              label="非标准 200 转为 500"
-            />
-            <div>
-              <span class="text-sm font-medium">非标准 200 转为 500</span>
-              <p class="mt-0.5 text-xs text-ink-faint">
-                开启后，纯文本、HTML 或无法识别的 JSON/SSE 等不符合渠道协议的 HTTP 200
-                响应会转换为不可重试的 500，并返回明确错误提示。
-              </p>
-            </div>
-          </label>
-        </div>
-      </section>
+      <LogRetentionSection
+        v-model="retentionDays"
+        v-model:log-bodies="logBodies"
+        :load-error="sectionErrors.retention"
+        :valid="retentionOk"
+        @retry="reloadSection('retention')"
+      />
 
-      <!-- 渠道亲和性 -->
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div
-          v-if="sectionErrors.affinity"
-          class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-        >
-          <span>加载失败：{{ sectionErrors.affinity }}</span>
-          <button
-            type="button"
-            class="font-medium hover:underline"
-            @click="reloadSection('affinity')"
-          >
-            重试
-          </button>
-        </div>
-        <label class="flex cursor-pointer items-center gap-3">
-          <GlassSwitch v-model="affinity.enabled" label="启用渠道亲和性" />
-          <div>
-            <span class="text-sm font-semibold text-ink-soft uppercase">渠道亲和性</span>
-            <p class="mt-1 text-xs text-ink-faint">
-              按规则（API 密钥 / 请求头 /
-              请求体字段）把调用方绑定到固定渠道，后续请求优先命中同一渠道。
-              仅参与路由选择，不影响密钥池与熔断。改动保存后立即生效。
-            </p>
-          </div>
-        </label>
-
-        <template v-if="affinity.enabled">
-          <!-- 预设 -->
-          <div class="border-t border-ink/8 pt-4">
-            <span class="mb-2 block text-sm font-medium text-ink-soft">常用预设</span>
-            <div class="flex flex-wrap gap-2">
-              <button
-                v-for="preset in AFFINITY_PRESETS"
-                :key="preset.label"
-                type="button"
-                class="glass-button-ghost px-3 py-2 text-sm"
-                :title="preset.desc"
-                @click="applyAffinityPreset(preset)"
-              >
-                <AppIcon name="sparkles" :size="14" />
-                {{ preset.label }}
-              </button>
-            </div>
-          </div>
-
-          <!-- 规则列表 -->
-          <div class="border-t border-ink/8 pt-4">
-            <div class="mb-3 flex items-center justify-between">
-              <span class="text-sm font-medium text-ink-soft">亲和规则</span>
-              <button
-                type="button"
-                class="glass-button-ghost px-3 py-2 text-sm"
-                @click="addAffinityRule"
-              >
-                <AppIcon name="plus" :size="14" />
-                添加规则
-              </button>
-            </div>
-            <p v-if="affinityRules.length === 0" class="text-xs text-ink-faint">
-              尚未配置规则；启用后无规则时不产生任何绑定。
-            </p>
-
-            <div
-              v-for="(draft, ri) in affinityRules"
-              :key="ri"
-              class="mb-4 rounded-xl border border-ink/8 p-4"
-            >
-              <div class="flex items-start gap-3">
-                <label class="flex flex-1 flex-col gap-1.5">
-                  <span class="text-xs font-medium text-ink-soft"
-                    >规则名（缓存键的一部分，需唯一）</span
-                  >
-                  <input
-                    v-model="draft.name"
-                    type="text"
-                    class="glass-field px-3 py-2 text-sm outline-none"
-                    placeholder="例如 by-api-key"
-                  />
-                </label>
-                <button
-                  type="button"
-                  class="glass-button-ghost glass-button-ghost-danger shrink-0 px-2 py-2"
-                  :aria-label="`删除规则 ${draft.name}`"
-                  @click="removeAffinityRule(ri)"
-                >
-                  <AppIcon name="trash" :size="13" />
-                </button>
-              </div>
-
-              <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
-                <label class="flex flex-col gap-1.5">
-                  <span class="text-xs text-ink-soft">模型正则（空 = 全部模型）</span>
-                  <input
-                    v-model="draft.model_regex"
-                    type="text"
-                    class="glass-field px-3 py-2 font-mono text-sm outline-none"
-                    placeholder="^(gpt|claude)-.*"
-                  />
-                </label>
-                <label class="flex flex-col gap-1.5">
-                  <span class="text-xs text-ink-soft">路径正则（空 = 全部路径）</span>
-                  <input
-                    v-model="draft.path_regex"
-                    type="text"
-                    class="glass-field px-3 py-2 font-mono text-sm outline-none"
-                    placeholder="/v1/chat/completions"
-                  />
-                </label>
-                <label class="flex flex-col gap-1.5">
-                  <span class="text-xs text-ink-soft">取值正则（空 = 原样绑定）</span>
-                  <input
-                    v-model="draft.value_regex"
-                    type="text"
-                    class="glass-field px-3 py-2 font-mono text-sm outline-none"
-                    placeholder="^user-(\d+)"
-                  />
-                </label>
-              </div>
-
-              <!-- 来源列表 -->
-              <div class="mt-3">
-                <div class="mb-2 flex items-center justify-between">
-                  <span class="text-xs font-medium text-ink-soft"
-                    >绑定来源（按顺序取第一个命中值）</span
-                  >
-                  <button
-                    type="button"
-                    class="glass-button-ghost px-2 py-1 text-xs"
-                    @click="addSourceRow(draft)"
-                  >
-                    <AppIcon name="plus" :size="12" />
-                    来源
-                  </button>
-                </div>
-                <div
-                  v-for="(row, si) in draft.sources"
-                  :key="si"
-                  class="mb-2 flex items-center gap-2"
-                >
-                  <select
-                    v-model="row.kind"
-                    class="glass-field w-40 px-2 py-2 text-sm outline-none"
-                    aria-label="来源类型"
-                  >
-                    <option value="api_key_id">调用方 API 密钥</option>
-                    <option value="header">请求头</option>
-                    <option value="body">请求体字段</option>
-                  </select>
-                  <input
-                    v-if="row.kind !== 'api_key_id'"
-                    v-model="row.value"
-                    type="text"
-                    class="glass-field flex-1 px-3 py-2 font-mono text-sm outline-none"
-                    :placeholder="
-                      row.kind === 'header'
-                        ? '请求头名，如 X-User-Id'
-                        : 'JSON 指针，如 /metadata/user_id'
-                    "
-                  />
-                  <button
-                    v-if="draft.sources.length > 1"
-                    type="button"
-                    class="glass-button-ghost shrink-0 px-2 py-2"
-                    :aria-label="`删除来源 ${si + 1}`"
-                    @click="removeSourceRow(draft, si)"
-                  >
-                    <AppIcon name="x" :size="13" />
-                  </button>
-                </div>
-              </div>
-
-              <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
-                <label class="flex flex-col gap-1.5">
-                  <span class="text-xs text-ink-soft">TTL（秒，空 = 用全局默认）</span>
-                  <input
-                    v-model.number="draft.ttl_secs"
-                    type="number"
-                    min="1"
-                    max="604800"
-                    class="glass-field tabular px-3 py-2 text-sm outline-none"
-                    placeholder="默认"
-                  />
-                </label>
-                <label class="flex cursor-pointer items-center gap-2 self-end pb-2">
-                  <input
-                    v-model="draft.include_model"
-                    type="checkbox"
-                    class="accent-[var(--color-accent)]"
-                  />
-                  <span class="text-xs text-ink-soft">模型参与绑定键（不同模型分开绑定）</span>
-                </label>
-                <label class="flex cursor-pointer items-center gap-2 self-end pb-2">
-                  <input
-                    v-model="draft.skip_retry_on_failure"
-                    type="checkbox"
-                    class="accent-[var(--color-accent)]"
-                  />
-                  <span class="text-xs text-ink-soft">失败后不切换其他渠道（保持绑定）</span>
-                </label>
-              </div>
-            </div>
-          </div>
-
-          <!-- 全局参数 -->
-          <div class="border-t border-ink/8 pt-4">
-            <span class="mb-2 block text-sm font-medium text-ink-soft">全局参数</span>
-            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <label class="flex flex-col gap-1.5">
-                <span class="text-xs text-ink-soft">最大绑定条数（LRU 上限）</span>
-                <input
-                  v-model.number="affinity.max_entries"
-                  type="number"
-                  min="1"
-                  class="glass-field tabular w-40 px-3 py-2 text-sm outline-none"
-                />
-              </label>
-              <label class="flex flex-col gap-1.5">
-                <span class="text-xs text-ink-soft">默认 TTL（秒，1–604800）</span>
-                <input
-                  v-model.number="affinity.default_ttl_secs"
-                  type="number"
-                  min="1"
-                  max="604800"
-                  class="glass-field tabular w-40 px-3 py-2 text-sm outline-none"
-                />
-              </label>
-              <label class="flex cursor-pointer items-center gap-2">
-                <input
-                  v-model="affinity.switch_on_success"
-                  type="checkbox"
-                  class="accent-[var(--color-accent)]"
-                />
-                <span class="text-xs text-ink-soft">绑定渠道成功后更新 TTL（推荐开启）</span>
-              </label>
-              <label class="flex cursor-pointer items-center gap-2">
-                <input
-                  v-model="affinity.keep_on_channel_disabled"
-                  type="checkbox"
-                  class="accent-[var(--color-accent)]"
-                />
-                <span class="text-xs text-ink-soft">渠道被禁用时保留绑定（否则失效回退重选）</span>
-              </label>
-            </div>
-          </div>
-
-          <!-- 运行状态 -->
-          <div class="border-t border-ink/8 pt-4">
-            <div class="flex items-center justify-between">
-              <span class="text-sm font-medium text-ink-soft">绑定状态</span>
-              <button
-                type="button"
-                class="glass-button-ghost glass-button-ghost-danger px-3 py-2 text-sm disabled:opacity-50"
-                :disabled="clearAffinity.busy"
-                @click="clearAffinityBindings"
-              >
-                <AppIcon
-                  :name="clearAffinity.busy ? 'spinner' : 'trash'"
-                  :class="clearAffinity.busy ? 'animate-spin' : ''"
-                  :size="13"
-                />
-                {{ clearAffinity.busy ? '清除中…' : '清空绑定' }}
-              </button>
-            </div>
-            <p v-if="affinityStats" class="mt-2 text-xs text-ink-faint">
-              当前绑定
-              <span class="font-mono text-ink-soft">{{ affinityStats.stats.entries }}</span> 条
-              （容量上限 <span class="font-mono text-ink-soft">{{ affinity.max_entries }}</span
-              >），命中
-              <span class="font-mono text-ink-soft">{{ affinityStats.stats.hits }}</span> / 未命中
-              <span class="font-mono text-ink-soft">{{ affinityStats.stats.misses }}</span
-              >，淘汰
-              <span class="font-mono text-ink-soft">{{ affinityStats.stats.evictions }}</span
-              >。
-            </p>
-          </div>
-
-          <p v-if="!affinityValid" class="text-xs text-danger" role="alert">
-            规则不合法：名称需非空且唯一；每条规则至少一个来源；请求头名不能为空；body 路径需以 /
-            开头；TTL 需为 1–604800 的整数。
-          </p>
-        </template>
-      </section>
-
-      <!-- 熔断 -->
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div
-          v-if="sectionErrors.breaker"
-          class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-        >
-          <span>加载失败：{{ sectionErrors.breaker }}</span>
-          <button
-            type="button"
-            class="font-medium hover:underline"
-            @click="reloadSection('breaker')"
-          >
-            重试
-          </button>
-        </div>
-        <div>
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">熔断</h2>
-          <p class="mt-1 text-xs text-ink-faint">
-            端点连续失败达到阈值后暂停参与路由，冷却按指数退避直到上限；期间一次成功即恢复。
-            阈值设为 0 关闭熔断。改动立即生效，已在冷却中的端点不受影响。
-          </p>
-        </div>
-
-        <div class="grid max-w-lg grid-cols-1 gap-4 sm:grid-cols-3">
-          <label class="flex flex-col gap-1.5">
-            <span class="text-sm font-medium text-ink-soft">失败阈值</span>
-            <input
-              v-model.number="breaker.failure_threshold"
-              type="number"
-              min="0"
-              max="1000"
-              step="1"
-              inputmode="numeric"
-              aria-label="熔断失败阈值"
-              class="glass-field tabular px-3 py-2 text-sm outline-none"
-            />
-            <span class="text-xs text-ink-faint">连续失败次数，0 关闭</span>
-          </label>
-
-          <label class="flex flex-col gap-1.5">
-            <span class="text-sm font-medium text-ink-soft">起始冷却（秒）</span>
-            <input
-              v-model.number="breaker.base_cooldown_secs"
-              type="number"
-              min="1"
-              max="86400"
-              step="1"
-              inputmode="numeric"
-              aria-label="熔断起始冷却秒数"
-              class="glass-field tabular px-3 py-2 text-sm outline-none"
-            />
-            <span class="text-xs text-ink-faint">首次熔断的时长</span>
-          </label>
-
-          <label class="flex flex-col gap-1.5">
-            <span class="text-sm font-medium text-ink-soft">冷却上限（秒）</span>
-            <input
-              v-model.number="breaker.max_cooldown_secs"
-              type="number"
-              min="1"
-              max="86400"
-              step="1"
-              inputmode="numeric"
-              aria-label="熔断冷却上限秒数"
-              class="glass-field tabular px-3 py-2 text-sm outline-none"
-            />
-            <span class="text-xs text-ink-faint">退避不超过该值</span>
-          </label>
-        </div>
-
-        <p v-if="!breakerValid" class="text-xs text-danger" role="alert">
-          阈值 0–1000；冷却 1–86400 秒，且上限不能小于起始值。
-        </p>
-      </section>
-
-      <!-- 数据 -->
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div>
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">数据</h2>
-          <p class="mt-1 text-xs text-ink-faint">
-            SQLite 在线热备（VACUUM INTO，产物紧凑、可直接恢复使用）。
-            配置备份只含渠道与密钥，这里是含全部请求日志的完整数据库。
-          </p>
-        </div>
-
-        <div v-if="dbStats" class="flex flex-wrap gap-x-6 gap-y-1 text-sm text-ink-soft">
-          <span>
-            体积 <span class="tabular font-medium">{{ fmtBytes(dbStats.db_bytes) }}</span>
-          </span>
-          <span>
-            日志 <span class="tabular font-medium">{{ dbStats.log_rows.toLocaleString() }}</span> 行
-          </span>
-          <span v-if="dbStats.oldest_log_at">
-            最旧 <span class="tabular font-medium">{{ dbStats.oldest_log_at }}</span>
-          </span>
-        </div>
-
-        <div>
-          <button
-            type="button"
-            class="glass-button-ghost inline-flex items-center gap-1.5 px-3 py-2 text-sm"
-            :disabled="downloadDbBackupAction.busy"
-            @click="downloadDatabaseBackup"
-          >
-            <AppIcon
-              :name="downloadDbBackupAction.busy ? 'spinner' : 'download'"
-              :class="downloadDbBackupAction.busy ? 'animate-spin' : ''"
-              :size="14"
-            />
-            {{ downloadDbBackupAction.busy ? '生成备份中…' : '下载数据库备份' }}
-          </button>
-        </div>
-      </section>
-
-      <!-- 全局限制 -->
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div
-          v-if="sectionErrors.limits"
-          class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-        >
-          <span>加载失败：{{ sectionErrors.limits }}</span>
-          <button
-            type="button"
-            class="font-medium hover:underline"
-            @click="reloadSection('limits')"
-          >
-            重试
-          </button>
-        </div>
-        <div>
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">全局限制</h2>
-          <p class="mt-1 text-xs text-ink-faint">
-            网关级保险丝，对所有请求生效（包括免鉴权模式）。跑飞的本地 agent
-            循环不该原样打穿上游账单。0 表示不限。
-          </p>
-        </div>
-
-        <div class="grid max-w-xl grid-cols-1 gap-4 sm:grid-cols-2">
-          <label class="flex flex-col gap-1.5">
-            <span class="text-sm font-medium text-ink-soft">全局 RPM</span>
-            <input
-              v-model.number="limits.rpm"
-              type="number"
-              min="0"
-              max="1000000"
-              step="1"
-              inputmode="numeric"
-              aria-label="全局每分钟请求数上限"
-              class="glass-field tabular px-3 py-2 text-sm outline-none"
-            />
-            <span class="text-xs text-ink-faint">每分钟请求数上限</span>
-          </label>
-
-          <label class="flex flex-col gap-1.5">
-            <span class="text-sm font-medium text-ink-soft">全局 TPM</span>
-            <input
-              v-model.number="limits.tpm"
-              type="number"
-              min="0"
-              max="1000000000"
-              step="1000"
-              inputmode="numeric"
-              aria-label="全局每分钟 token 数上限"
-              class="glass-field tabular px-3 py-2 text-sm outline-none"
-            />
-            <span class="text-xs text-ink-faint">
-              每分钟 token 数上限。RPM 挡不住「少量请求 × 巨大上下文」
-            </span>
-          </label>
-
-          <label class="flex flex-col gap-1.5">
-            <span class="text-sm font-medium text-ink-soft">并发上限</span>
-            <input
-              v-model.number="limits.max_concurrency"
-              type="number"
-              min="0"
-              max="100000"
-              step="1"
-              inputmode="numeric"
-              aria-label="全局并发上限"
-              class="glass-field tabular px-3 py-2 text-sm outline-none"
-            />
-            <span class="text-xs text-ink-faint">同时在途请求数（流式占用直到结束）</span>
-          </label>
-
-          <label class="flex flex-col gap-1.5">
-            <span class="text-sm font-medium text-ink-soft">单 IP RPM</span>
-            <input
-              v-model.number="ipLimits.rpm"
-              type="number"
-              min="0"
-              max="1000000"
-              step="1"
-              inputmode="numeric"
-              aria-label="单 IP 每分钟请求数上限"
-              class="glass-field tabular px-3 py-2 text-sm outline-none"
-            />
-            <span class="text-xs text-ink-faint">单 IP 每分钟请求上限，0 = 不限</span>
-          </label>
-        </div>
-
-        <p v-if="!limitsValid" class="text-xs text-danger" role="alert">
-          RPM ≤ 1,000,000；TPM ≤ 1,000,000,000；并发 ≤ 100,000。
-        </p>
-        <p v-if="!ipLimitsValid" class="text-xs text-danger" role="alert">
-          单 IP RPM ≤ 1,000,000。
-        </p>
-      </section>
-
-      <!-- 通知与自愈 -->
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div>
-          <div
-            v-if="sectionErrors.notify"
-            class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-          >
-            <span>加载失败：{{ sectionErrors.notify }}</span>
-            <button
-              type="button"
-              class="font-medium hover:underline"
-              @click="reloadSection('notify')"
-            >
-              重试
-            </button>
-          </div>
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">通知与自愈</h2>
-          <p class="mt-1 text-xs text-ink-faint">
-            熔断、恢复、自动禁用事件推送到 webhook（通用 JSON，可对接 Server酱 / 飞书 / Telegram
-            网桥）。连续 3 次凭据错误的渠道会被自动停用， 并按设定间隔重测，通过即自动恢复。
-          </p>
-        </div>
-
-        <label class="flex flex-col gap-1.5">
-          <span class="text-sm font-medium text-ink-soft">Webhook 地址</span>
-          <div class="flex items-center gap-2">
-            <input
-              v-model="notify.webhook_url"
-              type="url"
-              placeholder="https://example.com/hook（留空关闭通知）"
-              aria-label="告警 webhook 地址"
-              class="glass-field w-full max-w-xl px-3 py-2 font-mono text-sm outline-none"
-            />
-            <button
-              type="button"
-              class="glass-button-ghost shrink-0 px-3 py-2 text-sm"
-              :disabled="testNotify.busy || notifyDirty || !notify.webhook_url"
-              :title="notifyDirty ? '先保存设置再测试' : '发送一条测试通知'"
-              @click="sendTestNotification"
-            >
-              <AppIcon v-if="testNotify.busy" name="spinner" class="animate-spin mr-1" :size="13" />
-              {{ testNotify.busy ? '发送中…' : '发送测试' }}
-            </button>
-          </div>
-          <span v-if="testNotify.notice?.text" class="text-xs text-ink-soft">
-            {{ testNotify.notice?.text }}
-          </span>
-        </label>
-
-        <div
-          v-if="sectionErrors.webhookSecret"
-          class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-        >
-          <span>加载失败：{{ sectionErrors.webhookSecret }}</span>
-          <button
-            type="button"
-            class="font-medium hover:underline"
-            @click="reloadSection('webhookSecret')"
-          >
-            重试
-          </button>
-        </div>
-        <!-- Webhook 签名密钥 -->
-        <div class="flex max-w-xl flex-col gap-1.5">
-          <span class="text-sm font-medium text-ink-soft">
-            Webhook 签名密钥
-            <span v-if="webhookSecretConfigured" class="ml-2 font-normal text-success">
-              已配置（留空保存则清除）
-            </span>
-            <span v-else class="ml-2 font-normal text-ink-faint">未配置</span>
-          </span>
-          <div class="relative">
-            <input
-              v-model="webhookSecretDraft"
-              :type="showWebhookSecret ? 'text' : 'password'"
-              :placeholder="
-                webhookSecretConfigured ? '新签名密钥；留空保存即清除' : '签名密钥（留空不签名）'
-              "
-              autocomplete="new-password"
-              aria-label="Webhook 签名密钥"
-              class="glass-field w-full px-3 py-2 pr-16 font-mono text-sm outline-none"
-            />
-            <button
-              type="button"
-              class="absolute top-1/2 right-2 -translate-y-1/2 rounded-md px-2 py-1 text-xs text-ink-faint hover:text-ink"
-              :aria-label="showWebhookSecret ? '隐藏签名密钥' : '显示签名密钥'"
-              :aria-pressed="showWebhookSecret"
-              @click="showWebhookSecret = !showWebhookSecret"
-            >
-              {{ showWebhookSecret ? '隐藏' : '显示' }}
-            </button>
-          </div>
-          <div class="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              class="glass-button-ghost px-3 py-1.5 text-xs disabled:opacity-50"
-              :disabled="
-                saveWebhookSecret.busy || (!webhookSecretConfigured && !webhookSecretDraft.trim())
-              "
-              @click="applyWebhookSecret"
-            >
-              <AppIcon
-                v-if="saveWebhookSecret.busy"
-                name="spinner"
-                class="animate-spin mr-1"
-                :size="13"
-              />
-              {{ saveWebhookSecret.busy ? '保存中…' : '保存签名密钥' }}
-            </button>
-          </div>
-          <p class="text-xs text-ink-faint">
-            配置后 webhook 请求携带 X-Refract-Signature 头（HMAC-SHA256 签名），接收端可验证来源。
-          </p>
-        </div>
-
-        <label class="flex max-w-sm flex-col gap-1.5">
-          <span class="text-sm font-medium text-ink-soft">自动禁用渠道的重测间隔</span>
-          <div class="flex items-center gap-2">
-            <input
-              v-model.number="notify.retest_minutes"
-              type="number"
-              min="0"
-              max="1440"
-              step="1"
-              inputmode="numeric"
-              aria-label="重测间隔分钟数"
-              class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
-            />
-            <span class="text-sm text-ink-faint">分钟，0 关闭自愈</span>
-          </div>
-        </label>
-
-        <p v-if="!notifyValid" class="text-xs text-danger" role="alert">
-          webhook 需以 http(s):// 开头；重测间隔 0–1440 分钟。
-        </p>
-      </section>
-
-      <!-- 模型价表 -->
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div
-          v-if="sectionErrors.pricing"
-          class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-        >
-          <span>加载失败：{{ sectionErrors.pricing }}</span>
-          <button
-            type="button"
-            class="font-medium hover:underline"
-            @click="reloadSection('pricing')"
-          >
-            重试
-          </button>
-        </div>
-        <div>
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">模型价表</h2>
-          <p class="mt-1 text-xs text-ink-faint">
-            按「每百万 token」计价，币种自定。模式支持精确模型名或以 * 结尾的前缀
-            （精确名优先，其后取最长前缀）。缓存读/写价留空按输入价计（不打折）。
-            请求日志按落库当时的价表固化成本。
-          </p>
-        </div>
-
-        <div v-if="pricing.length > 0" class="flex flex-col gap-2">
-          <div
-            class="grid grid-cols-[1fr_6rem_6rem_6rem_6rem_2.5rem] items-center gap-2 text-xs text-ink-faint"
-          >
-            <span>模式</span>
-            <span class="text-right">输入 / M</span>
-            <span class="text-right">输出 / M</span>
-            <span class="text-right">缓存读 / M</span>
-            <span class="text-right">缓存写 / M</span>
-            <span></span>
-          </div>
-          <div
-            v-for="(row, i) in pricing"
-            :key="i"
-            class="grid grid-cols-[1fr_6rem_6rem_6rem_6rem_2.5rem] items-center gap-2"
-          >
-            <input
-              v-model="row.pattern"
-              type="text"
-              placeholder="gpt-4o 或 gpt-4o*"
-              :aria-label="`价表第 ${i + 1} 行模式`"
-              class="glass-field px-3 py-2 font-mono text-xs outline-none"
-            />
-            <input
-              v-model.number="row.input_per_m"
-              type="number"
-              min="0"
-              step="0.01"
-              :aria-label="`价表第 ${i + 1} 行输入单价`"
-              class="glass-field tabular px-3 py-2 text-right text-xs outline-none"
-            />
-            <input
-              v-model.number="row.output_per_m"
-              type="number"
-              min="0"
-              step="0.01"
-              :aria-label="`价表第 ${i + 1} 行输出单价`"
-              class="glass-field tabular px-3 py-2 text-right text-xs outline-none"
-            />
-            <input
-              v-model.number="row.cached_input_per_m"
-              type="number"
-              min="0"
-              step="0.01"
-              placeholder="=输入"
-              :aria-label="`价表第 ${i + 1} 行缓存读单价`"
-              class="glass-field tabular px-3 py-2 text-right text-xs outline-none"
-              @change="normalizePrice(row, 'cached_input_per_m')"
-            />
-            <input
-              v-model.number="row.cache_write_per_m"
-              type="number"
-              min="0"
-              step="0.01"
-              placeholder="=输入"
-              :aria-label="`价表第 ${i + 1} 行缓存写单价`"
-              class="glass-field tabular px-3 py-2 text-right text-xs outline-none"
-              @change="normalizePrice(row, 'cache_write_per_m')"
-            />
-            <button
-              type="button"
-              class="glass-button-ghost glass-button-ghost-danger justify-center px-2 py-2"
-              :aria-label="`删除价表第 ${i + 1} 行`"
-              @click="removePriceRow(i)"
-            >
-              <AppIcon name="x" :size="13" />
-            </button>
-          </div>
-        </div>
-
-        <div>
-          <button type="button" class="glass-button-ghost px-3 py-2 text-sm" @click="addPriceRow">
-            <AppIcon name="plus" :size="14" />
-            添加规则
-          </button>
-        </div>
-
-        <p v-if="!pricingValid" class="text-xs text-danger" role="alert">
-          模式不能为空，价格必须是非负数字。
-        </p>
-      </section>
-
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div>
-          <div
-            v-if="sectionErrors.retention"
-            class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-          >
-            <span>加载失败：{{ sectionErrors.retention }}</span>
-            <button
-              type="button"
-              class="font-medium hover:underline"
-              @click="reloadSection('retention')"
-            >
-              重试
-            </button>
-          </div>
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">日志保留</h2>
-          <p class="mt-1 text-xs text-ink-faint">
-            服务启动时清理一次，之后每 24 小时按当前设置删除过期请求日志。
-          </p>
-        </div>
-
-        <label class="flex cursor-pointer items-center gap-3">
-          <GlassSwitch v-model="logBodies" label="记录请求与响应正文" />
-          <span>
-            <span class="text-sm font-medium">记录请求与响应正文</span>
-            <span class="ml-2 text-xs text-ink-faint">
-              排障时可在日志里查看完整请求；正文超过 64KB 截断，流式存聚合文本。
-            </span>
-          </span>
-        </label>
-
-        <label class="flex max-w-sm flex-col gap-1.5">
-          <span class="text-sm font-medium text-ink-soft">保留天数</span>
-          <div class="flex items-center gap-2">
-            <input
-              v-model.number="retentionDays"
-              type="number"
-              min="1"
-              max="3650"
-              step="1"
-              inputmode="numeric"
-              class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
-              :aria-invalid="!retentionValid"
-            />
-            <span class="text-sm text-ink-faint">天</span>
-          </div>
-          <span v-if="!retentionValid" class="text-xs text-danger" role="alert">
-            请输入 1–3650 的整数。
-          </span>
-        </label>
-      </section>
-
-      <!-- 操作栏 -->
       <div class="mt-5 flex items-center gap-3">
         <button
           type="button"
           class="glass-button-primary px-5 py-2.5 text-sm font-medium disabled:opacity-50"
-          :disabled="
-            saveSettings.busy ||
-            !isDirty ||
-            !retentionValid ||
-            !breakerValid ||
-            !pricingValid ||
-            !notifyValid ||
-            !emptyResponseRetryValid ||
-            !affinityValid ||
-            !limitsValid ||
-            !ipLimitsValid ||
-            !backupValid ||
-            !policyValid
-          "
+          :disabled="!canSave"
           @click="save"
         >
           <AppIcon v-if="saveSettings.busy" name="spinner" class="animate-spin mr-1.5" :size="15" />
@@ -2095,198 +615,12 @@ async function runImport(payload: unknown) {
         </p>
       </div>
 
-      <!-- 管理令牌 -->
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div
-          v-if="sectionErrors.masterKey"
-          class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-        >
-          <span>加载失败：{{ sectionErrors.masterKey }}</span>
-          <button
-            type="button"
-            class="font-medium hover:underline"
-            @click="reloadSection('masterKey')"
-          >
-            重试
-          </button>
-        </div>
-        <div>
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">管理身份与令牌</h2>
-          <p class="mt-1 text-xs text-ink-faint">
-            默认管理员账号为
-            <code class="font-mono text-ink-soft">admin@localhost</code>。启用后管理界面与 /api
-            的所有请求都需要携带该令牌。服务端只保存哈希，令牌本身无法读回。首次凭据保存在数据目录的
-            <code class="font-mono text-ink-soft">.admin_token</code> 文件中，10 分钟后自动删除；
-            若令牌丢失或文件过期，必须在宿主机或容器内使用
-            <code class="font-mono text-ink-soft">refract-server --reset-admin</code> 重启实例。
-          </p>
-        </div>
-        <p class="text-xs text-ink-faint">
-          会话通过安全 HttpOnly Cookie 维护，浏览器不持久化任何明文令牌。
-        </p>
-        <div class="relative">
-          <input
-            v-model="tokenDraft"
-            :type="showTokenDraft ? 'text' : 'password'"
-            placeholder="新令牌（启用或更换）"
-            autocomplete="new-password"
-            aria-label="新管理令牌"
-            class="glass-field w-full px-3 py-2 pr-16 font-mono text-sm outline-none"
-          />
-          <button
-            type="button"
-            class="absolute top-1/2 right-2 -translate-y-1/2 rounded-md px-2 py-1 text-xs text-ink-faint hover:text-ink"
-            :aria-label="showTokenDraft ? '隐藏管理令牌' : '显示管理令牌'"
-            :aria-pressed="showTokenDraft"
-            @click="showTokenDraft = !showTokenDraft"
-          >
-            {{ showTokenDraft ? '隐藏' : '显示' }}
-          </button>
-        </div>
+      <AdminIdentitySection
+        :load-error="sectionErrors.masterKey"
+        @retry="reloadSection('masterKey')"
+      />
 
-        <div class="flex flex-wrap items-center gap-3">
-          <button
-            type="button"
-            class="glass-button-primary px-4 py-2 text-sm font-medium disabled:opacity-50"
-            :disabled="tokenBusy || !tokenDraft.trim()"
-            @click="applyToken"
-          >
-            <AppIcon v-if="tokenBusy" name="spinner" class="animate-spin mr-1" :size="14" />
-            {{ tokenBusy ? '处理中…' : '启用或更换' }}
-          </button>
-          <button
-            type="button"
-            class="glass-button-ghost glass-button-ghost-danger px-4 py-2 text-sm"
-            :disabled="tokenBusy"
-            @click="clearToken"
-          >
-            <AppIcon v-if="tokenBusy" name="spinner" class="animate-spin mr-1" :size="14" />
-            {{ tokenBusy ? '关闭中…' : '关闭管理鉴权' }}
-          </button>
-          <button
-            type="button"
-            class="glass-button-ghost px-4 py-2 text-sm text-ink-soft hover:text-ink"
-            :disabled="tokenBusy"
-            @click="logout"
-          >
-            退出登录
-          </button>
-        </div>
-      </section>
-
-      <!-- 数据备份 -->
-      <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
-        <div
-          v-if="sectionErrors.backup"
-          class="p-3 text-xs bg-danger/10 text-danger flex items-center justify-between rounded-lg"
-        >
-          <span>加载失败：{{ sectionErrors.backup }}</span>
-          <button
-            type="button"
-            class="font-medium hover:underline"
-            @click="reloadSection('backup')"
-          >
-            重试
-          </button>
-        </div>
-        <div>
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">数据备份</h2>
-          <p class="mt-1 text-xs text-ink-faint">
-            导出渠道、API 密钥与设置为一个 JSON 文件；可在另一个 Refract 实例导入恢复。
-            导出文件含渠道凭据明文；网关密钥只含哈希，恢复后原密钥继续可用。
-          </p>
-        </div>
-
-        <div class="flex flex-wrap items-center gap-3">
-          <button
-            type="button"
-            class="glass-button-primary flex items-center gap-1.5 px-4 py-2 text-sm font-medium disabled:opacity-50"
-            :disabled="exportBackupAction.busy"
-            @click="exportBackup"
-          >
-            <AppIcon
-              :name="exportBackupAction.busy ? 'spinner' : 'download'"
-              :class="exportBackupAction.busy ? 'animate-spin' : ''"
-              :size="15"
-            />
-            {{ exportBackupAction.busy ? '导出中…' : '导出备份' }}
-          </button>
-
-          <button
-            type="button"
-            class="glass-button-ghost px-4 py-2 text-sm font-medium"
-            :disabled="importBackupAction.busy"
-            @click="importFileInput?.click()"
-          >
-            <AppIcon
-              :name="importBackupAction.busy ? 'spinner' : 'upload'"
-              :class="importBackupAction.busy ? 'animate-spin' : ''"
-              :size="15"
-            />
-            {{ importBackupAction.busy ? '导入中…' : '导入备份' }}
-          </button>
-          <input
-            ref="importFileInput"
-            type="file"
-            accept="application/json,.json"
-            class="hidden"
-            aria-label="选择备份文件"
-            @change="importBackup"
-          />
-
-          <div class="flex items-center gap-2 text-xs text-ink-soft">
-            <label class="flex cursor-pointer items-center gap-1.5">
-              <input
-                v-model="importMode"
-                type="radio"
-                value="merge"
-                name="import-mode"
-                class="accent-[var(--color-accent)]"
-              />
-              合并（跳过同名）
-            </label>
-            <label class="flex cursor-pointer items-center gap-1.5">
-              <input
-                v-model="importMode"
-                type="radio"
-                value="replace"
-                name="import-mode"
-                class="accent-[var(--color-accent)]"
-              />
-              替换（清空后导入）
-            </label>
-          </div>
-        </div>
-
-        <div
-          v-if="pendingReplace"
-          class="flex flex-wrap items-center gap-3 rounded-lg border border-danger/30 bg-danger/8 px-4 py-3"
-          role="alertdialog"
-          aria-label="确认替换导入"
-        >
-          <p class="text-xs text-ink-soft">
-            替换导入会<span class="font-semibold text-danger">先清空现有全部渠道与密钥</span
-            >，且无法恢复。确定用「{{ pendingReplace.name }}」替换吗？
-          </p>
-          <div class="flex items-center gap-2">
-            <button
-              type="button"
-              class="inline-flex items-center gap-1 rounded-lg bg-danger px-3.5 py-1.5 text-xs font-medium text-white hover:brightness-105 disabled:opacity-50"
-              :disabled="importBackupAction.busy"
-              @click="confirmReplaceImport"
-            >
-              <AppIcon
-                v-if="importBackupAction.busy"
-                name="spinner"
-                class="animate-spin"
-                :size="12"
-              />
-              {{ importBackupAction.busy ? '替换中…' : '确认替换' }}
-            </button>
-            <button type="button" @click="pendingReplace = null">取消</button>
-          </div>
-        </div>
-      </section>
+      <ConfigBackupSection :load-error="sectionErrors.backup" @retry="reloadSection('backup')" />
     </template>
   </div>
 </template>

@@ -10,12 +10,15 @@
 //! 熔断中的端点被排到最后而不是直接删掉。理由：全部端点都熔断时，打一个
 //! 可能失败的上游仍优于确定失败的 503 —— 熔断常常只是上游的短暂抖动。
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
 use refract_core::{
-    Action, ChannelId, Credential, EmptyResponseRetryPolicy, ErrorKind, GatewayError, Protocol,
+    Action, ChannelId, Credential, EmptyResponseRetryPolicy, ErrorKind, GatewayError,
+    ParamOverride, Protocol,
 };
 use refract_protocol::codec::CodecSet;
 use refract_protocol::ir::{ContentPart, UnifiedRequest, UnifiedResponse, Usage};
@@ -924,7 +927,6 @@ impl RouteExecutor {
                 req.proxy = candidate.proxy();
                 // 流式请求不设整体超时：上游客户端只按 stream_idle_timeout 保护，
                 // 整体 deadline 会误杀持续产出 token 的长回答。
-                req.proxy = candidate.proxy();
 
                 check_budget(route, &mut upstream_calls)?;
                 match self.client.stream(req).await {
@@ -952,8 +954,13 @@ impl RouteExecutor {
                             }
                             let latency_ms = started.elapsed().as_millis() as u64;
                             let mut prefix = prefix.into_iter();
-                            let first =
-                                prefix.next().expect("preflight returns a non-empty prefix");
+                            let Some(first) = prefix.next() else {
+                                last_error = GatewayError::new(
+                                    ErrorKind::UpstreamError,
+                                    "upstream stream preflight returned no events",
+                                );
+                                break;
+                            };
                             let rest =
                                 Box::pin(futures_util::stream::iter(prefix.map(Ok)).chain(rest));
                             let tracked = track_stream(
@@ -1441,72 +1448,47 @@ fn prepare_native_body<'a>(
     Ok(PreparedBody::Json(body))
 }
 
-/// 把渠道级参数覆盖合并进请求体，支持按协议分组。
+/// 把渠道级参数覆盖合并进请求体。
 ///
-/// 覆盖对象里键名恰好是协议名（`chat` / `responses` / `messages` / `gemini`）
-/// 且值为对象的条目，被视为**该协议专属**的覆盖组：只有打到对应协议端点时
-/// 才展开合并。其余顶层键对所有端点生效 —— 这是单协议渠道的常见写法。
-///
-/// 没有这个分组机制时，聚合渠道的顶层覆盖（如 `temperature`）会被盲注进
-/// Gemini 的请求体顶层，而 Gemini 的采样参数在 `generationConfig` 里，
-/// 顶层未知字段直接 400。
-fn apply_param_override(body: &mut Value, param_override: &Option<Value>, protocol: Protocol) {
-    let (Some(Value::Object(overrides)), Value::Object(map)) = (param_override, body) else {
+/// `common` 先合并，协议分组后合并 —— 同名字段以协议分组压过公共项。
+/// 值为 `null` 的条目是删除语义：剥掉某上游不认的字段（`logprobs`、
+/// `reasoning_effort`…）是参数覆盖的高频诉求。
+fn apply_param_override(
+    body: &mut Value,
+    param_override: &Option<ParamOverride>,
+    protocol: Protocol,
+) {
+    let Some(overrides) = param_override else {
         return;
     };
-    // `null` 是删除语义：merge 只能加和改，而「剥掉某上游不认的字段」
-    // （logprobs、reasoning_effort…）是参数覆盖剩下 20% 的高频诉求。
-    for (key, value) in overrides {
-        match protocol_group(key, value) {
-            Some(group_protocol) => {
-                if group_protocol == protocol
-                    && let Value::Object(group) = value
-                {
-                    for (k, v) in group {
-                        if v.is_null() {
-                            map.remove(k);
-                        } else {
-                            map.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-            None => {
-                if value.is_null() {
-                    map.remove(key);
-                } else {
-                    map.insert(key.clone(), value.clone());
-                }
-            }
+    let Value::Object(map) = body else {
+        return;
+    };
+    merge_fields(map, &overrides.common);
+    if let Some(group) = overrides.protocols.get(&protocol) {
+        merge_fields(map, group);
+    }
+}
+
+fn merge_fields(map: &mut serde_json::Map<String, Value>, fields: &serde_json::Map<String, Value>) {
+    for (key, value) in fields {
+        if value.is_null() {
+            map.remove(key);
+        } else {
+            map.insert(key.clone(), value.clone());
         }
     }
 }
 
 /// 覆盖对本协议是否有实际效果 —— 决定原生直通要不要为此重编码请求体。
-fn param_override_touches(param_override: &Option<Value>, protocol: Protocol) -> bool {
-    let Some(Value::Object(overrides)) = param_override else {
-        return false;
-    };
-    overrides
-        .iter()
-        .any(|(key, value)| match protocol_group(key, value) {
-            Some(group_protocol) => {
-                group_protocol == protocol
-                    && matches!(value, Value::Object(group) if !group.is_empty())
-            }
-            None => true,
-        })
-}
-
-/// 键名是协议名且值为对象时，识别为协议分组。
-///
-/// 值必须是对象才算分组：`messages` 同时也是 Chat/Messages 协议请求体的
-/// 字段名，但那个字段的值是数组 —— 用值的形状消除歧义。
-fn protocol_group(key: &str, value: &Value) -> Option<Protocol> {
-    if !value.is_object() {
-        return None;
-    }
-    key.parse::<Protocol>().ok()
+fn param_override_touches(param_override: &Option<ParamOverride>, protocol: Protocol) -> bool {
+    param_override.as_ref().is_some_and(|overrides| {
+        !overrides.common.is_empty()
+            || overrides
+                .protocols
+                .get(&protocol)
+                .is_some_and(|group| !group.is_empty())
+    })
 }
 
 fn decode_raw_request(
@@ -2025,6 +2007,7 @@ fn affects_endpoint_health(kind: ErrorKind) -> bool {
 }
 
 /// 首帧已验证后的流包装：完整结束记成功，中途错误记失败。
+/// 客户端中途断开既不记成功也不记失败，只告警，避免把用户取消当成上游故障。
 fn track_stream<T>(
     first: T,
     rest: std::pin::Pin<Box<dyn Stream<Item = Result<T, GatewayError>> + Send>>,
@@ -2036,17 +2019,19 @@ fn track_stream<T>(
 where
     T: Send + 'static,
 {
+    let watch = StreamHealthWatch::new(channel_id, protocol);
     let stream = futures_util::stream::once(async move { Ok(first) }).chain(rest);
     let tracked = futures_util::stream::unfold(
-        (Box::pin(stream), health, false),
-        move |(mut stream, health, done)| async move {
+        (Box::pin(stream), health, false, watch),
+        move |(mut stream, health, done, watch)| async move {
             if done {
                 return None;
             }
 
             match stream.next().await {
-                Some(Ok(item)) => Some((Ok(item), (stream, health, false))),
+                Some(Ok(item)) => Some((Ok(item), (stream, health, false, watch))),
                 Some(Err(error)) => {
+                    watch.finish();
                     if affects_endpoint_health(error.kind)
                         && let Err(store_error) = health
                             .record_failure(
@@ -2059,9 +2044,10 @@ where
                     {
                         tracing::warn!(error = %store_error, "failed to record upstream stream failure");
                     }
-                    Some((Err(error), (stream, health, true)))
+                    Some((Err(error), (stream, health, true, watch)))
                 }
                 None => {
+                    watch.finish();
                     if let Err(store_error) = health
                         .record_success(channel_id, protocol, latency_ms)
                         .await
@@ -2074,6 +2060,38 @@ where
         },
     );
     Box::pin(tracked)
+}
+
+struct StreamHealthWatch {
+    channel_id: ChannelId,
+    protocol: Protocol,
+    finished: Arc<AtomicBool>,
+}
+
+impl StreamHealthWatch {
+    fn new(channel_id: ChannelId, protocol: Protocol) -> Self {
+        Self {
+            channel_id,
+            protocol,
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for StreamHealthWatch {
+    fn drop(&mut self) {
+        if !self.finished.load(Ordering::Relaxed) {
+            tracing::warn!(
+                channel_id = self.channel_id,
+                protocol = %self.protocol,
+                "client dropped upstream stream before completion; health stats not updated"
+            );
+        }
+    }
 }
 
 /// 检查并递增单请求上游调用总次数。超出预算时直接拒绝请求(503),封住无界扇出。
