@@ -709,7 +709,9 @@ async fn model_probe_uses_gemini_shape() {
 
 #[tokio::test]
 async fn connection_refused_is_an_upstream_error() {
-    // 绑定随机端口后立刻释放 —— 确保该端口无监听，且连接失败必须变成结构化错误而不是 panic。
+    // 绑定随机端口后立刻释放 —— 该端口无监听。Unix 通常立刻 RST 成 UpstreamError；
+    // Windows 常对刚关闭的端口 SYN 重试，直到 connect_timeout，reqwest 报 Timeout。
+    // 合同是结构化传输错误，不是 panic，也没有上游 HTTP 状态。
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = full_address(format!(
         "http://{}/v1/chat/completions",
@@ -729,7 +731,10 @@ async fn connection_refused_is_an_upstream_error() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, ErrorKind::UpstreamError, "err was: {err:#?}");
+    assert!(
+        matches!(err.kind, ErrorKind::UpstreamError | ErrorKind::Timeout),
+        "err was: {err:#?}"
+    );
     assert!(err.upstream_status.is_none(), "err was: {err:#?}");
 }
 
