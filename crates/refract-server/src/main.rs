@@ -4,7 +4,7 @@
 //! 前端产物通过 `rust-embed` 编译进二进制，部署时只需拷贝一个文件。
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -48,6 +48,10 @@ struct Config {
     master_key: Option<String>,
     /// 是否强制重置管理员账号并重新生成初始凭据文件。
     reset_admin: bool,
+    /// TLS 证书 PEM。与 `tls_key` 成对出现时启用 HTTPS（HTTP/1.1+HTTP/2）和 HTTP/3。
+    tls_cert: Option<String>,
+    /// TLS 私钥 PEM。与 `tls_cert` 成对出现时启用 HTTPS 和 HTTP/3。
+    tls_key: Option<String>,
 }
 
 impl Default for Config {
@@ -62,6 +66,8 @@ impl Default for Config {
             proxy: None,
             master_key: None,
             reset_admin: false,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -87,6 +93,21 @@ impl Config {
             stream_idle_timeout: Duration::from_secs(self.stream_idle_timeout_secs),
             proxy: self.proxy.clone(),
             ..UpstreamClientConfig::default()
+        }
+    }
+
+    fn tls(&self, addr: SocketAddr) -> Result<Option<refract_api::TlsListen>> {
+        match (
+            nonempty_path(self.tls_cert.as_deref()),
+            nonempty_path(self.tls_key.as_deref()),
+        ) {
+            (None, None) => Ok(None),
+            (Some(cert), Some(key)) => Ok(Some(refract_api::TlsListen {
+                addr,
+                cert_pem: PathBuf::from(cert),
+                key_pem: PathBuf::from(key),
+            })),
+            _ => anyhow::bail!("tls_cert and tls_key must both be set to enable HTTPS/HTTP/3"),
         }
     }
 }
@@ -182,10 +203,15 @@ fn main() -> Result<()> {
 
     tracing::info!(address = %local, "refract is listening");
 
+    let tls = config.tls(local)?;
+    if tls.is_some() {
+        tracing::info!(address = %local, "HTTPS (HTTP/1.1+HTTP/2) and HTTP/3 enabled");
+    }
+
     // 优雅关闭必须有上限：挂着的 SSE 长连接可以合法地存活几分钟，无上限的
     // drain 会让 systemd/docker 在超时后直接 SIGKILL —— 那比我们主动截断更糟。
-    let (handle, wait) =
-        refract_api::start_server(state, std_listener).context("failed to start xitca-server")?;
+    let (handle, wait) = refract_api::start_server(state, std_listener, tls)
+        .context("failed to start xitca-server")?;
     let force = handle.clone();
     let grace = Duration::from_secs(config.shutdown_grace_secs);
     let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
@@ -231,6 +257,10 @@ fn write_owner_only_file(path: &Path, content: &str) -> std::io::Result<()> {
     file.write_all(content.as_bytes())?;
     file.flush()?;
     Ok(())
+}
+
+fn nonempty_path(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(not(unix))]
@@ -625,5 +655,58 @@ mod tests {
             token_file.exists(),
             "reset_admin must recreate .admin_token"
         );
+    }
+
+    #[test]
+    fn tls_is_off_without_paths() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 3939));
+        assert!(Config::default().tls(addr).unwrap().is_none());
+    }
+
+    #[test]
+    fn tls_rejects_cert_without_key() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 3939));
+        let config = Config {
+            tls_cert: Some("cert.pem".into()),
+            ..Config::default()
+        };
+        let error = config.tls(addr).expect_err("cert without key");
+        assert!(error.to_string().contains("tls_cert and tls_key"));
+    }
+
+    #[test]
+    fn tls_rejects_key_without_cert() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 3939));
+        let config = Config {
+            tls_key: Some("key.pem".into()),
+            ..Config::default()
+        };
+        let error = config.tls(addr).expect_err("key without cert");
+        assert!(error.to_string().contains("tls_cert and tls_key"));
+    }
+
+    #[test]
+    fn tls_treats_blank_paths_as_disabled() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 3939));
+        let config = Config {
+            tls_cert: Some("  ".into()),
+            tls_key: Some("".into()),
+            ..Config::default()
+        };
+        assert!(config.tls(addr).unwrap().is_none());
+    }
+
+    #[test]
+    fn tls_binds_same_addr_when_both_paths_set() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 3939));
+        let config = Config {
+            tls_cert: Some("/data/cert.pem".into()),
+            tls_key: Some("/data/key.pem".into()),
+            ..Config::default()
+        };
+        let tls = config.tls(addr).unwrap().expect("enabled");
+        assert_eq!(tls.addr, addr);
+        assert_eq!(tls.cert_pem.as_os_str(), "/data/cert.pem");
+        assert_eq!(tls.key_pem.as_os_str(), "/data/key.pem");
     }
 }

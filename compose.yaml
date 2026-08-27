@@ -9,7 +9,8 @@ services:
     init: true
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3939:3939"
+      - "127.0.0.1:3939:3939/tcp"
+      - "127.0.0.1:3939:3939/udp"
     environment:
       REFRACT_LISTEN: 0.0.0.0:3939
       REFRACT_DATABASE: /data/refract.db

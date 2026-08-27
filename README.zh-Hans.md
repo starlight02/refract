@@ -127,6 +127,7 @@ Realtime 同样只走原生 Chat 端点：先按健康度选路由并应用模�
 | `shutdown_grace_secs` | `30` | 优雅关闭窗口，超时后强制断开存量连接 |
 | `proxy` | 无 | 出站代理（http/socks5） |
 | `master_key` | 无 | 渠道凭据静态加密主密钥（32 字节 base64）；推荐通过 `REFRACT_MASTER_KEY` 注入 |
+| `tls_cert` / `tls_key` | 无 | PEM 证书与私钥。成对配置后同一地址启用 HTTPS（HTTP/1.1+HTTP/2）和 HTTP/3；未配置时明文 HTTP/1.1 + h2c |
 
 
 路由策略（`max_attempts`、`max_upstream_calls`、原生优先、选择算法）在管理界面运行时可调，不是 `refract.toml` 键。

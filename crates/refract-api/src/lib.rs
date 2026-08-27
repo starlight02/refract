@@ -30,6 +30,7 @@ pub use error::{ApiError, ErrorEnvelope};
 pub use state::AppState;
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use xitca_web::error::{MatchError, MethodNotAllowed};
 use xitca_web::handler::handler_service;
 use xitca_web::http::{HeaderValue, Method, StatusCode, WebResponse};
@@ -153,18 +154,143 @@ pub(crate) async fn dispatch_test(
     (status, headers, xitca_web::bytes::Bytes::from(body))
 }
 
+/// TLS 身份。同一套 PEM 用于 TCP 上的 HTTPS（HTTP/1.1 + HTTP/2）和 UDP 上的 HTTP/3。
+#[derive(Debug)]
+pub struct TlsListen {
+    /// TCP/UDP 绑定地址，通常与明文 `listen` 相同。
+    pub addr: SocketAddr,
+    /// PEM 证书链路径。
+    pub cert_pem: PathBuf,
+    /// PEM 私钥路径。
+    pub key_pem: PathBuf,
+}
+
 /// 监听并启动 xitca-server。调用方负责 `wait` 与优雅关闭。
+///
+/// 无 TLS 时 TCP 提供 HTTP/1.1 与 h2c（prior knowledge）。`tls` 为 `Some` 时
+/// 释放明文 TCP，改为同一地址上的 HTTPS（ALPN：h2、http/1.1）加 HTTP/3。
 pub fn start_server(
     state: AppState,
     listener: std::net::TcpListener,
+    tls: Option<TlsListen>,
 ) -> std::io::Result<(ServerStop, impl FnOnce() -> std::io::Result<()>)> {
-    let mut server = assembled_app!(state)
-        .serve()
-        .disable_signal()
-        .listen(listener)?
-        .run();
+    let mut server = assembled_app!(state).serve().disable_signal();
+    if let Some(tls) = tls {
+        let addr = tls.addr;
+        drop(listener);
+        let rustls_config = load_rustls_config(&tls.cert_pem, &tls.key_pem)?;
+        let quic_config = load_quic_config(&tls.cert_pem, &tls.key_pem)?;
+        server = server
+            .bind_rustls(addr, rustls_config)?
+            .bind_h3(addr, quic_config)?;
+    } else {
+        server = server.h2c_prior_knowledge().listen(listener)?;
+    }
+    let mut server = server.run();
     let handle = server.handle()?;
     Ok((ServerStop(handle), move || server.wait()))
+}
+
+fn load_pem(
+    cert_path: &Path,
+    key_path: &Path,
+) -> std::io::Result<(
+    Vec<quinn::rustls::pki_types::CertificateDer<'static>>,
+    quinn::rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let cert_pem = std::fs::read(cert_path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to read TLS certificate {}: {error}",
+                cert_path.display()
+            ),
+        )
+    })?;
+    let key_pem = std::fs::read(key_path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to read TLS private key {}: {error}",
+                key_path.display()
+            ),
+        )
+    })?;
+
+    let certs = rustls_pemfile::certs(&mut &*cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid TLS certificate PEM: {error}"),
+            )
+        })?;
+    if certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("no certificates in {}", cert_path.display()),
+        ));
+    }
+
+    let key = rustls_pemfile::private_key(&mut &*key_pem)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid TLS private key PEM: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("no private key in {}", key_path.display()),
+            )
+        })?;
+    Ok((certs, key))
+}
+
+fn rustls_server_config(
+    certs: Vec<quinn::rustls::pki_types::CertificateDer<'static>>,
+    key: quinn::rustls::pki_types::PrivateKeyDer<'static>,
+) -> std::io::Result<quinn::rustls::ServerConfig> {
+    quinn::rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        quinn::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid TLS protocol versions: {error}"),
+        )
+    })?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid TLS certificate/key pair: {error}"),
+        )
+    })
+}
+
+fn load_rustls_config(
+    cert_path: &Path,
+    key_path: &Path,
+) -> std::io::Result<quinn::rustls::ServerConfig> {
+    let (certs, key) = load_pem(cert_path, key_path)?;
+    rustls_server_config(certs, key)
+}
+
+fn load_quic_config(cert_path: &Path, key_path: &Path) -> std::io::Result<quinn::ServerConfig> {
+    let (certs, key) = load_pem(cert_path, key_path)?;
+    let mut tls = rustls_server_config(certs, key)?;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid QUIC TLS config: {error}"),
+        )
+    })?;
+    Ok(quinn::ServerConfig::with_crypto(std::sync::Arc::new(tls)))
 }
 
 /// 已启动服务器的停止手柄。
@@ -428,5 +554,227 @@ mod tests {
         let admin = TestRequest::post("/api/does-not-exist").send(state).await;
         assert!(admin.json().get("code").is_some());
         assert_eq!(admin.status(), 404);
+    }
+
+    fn write_self_signed(dir: &std::path::Path) -> (PathBuf, PathBuf, rcgen::Certificate) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
+        (cert_path, key_path, certified.cert)
+    }
+
+    #[test]
+    fn load_quic_config_rejects_missing_files() {
+        let error = super::load_quic_config(
+            Path::new("/no/such/cert.pem"),
+            Path::new("/no/such/key.pem"),
+        )
+        .expect_err("missing cert");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn load_quic_config_rejects_empty_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, "").unwrap();
+        std::fs::write(&key_path, "").unwrap();
+        let error = super::load_quic_config(&cert_path, &key_path).expect_err("empty pem");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_quic_config_accepts_self_signed_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, _) = write_self_signed(dir.path());
+        super::load_quic_config(&cert_path, &key_path).expect("valid pem");
+    }
+
+    async fn spawn_plain() -> (SocketAddr, super::ServerStop, std::thread::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_listener = listener.into_std().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let (handle, wait) =
+            super::start_server(test_state().await, std_listener, None).expect("listen");
+        let join = std::thread::spawn(move || {
+            let _ = wait();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        (addr, handle, join)
+    }
+
+    #[tokio::test]
+    async fn h2c_curl_prior_knowledge_health_live() {
+        let (addr, handle, join) = spawn_plain().await;
+        let url = format!("http://{addr}/health/live");
+        let output = std::process::Command::new("curl")
+            .args(["--http2-prior-knowledge", "-sS", "-D", "-", "-o", "-", &url])
+            .output()
+            .expect("curl");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "curl h2c failed: status={} stderr={stderr} stdout={stdout}",
+            output.status
+        );
+        assert!(
+            stdout.contains("HTTP/2 200") || stdout.contains("HTTP/2.0 200"),
+            "expected HTTP/2 200, got {stdout}"
+        );
+        assert!(stdout.contains("\"status\""), "body: {stdout}");
+        handle.stop(true);
+        let _ = join.join();
+    }
+
+    #[tokio::test]
+    async fn h2c_server_sends_settings_after_preface() {
+        let (addr, handle, join) = spawn_plain().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        stream
+            .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("server should answer h2c preface")
+            .unwrap();
+        assert!(n >= 9, "short h2c response: {n} bytes {:x?}", &buf[..n]);
+        let len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
+        let kind = buf[3];
+        assert_eq!(
+            kind,
+            4,
+            "first frame should be SETTINGS, got kind={kind} len={len} {:x?}",
+            &buf[..n]
+        );
+        handle.stop(true);
+        let _ = join.join();
+    }
+
+    #[tokio::test]
+    async fn h2c_does_not_break_http1() {
+        let (addr, handle, join) = spawn_plain().await;
+        let h1 = reqwest::get(format!("http://{addr}/health/live"))
+            .await
+            .expect("http/1.1");
+        assert_eq!(h1.status(), reqwest::StatusCode::OK);
+        assert_eq!(h1.version(), reqwest::Version::HTTP_11);
+        handle.stop(true);
+        let _ = join.join();
+    }
+
+    #[tokio::test]
+    async fn tls_serves_h1_h2_and_h3() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, cert) = write_self_signed(dir.path());
+        let pem = std::fs::read(&cert_path).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_listener = listener.into_std().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+
+        let (handle, wait) = super::start_server(
+            test_state().await,
+            std_listener,
+            Some(TlsListen {
+                addr,
+                cert_pem: cert_path,
+                key_pem: key_path,
+            }),
+        )
+        .expect("listen");
+        let join = std::thread::spawn(move || {
+            let _ = wait();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let https = format!("https://localhost:{}/health/live", addr.port());
+        let ca = reqwest::Certificate::from_pem(&pem).unwrap();
+
+        let h2 = reqwest::Client::builder()
+            .add_root_certificate(ca.clone())
+            .https_only(true)
+            .build()
+            .unwrap()
+            .get(&https)
+            .send()
+            .await
+            .expect("https h2");
+        assert_eq!(h2.status(), reqwest::StatusCode::OK);
+        assert_eq!(h2.version(), reqwest::Version::HTTP_2);
+
+        let h1 = reqwest::Client::builder()
+            .add_root_certificate(ca)
+            .http1_only()
+            .https_only(true)
+            .build()
+            .unwrap()
+            .get(&https)
+            .send()
+            .await
+            .expect("https h1");
+        assert_eq!(h1.status(), reqwest::StatusCode::OK);
+        assert_eq!(h1.version(), reqwest::Version::HTTP_11);
+
+        let status = h3_get_live(addr, cert.der().clone()).await;
+        assert_eq!(status, http::StatusCode::OK);
+
+        handle.stop(true);
+        let _ = join.join();
+    }
+
+    async fn h3_get_live(
+        addr: SocketAddr,
+        root: quinn::rustls::pki_types::CertificateDer<'static>,
+    ) -> http::StatusCode {
+        let mut roots = quinn::rustls::RootCertStore::empty();
+        roots.add(root).expect("trust self-signed cert");
+        let mut tls = quinn::rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            quinn::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        )));
+
+        let conn = endpoint
+            .connect(addr, "localhost")
+            .unwrap()
+            .await
+            .expect("QUIC handshake");
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .expect("h3 client");
+
+        let request = async {
+            let request = http::Request::builder()
+                .uri("https://localhost/health/live")
+                .body(())
+                .unwrap();
+            let mut stream = send_request.send_request(request).await.unwrap();
+            stream.finish().await.unwrap();
+            stream.recv_response().await.unwrap().status()
+        };
+        tokio::select! {
+            error = driver.wait_idle() => panic!("h3 driver closed: {error}"),
+            status = request => status,
+        }
     }
 }

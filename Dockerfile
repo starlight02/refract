@@ -68,7 +68,8 @@ WORKDIR /data
 ENV REFRACT_LISTEN=0.0.0.0:3939 \
     REFRACT_DATABASE=/data/refract.db \
     REFRACT_REQUIRE_AUTH=true
-EXPOSE 3939
+EXPOSE 3939/tcp
+EXPOSE 3939/udp
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3939/health/ready"]

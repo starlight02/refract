@@ -54,7 +54,7 @@ refract-api = { path = "crates/refract-api" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 xitca-web = { version = "0.8.2", default-features = false, features = [
-  "http1", "http2", "json", "params", "urlencoded", "websocket",
+  "http1", "http2", "http3", "rustls", "json", "params", "urlencoded", "websocket",
 ] }
 xitca-server = "0.7.0"
 http = "1.5"

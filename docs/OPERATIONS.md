@@ -202,3 +202,5 @@ The `.github/workflows/release.yml` pipeline will:
 ## Reverse proxy
 
 Terminate TLS at a trusted reverse proxy and preserve streaming semantics: disable response buffering, allow long request durations, and do not compress or coalesce server-sent events. Keep the Refract listener private. The built-in non-loopback guard is a last line of defense, not a substitute for network access controls.
+
+Without certificates the TCP listener speaks HTTP/1.1 and HTTP/2 cleartext (h2c prior knowledge: `curl --http2-prior-knowledge`). Set both `tls_cert` and `tls_key` (PEM) to switch that address to HTTPS — ALPN `h2` and `http/1.1` on TCP, HTTP/3 on UDP. A reverse proxy that already terminates TLS/HTTP/2/HTTP/3 can keep talking HTTP/1.1 to Refract. Direct clients (`curl --http2`, `curl --http3`) need the matching TCP/UDP port published; Compose maps `127.0.0.1:3939` for both. Realtime WebSocket still uses HTTP/1.1 (or HTTPS after upgrade).

@@ -127,6 +127,7 @@ Realtime is likewise native-only: it selects a healthy Chat endpoint, applies mo
 | `shutdown_grace_secs` | `30` | Graceful shutdown window before in-flight connections are aborted |
 | `proxy` | none | Outbound proxy (http/socks5) |
 | `master_key` | none | Master encryption key for credentials at rest (32-byte base64); inject via `REFRACT_MASTER_KEY` |
+| `tls_cert` / `tls_key` | none | PEM certificate and private key. Set both to enable HTTPS (HTTP/1.1+HTTP/2) and HTTP/3. Unset: cleartext HTTP/1.1 + h2c. |
 
 
 Routing policy (`max_attempts`, `max_upstream_calls`, native-first, selection) is runtime-tunable in the admin UI, not a `refract.toml` key.

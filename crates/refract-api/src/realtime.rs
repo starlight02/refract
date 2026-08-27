@@ -529,7 +529,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let std_listener = listener.into_std().unwrap();
         std_listener.set_nonblocking(true).unwrap();
-        let (handle, wait) = crate::start_server(state, std_listener).expect("listen");
+        let (handle, wait) = crate::start_server(state, std_listener, None).expect("listen");
         let join = std::thread::spawn(move || {
             let _ = wait();
         });

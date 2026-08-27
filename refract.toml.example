@@ -8,6 +8,11 @@
 # 局域网/公网之前请先想清楚，并打开 require_auth。
 listen = "127.0.0.1:3939"
 
+# 成对配置 PEM 后：TCP 改为 HTTPS（HTTP/1.1 + HTTP/2 ALPN），UDP 启用 HTTP/3。
+# 只配其中一个会拒绝启动。未配置时 TCP 是明文 HTTP/1.1 + h2c（prior knowledge）。
+# tls_cert = "cert.pem"
+# tls_key = "key.pem"
+
 # SQLite 数据库文件路径（相对运行目录）。
 database = "refract.db"
 
