@@ -7,9 +7,9 @@ allowBuilds:
   # Effect v4 经 msgpackr 传递引入。它只是 Node 侧的原生加速件，
   # 浏览器构建 tree-shake 后根本不引用 —— 不为它编译原生模块。
   msgpackr-extract: false
+  pnpm: true
   vue-demi: true
 
-managePackageManagerVersions: false
 updateNotifier: false
 
 catalog:
@@ -52,3 +52,12 @@ minimumReleaseAgeExclude:
   - '@vue/shared@3.6.0-rc.3'
   - vue@3.6.0-rc.3
   - effect@4.0.0-rc.112
+  - '@pnpm/exe.darwin-arm64@12.0.0'
+  - '@pnpm/exe.darwin-x64@12.0.0'
+  - '@pnpm/exe.linux-arm64-musl@12.0.0'
+  - '@pnpm/exe.linux-arm64@12.0.0'
+  - '@pnpm/exe.linux-x64-musl@12.0.0'
+  - '@pnpm/exe.linux-x64@12.0.0'
+  - '@pnpm/exe.win32-arm64@12.0.0'
+  - '@pnpm/exe.win32-x64@12.0.0'
+  - pnpm@12.0.0

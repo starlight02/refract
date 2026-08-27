@@ -1914,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "refract-api"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "refract-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "pretty_assertions",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "refract-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "refract-router"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2018,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "refract-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "refract-store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "refract-upstream"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "chrono",

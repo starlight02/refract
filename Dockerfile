@@ -13,7 +13,7 @@ ARG bin_src=rust-builder
 FROM node:24.19-alpine AS admin-builder
 ARG NPM_REGISTRY
 WORKDIR /build
-RUN npm install -g pnpm@11.22.0 --registry="$NPM_REGISTRY" && \
+RUN npm install -g pnpm@12 --registry="$NPM_REGISTRY" && \
     pnpm config set registry "$NPM_REGISTRY"
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/admin/package.json ./apps/admin/package.json
