@@ -5,8 +5,8 @@
  * 一行一对 Name / Value，校验规则与后端保存时一致。
  */
 import AppIcon from '@/components/AppIcon.vue'
+import * as m from '@/paraglide/messages'
 import { emptyHeaderRow, headerRowError, type HeaderRow } from '@/utils/extra-headers'
-
 const rows = defineModel<HeaderRow[]>({ required: true })
 
 function addRow() {
@@ -22,9 +22,9 @@ function removeRow(index: number) {
 <template>
   <div class="flex flex-col gap-2">
     <div>
-      <span class="text-xs font-medium text-ink-soft">自定义请求头</span>
+      <span class="text-xs font-medium text-ink-soft">{{ m.headers_title() }}</span>
       <p class="mt-1 text-[0.7rem] text-ink-faint">
-        随所有上游调用发送。鉴权头（Authorization / x-api-key）由网关掌管，不能覆盖。
+        {{ m.headers_desc() }}
       </p>
     </div>
     <div v-for="(row, index) in rows" :key="index" class="flex flex-col gap-1">
@@ -39,14 +39,14 @@ function removeRow(index: number) {
         <input
           v-model="row.value"
           type="text"
-          placeholder="值"
+          :placeholder="m.headers_value_placeholder()"
           spellcheck="false"
           class="glass-field min-w-0 flex-1 px-2 py-1.5 font-mono text-xs outline-none"
         />
         <button
           type="button"
-          class="rounded px-2 py-1.5 text-xs text-ink-faint hover:bg-danger/12 hover:text-danger"
-          aria-label="删除请求头"
+          class="rounded px-2 py-1.5 text-xs text-ink-faint hover:bg-danger/12 hover:text-danger cursor-pointer"
+          :aria-label="m.headers_delete_aria()"
           @click="removeRow(index)"
         >
           <AppIcon name="trash" :size="13" />
@@ -58,7 +58,7 @@ function removeRow(index: number) {
     </div>
     <button type="button" class="glass-button-ghost self-start px-2 py-1 text-xs" @click="addRow">
       <AppIcon name="plus" :size="12" />
-      添加请求头
+      {{ m.headers_add() }}
     </button>
   </div>
 </template>

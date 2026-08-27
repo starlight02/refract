@@ -4,6 +4,7 @@ import { constants as zlibConstants } from 'node:zlib'
 
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
+import { paraglideVitePlugin } from '@inlang/paraglide-js'
 import { compression, defineAlgorithm } from 'vite-plugin-compression2'
 import { configDefaults, defineConfig } from 'vite-plus'
 
@@ -29,7 +30,7 @@ export default defineConfig({
       browser: true,
       builtin: true,
     },
-    ignorePatterns: ['**/dist/**', '**/dist-ssr/**', '**/coverage/**'],
+    ignorePatterns: ['**/dist/**', '**/dist-ssr/**', '**/coverage/**', '**/src/paraglide/**'],
     rules: {
       'no-array-constructor': 'error',
       'typescript/ban-ts-comment': 'error',
@@ -153,6 +154,13 @@ export default defineConfig({
     vue({
       // 全项目启用 Vapor：单文件组件不必逐个加 `<script setup vapor>`。
       features: { vapor: true },
+    }),
+    // 与 package.json 的 `paraglide` 脚本保持同一套 strategy / outputStructure。
+    paraglideVitePlugin({
+      project: './project.inlang',
+      outdir: './src/paraglide',
+      strategy: ['globalVariable', 'localStorage', 'cookie', 'custom-browser', 'baseLocale'],
+      outputStructure: 'locale-modules',
     }),
     tailwindcss(),
     compression({

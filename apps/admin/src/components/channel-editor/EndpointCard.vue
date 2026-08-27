@@ -8,6 +8,7 @@
 import { nextTick, ref } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
+import * as m from '@/paraglide/messages'
 import UpstreamAddressFields from '@/components/channel-editor/UpstreamAddressFields.vue'
 import {
   PROTOCOL_LABEL,
@@ -146,7 +147,7 @@ function isAccepted(p: Protocol): boolean {
 
       <label class="flex cursor-pointer items-center gap-2 text-xs text-ink-soft">
         <input v-model="ep.enabled" type="checkbox" class="accent-[var(--color-accent)]" />
-        启用
+        {{ m.common_enable() }}
       </label>
 
       <span class="w-full break-all font-mono text-[0.7rem] text-ink-faint sm:ml-auto sm:w-auto">
@@ -156,10 +157,10 @@ function isAccepted(p: Protocol): boolean {
       <button
         v-if="canRemove"
         type="button"
-        class="rounded px-2 py-1 text-xs text-ink-faint hover:bg-danger/12 hover:text-danger"
+        class="rounded px-2 py-1 text-xs text-ink-faint hover:bg-danger/12 hover:text-danger cursor-pointer"
         @click="emit('remove')"
       >
-        移除
+        {{ m.common_remove() }}
       </button>
     </div>
 
@@ -172,7 +173,7 @@ function isAccepted(p: Protocol): boolean {
           class="accent-[var(--color-accent)]"
           @change="toggleOwnAddress(($event.target as HTMLInputElement).checked)"
         />
-        自定义地址<span class="text-ink-faint">（不勾选则继承渠道默认）</span>
+        {{ m.ep_custom_addr() }}<span class="text-ink-faint">{{ m.ep_custom_addr_hint() }}</span>
       </label>
 
       <div v-if="hasOwnAddress(ep)" class="mt-2 flex flex-col gap-2 pl-5">
@@ -189,7 +190,7 @@ function isAccepted(p: Protocol): boolean {
           class="accent-[var(--color-accent)]"
           @change="ep.credential = ($event.target as HTMLInputElement).checked ? '' : null"
         />
-        自定义密钥<span class="text-ink-faint">（不勾选则继承渠道默认）</span>
+        {{ m.ep_custom_key() }}<span class="text-ink-faint">{{ m.ep_custom_key_hint() }}</span>
       </label>
 
       <div v-if="ep.credential !== null" class="relative mt-2 pl-5">
@@ -198,7 +199,7 @@ function isAccepted(p: Protocol): boolean {
           :type="showEndpointCredential ? 'text' : 'password'"
           placeholder="sk-..."
           autocomplete="new-password"
-          :aria-label="`${ep.protocol} 端点 API 密钥`"
+          :aria-label="m.ep_key_aria({ protocol: ep.protocol })"
           class="glass-field w-full px-3 py-1.5 pr-16 font-mono text-xs outline-none"
         />
         <button
@@ -206,13 +207,13 @@ function isAccepted(p: Protocol): boolean {
           class="absolute top-1/2 right-2 -translate-y-1/2 rounded px-2 py-0.5 text-[0.7rem] text-ink-faint hover:text-ink"
           :aria-label="
             showEndpointCredential
-              ? `隐藏 ${ep.protocol} 端点 API 密钥`
-              : `显示 ${ep.protocol} 端点 API 密钥`
+              ? m.ep_key_hide_aria({ protocol: ep.protocol })
+              : m.ep_key_show_aria({ protocol: ep.protocol })
           "
           :aria-pressed="showEndpointCredential === true"
           @click="showEndpointCredential = !showEndpointCredential"
         >
-          {{ showEndpointCredential ? '隐藏' : '显示' }}
+          {{ showEndpointCredential ? m.common_hide() : m.common_show() }}
         </button>
       </div>
     </div>
@@ -221,9 +222,9 @@ function isAccepted(p: Protocol): boolean {
     <div class="mb-4">
       <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
         <div class="flex items-center gap-2">
-          <span class="text-xs font-semibold text-ink-soft">模型列表</span>
+          <span class="text-xs font-semibold text-ink-soft">{{ m.ep_models_title() }}</span>
           <span class="rounded bg-ink/8 px-1.5 py-0.5 text-[0.7rem] font-medium text-ink-faint">
-            已选 {{ ep.models.length }} 个
+            {{ m.ep_models_count({ count: ep.models.length }) }}
           </span>
         </div>
         <div class="flex flex-wrap items-center gap-1.5">
@@ -233,7 +234,7 @@ function isAccepted(p: Protocol): boolean {
             @click="emit('probe')"
           >
             <AppIcon name="globe" :size="13" />
-            从上游获取模型
+            {{ m.ep_fetch_models() }}
           </button>
 
           <button
@@ -242,48 +243,48 @@ function isAccepted(p: Protocol): boolean {
             class="glass-button-ghost px-2 py-1 text-xs text-ink-faint hover:!text-danger"
             @click="clearAllModels"
           >
-            清空
+            {{ m.ep_clear_models() }}
           </button>
         </div>
       </div>
       <div v-if="ep.models.length > 0" class="mb-2.5 flex flex-wrap gap-1.5">
         <span
-          v-for="(m, mi) in ep.models"
-          :key="m.name"
+          v-for="(modelEntry, mi) in ep.models"
+          :key="modelEntry.name"
           class="inline-flex items-center gap-1.5 rounded-full border border-ink/8 bg-ink/6 px-2 py-1 font-mono text-xs shadow-xs"
         >
-          <template v-if="editingModelKey === modelKey(ep.protocol, m.name)">
-            <span class="font-medium text-ink">{{ m.name }}</span>
+          <template v-if="editingModelKey === modelKey(ep.protocol, modelEntry.name)">
+            <span class="font-medium text-ink">{{ modelEntry.name }}</span>
             <span class="text-[0.7rem] text-ink-faint">→</span>
             <input
               :ref="setEditMappingInput"
               :value="editingUpstreamDraft"
               type="text"
-              :aria-label="`${m.name} 上游名`"
-              :placeholder="m.name"
+              :aria-label="m.ep_model_upstream_aria({ name: modelEntry.name })"
+              :placeholder="modelEntry.name"
               class="glass-field h-auto w-40 px-1.5 py-0.5 font-mono text-[0.7rem] outline-none"
               @input="editingUpstreamDraft = ($event.target as HTMLInputElement).value"
-              @keydown.enter.prevent="commitEditMapping(m)"
+              @keydown.enter.prevent="commitEditMapping(modelEntry)"
               @keydown.esc.prevent="cancelEditMapping"
-              @blur="commitEditMapping(m)"
+              @blur="commitEditMapping(modelEntry)"
             />
           </template>
           <button
             v-else
             type="button"
             class="cursor-pointer rounded font-medium text-ink hover:text-accent-deep"
-            :title="`编辑 ${m.name} 的上游映射`"
-            @click="startEditMapping(m)"
+            :title="m.ep_model_edit_title({ name: modelEntry.name })"
+            @click="startEditMapping(modelEntry)"
           >
-            {{ m.name
-            }}<span v-if="m.upstream" class="ml-1 text-[0.7rem] text-accent-deep"
-              >→{{ m.upstream }}</span
+            {{ modelEntry.name
+            }}<span v-if="modelEntry.upstream" class="ml-1 text-[0.7rem] text-accent-deep"
+              >→{{ modelEntry.upstream }}</span
             >
           </button>
           <button
             type="button"
             class="grid size-3.5 place-items-center rounded-full text-ink-faint hover:bg-danger/20 hover:text-danger"
-            title="移除模型"
+            :title="m.ep_model_remove_title()"
             @click="removeModel(mi)"
           >
             ×
@@ -295,8 +296,8 @@ function isAccepted(p: Protocol): boolean {
         <input
           v-model="modelDraft"
           type="text"
-          :aria-label="`${PROTOCOL_LABEL[ep.protocol]} 模型输入`"
-          placeholder="输入模型名（支持批量粘贴或 别名=上游名 映射），按回车添加"
+          :aria-label="m.ep_model_input_aria({ protocol: PROTOCOL_LABEL[ep.protocol] })"
+          :placeholder="m.ep_model_input_placeholder()"
           class="glass-field w-full px-3 py-1.5 pr-16 font-mono text-xs outline-none"
           @keydown.enter.prevent="addModel"
           @paste="onModelPaste"
@@ -307,7 +308,7 @@ function isAccepted(p: Protocol): boolean {
           class="absolute top-1/2 right-1.5 -translate-y-1/2 rounded bg-accent px-2 py-0.5 text-xs text-white"
           @click="addModel"
         >
-          添加
+          {{ m.common_add() }}
         </button>
       </div>
     </div>
@@ -319,8 +320,8 @@ function isAccepted(p: Protocol): boolean {
           type="checkbox"
           class="accent-[var(--color-accent)]"
         />
-        <span class="font-medium">协议转换</span>
-        <span class="text-ink-faint">允许其他协议的客户端打到这个端点</span>
+        <span class="font-medium">{{ m.ep_transcode_title() }}</span>
+        <span class="text-ink-faint">{{ m.ep_transcode_desc() }}</span>
       </label>
 
       <div v-if="ep.transcode.enabled" class="mt-2 flex flex-wrap gap-2 pl-5">
@@ -338,11 +339,11 @@ function isAccepted(p: Protocol): boolean {
             @change="toggleAccepted(p)"
           />
           <ProtocolBadge :protocol="p" />
-          <span v-if="p === ep.protocol" class="text-ink-faint">原生</span>
+          <span v-if="p === ep.protocol" class="text-ink-faint">{{ m.ep_transcode_native() }}</span>
         </label>
       </div>
       <p v-if="ep.transcode.enabled" class="mt-1.5 pl-5 text-[0.7rem] text-ink-faint">
-        未勾选的协议打过来会被直接拒绝，而不是硬转。
+        {{ m.ep_transcode_hint() }}
       </p>
     </div>
   </article>

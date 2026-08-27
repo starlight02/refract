@@ -8,6 +8,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
+import * as m from '@/paraglide/messages'
 import { useDashboardStore } from '@/stores/dashboard'
 
 const store = useDashboardStore()
@@ -17,11 +18,11 @@ const POLL_MS = 30_000
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 /** 时间窗口选项。1 小时用于排障，7 天用于看趋势。 */
-const WINDOWS = [
-  { hours: 1, label: '1 小时' },
-  { hours: 24, label: '24 小时' },
-  { hours: 168, label: '7 天' },
-] as const
+const WINDOWS = computed(() => [
+  { hours: 1, label: m.dash_win_1h() },
+  { hours: 24, label: m.dash_win_24h() },
+  { hours: 168, label: m.dash_win_7d() },
+])
 
 const activeWindow = ref<number>(24)
 
@@ -111,9 +112,11 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
   <div class="mx-auto max-w-6xl">
     <header class="mb-6 flex flex-wrap items-end justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold">仪表盘</h1>
+        <h1 class="text-2xl font-semibold">{{ m.dash_title() }}</h1>
         <p class="mt-1 text-sm text-ink-faint">
-          最近 {{ WINDOWS.find((w) => w.hours === activeWindow)?.label }}的网关活动
+          {{
+            m.dash_subtitle({ window: WINDOWS.find((w) => w.hours === activeWindow)?.label ?? '' })
+          }}
         </p>
       </div>
 
@@ -138,18 +141,24 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
     <!-- 四个核心指标 -->
     <div class="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <div class="glass glass-specular glass-interactive p-5">
-        <div class="text-xs font-medium text-ink-faint uppercase">请求总数</div>
+        <div class="text-xs font-medium text-ink-faint uppercase">
+          {{ m.dash_total_requests() }}
+        </div>
         <div class="tabular mt-2 text-3xl font-semibold">
           {{ compact(store.summary?.requests ?? 0) }}
         </div>
         <div class="mt-1 text-xs text-ink-faint">
-          <span class="tabular">{{ compact(store.summary?.transcoded ?? 0) }}</span> 次协议转换 ·
-          <span class="tabular">{{ percent(transcodeRate) }}</span>
+          {{
+            m.dash_transcode_stat({
+              count: compact(store.summary?.transcoded ?? 0),
+              rate: percent(transcodeRate),
+            })
+          }}
         </div>
       </div>
 
       <div class="glass glass-specular glass-interactive p-5">
-        <div class="text-xs font-medium text-ink-faint uppercase">失败</div>
+        <div class="text-xs font-medium text-ink-faint uppercase">{{ m.dash_failures() }}</div>
         <div
           class="tabular mt-2 text-3xl font-semibold"
           :class="(store.summary?.failures ?? 0) > 0 ? 'text-danger' : ''"
@@ -157,26 +166,30 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
           {{ compact(store.summary?.failures ?? 0) }}
         </div>
         <div class="mt-1 text-xs text-ink-faint">
-          失败率 <span class="tabular">{{ percent(failureRate) }}</span>
+          {{ m.dash_failure_rate({ rate: percent(failureRate) }) }}
         </div>
       </div>
 
       <div class="glass glass-specular glass-interactive p-5">
-        <div class="text-xs font-medium text-ink-faint uppercase">平均延迟</div>
+        <div class="text-xs font-medium text-ink-faint uppercase">{{ m.dash_avg_duration() }}</div>
         <div class="tabular mt-2 text-3xl font-semibold">
           {{ ms(store.summary?.avg_duration_ms) }}
         </div>
         <div class="mt-1 text-xs text-ink-faint">
-          首字 <span class="tabular">{{ ms(store.summary?.avg_ttfb_ms) }}</span>
+          {{ m.dash_first_token({ time: ms(store.summary?.avg_ttfb_ms) }) }}
         </div>
       </div>
 
       <div class="glass glass-specular glass-interactive p-5">
-        <div class="text-xs font-medium text-ink-faint uppercase">Token</div>
+        <div class="text-xs font-medium text-ink-faint uppercase">{{ m.dash_token_usage() }}</div>
         <div class="tabular mt-2 text-3xl font-semibold">{{ compact(store.totalTokens) }}</div>
         <div class="mt-1 text-xs text-ink-faint">
-          入 <span class="tabular">{{ compact(store.summary?.input_tokens ?? 0) }}</span> · 出
-          <span class="tabular">{{ compact(store.summary?.output_tokens ?? 0) }}</span>
+          {{
+            m.dash_token_in_out({
+              input: compact(store.summary?.input_tokens ?? 0),
+              output: compact(store.summary?.output_tokens ?? 0),
+            })
+          }}
           <template v-if="(store.summary?.cost ?? 0) > 0">
             · <span class="tabular">${{ (store.summary?.cost ?? 0).toFixed(4) }}</span>
           </template>
@@ -187,13 +200,15 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
     <!-- 趋势 -->
     <section v-if="chart" class="glass glass-specular mb-6 p-5">
       <div class="mb-3 flex items-baseline justify-between">
-        <h2 class="text-sm font-semibold text-ink-soft uppercase">趋势</h2>
+        <h2 class="text-sm font-semibold text-ink-soft uppercase">{{ m.dash_trend() }}</h2>
         <span class="text-xs text-ink-faint">
           <span class="mr-3 inline-flex items-center gap-1.5">
-            <span class="inline-block h-0.5 w-4 rounded bg-accent"></span> 请求
+            <span class="inline-block h-0.5 w-4 rounded bg-accent"></span>
+            {{ m.dash_trend_requests() }}
           </span>
           <span class="inline-flex items-center gap-1.5">
-            <span class="inline-block h-0.5 w-4 rounded bg-danger"></span> 失败
+            <span class="inline-block h-0.5 w-4 rounded bg-danger"></span>
+            {{ m.dash_trend_failures() }}
           </span>
         </span>
       </div>
@@ -202,7 +217,7 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
         class="h-36 w-full"
         preserveAspectRatio="none"
         role="img"
-        aria-label="请求量与失败数趋势"
+        :aria-label="m.dash_trend_aria()"
       >
         <polyline
           v-for="(line, i) in chart.lines"
@@ -218,60 +233,68 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
       </svg>
       <div class="mt-1.5 flex justify-between text-[0.65rem] text-ink-faint">
         <span class="tabular">{{ chart.first }}</span>
-        <span class="tabular">峰值 {{ chart.maxRequests.toLocaleString() }} 次/桶</span>
+        <span class="tabular">{{
+          m.dash_trend_peak({ peak: chart.maxRequests.toLocaleString() })
+        }}</span>
         <span class="tabular">{{ chart.last }}</span>
       </div>
     </section>
 
     <!-- 按模型 -->
     <section class="glass glass-specular p-5">
-      <h2 class="mb-4 text-sm font-semibold text-ink-soft uppercase">按模型</h2>
+      <h2 class="mb-4 text-sm font-semibold text-ink-soft uppercase">{{ m.dash_by_model() }}</h2>
 
       <div v-if="store.loading && sortedModels.length === 0" class="py-12 text-center">
-        <GlassSpinner size="md" label="正在汇总模型数据…" />
+        <GlassSpinner size="md" :label="m.dash_by_model_loading()" />
       </div>
 
       <div v-else-if="sortedModels.length === 0" class="py-12 text-center">
         <div class="shape-app-icon mx-auto grid size-12 place-items-center bg-ink/6 text-ink-faint">
           <AppIcon name="gauge" :size="22" />
         </div>
-        <p class="mt-3 text-sm text-ink-faint">这个时间窗口内还没有请求</p>
+        <p class="mt-3 text-sm text-ink-faint">{{ m.dash_by_model_empty() }}</p>
       </div>
 
-      <div v-else class="overflow-x-auto" tabindex="0" aria-label="按模型统计表">
+      <div v-else class="overflow-x-auto" tabindex="0" :aria-label="m.dash_by_model_aria()">
         <table class="min-w-[560px] w-full text-sm">
           <thead>
             <tr class="border-b border-ink/10 text-left text-xs text-ink-faint">
-              <th class="pb-2 font-medium">模型</th>
-              <th class="pb-2 text-right font-medium">请求</th>
-              <th class="pb-2 text-right font-medium">输入</th>
-              <th class="pb-2 text-right font-medium">输出</th>
-              <th class="pb-2 text-right font-medium">花费</th>
-              <th class="pb-2 text-right font-medium">首字</th>
-              <th class="pb-2 text-right font-medium">总耗时</th>
+              <th class="pb-2 font-medium">{{ m.dash_th_model() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_requests() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_input() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_output() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_cost() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_ttfb() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_duration() }}</th>
               <th class="pb-2 text-right font-medium">t/s</th>
-              <th class="w-32 pb-2 pl-4 font-medium">占比</th>
+              <th class="w-32 pb-2 pl-4 font-medium">{{ m.dash_th_share() }}</th>
             </tr>
           </thead>
           <tbody>
             <tr
-              v-for="m in sortedModels"
-              :key="m.model"
+              v-for="modelItem in sortedModels"
+              :key="modelItem.model"
               class="border-b border-ink/5 last:border-0 transition-colors hover:bg-ink/[0.03]"
             >
-              <td class="py-2.5 font-medium">{{ m.model }}</td>
-              <td class="tabular py-2.5 text-right">{{ m.requests.toLocaleString() }}</td>
-              <td class="tabular py-2.5 text-right text-ink-soft">{{ compact(m.input_tokens) }}</td>
+              <td class="py-2.5 font-medium">{{ modelItem.model }}</td>
+              <td class="tabular py-2.5 text-right">{{ modelItem.requests.toLocaleString() }}</td>
               <td class="tabular py-2.5 text-right text-ink-soft">
-                {{ compact(m.output_tokens) }}
+                {{ compact(modelItem.input_tokens) }}
               </td>
               <td class="tabular py-2.5 text-right text-ink-soft">
-                {{ m.cost > 0 ? `$${m.cost.toFixed(4)}` : '—' }}
+                {{ compact(modelItem.output_tokens) }}
               </td>
-              <td class="tabular py-2.5 text-right text-ink-soft">{{ ms(m.avg_ttfb_ms) }}</td>
-              <td class="tabular py-2.5 text-right text-ink-soft">{{ ms(m.avg_duration_ms) }}</td>
               <td class="tabular py-2.5 text-right text-ink-soft">
-                {{ m.tokens_per_sec != null ? m.tokens_per_sec.toFixed(1) : '—' }}
+                {{ modelItem.cost > 0 ? `$${modelItem.cost.toFixed(4)}` : '—' }}
+              </td>
+              <td class="tabular py-2.5 text-right text-ink-soft">
+                {{ ms(modelItem.avg_ttfb_ms) }}
+              </td>
+              <td class="tabular py-2.5 text-right text-ink-soft">
+                {{ ms(modelItem.avg_duration_ms) }}
+              </td>
+              <td class="tabular py-2.5 text-right text-ink-soft">
+                {{ modelItem.tokens_per_sec != null ? modelItem.tokens_per_sec.toFixed(1) : '—' }}
               </td>
               <td class="py-2.5 pl-4">
                 <div class="h-1.5 overflow-hidden rounded-full bg-ink/8">
@@ -285,7 +308,7 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
                       );
                     "
                     :style="{
-                      width: `${maxModelRequests ? (m.requests / maxModelRequests) * 100 : 0}%`,
+                      width: `${maxModelRequests ? (modelItem.requests / maxModelRequests) * 100 : 0}%`,
                     }"
                   />
                 </div>
@@ -298,18 +321,18 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
 
     <!-- 按渠道 -->
     <section v-if="store.byChannel.length > 0" class="glass glass-specular mt-6 p-5">
-      <h2 class="mb-4 text-sm font-semibold text-ink-soft uppercase">按渠道</h2>
-      <div class="overflow-x-auto" tabindex="0" aria-label="按渠道统计表">
+      <h2 class="mb-4 text-sm font-semibold text-ink-soft uppercase">{{ m.dash_by_channel() }}</h2>
+      <div class="overflow-x-auto" tabindex="0" :aria-label="m.dash_by_channel_aria()">
         <table class="w-full min-w-[560px] text-sm">
           <thead>
             <tr class="border-b border-ink/10 text-left text-xs text-ink-faint">
-              <th class="pb-2 font-medium">渠道</th>
-              <th class="pb-2 text-right font-medium">请求</th>
-              <th class="pb-2 text-right font-medium">失败</th>
+              <th class="pb-2 font-medium">{{ m.dash_th_channel() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_requests() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_failures() }}</th>
               <th class="pb-2 text-right font-medium">tokens</th>
-              <th class="pb-2 text-right font-medium">花费</th>
-              <th class="pb-2 text-right font-medium">首字</th>
-              <th class="pb-2 text-right font-medium">总耗时</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_cost() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_ttfb() }}</th>
+              <th class="pb-2 text-right font-medium">{{ m.dash_th_duration() }}</th>
             </tr>
           </thead>
           <tbody>

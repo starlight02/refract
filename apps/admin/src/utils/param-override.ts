@@ -5,8 +5,8 @@
  * `null` 是删除语义。协议作用域走显式 `protocols`，不再靠键名猜。
  */
 import { PROTOCOL_IDS, type ParamOverride, type Protocol } from '@refract/contracts'
+import * as m from '@/paraglide/messages'
 import { parseJson } from '@/utils/effect'
-
 export interface OverrideRow {
   key: string
   valueText: string
@@ -39,9 +39,9 @@ export function parseOverrideValue(
   text: string,
 ): { ok: true; value: unknown } | { ok: false; error: string } {
   const trimmed = text.trim()
-  if (!trimmed) return { ok: false, error: '值不能为空；删除字段请填 null' }
+  if (!trimmed) return { ok: false, error: m.val_override_value_empty() }
   const parsed = parseJson(trimmed)
-  if (parsed === undefined) return { ok: false, error: '值必须是合法 JSON（字符串请加引号）' }
+  if (parsed === undefined) return { ok: false, error: m.val_override_value_invalid_json() }
   return { ok: true, value: parsed }
 }
 
@@ -72,8 +72,8 @@ function recordFromRows(rows: OverrideRow[]): {
     const key = row.key.trim()
     const valueText = row.valueText.trim()
     if (!key && !valueText) continue
-    if (!key) return { record, error: '字段名不能为空' }
-    if (seen.has(key)) return { record, error: `字段名重复：${key}` }
+    if (!key) return { record, error: m.val_override_key_empty() }
+    if (seen.has(key)) return { record, error: m.val_override_key_dup({ key }) }
     const parsed = parseOverrideValue(row.valueText)
     if (!parsed.ok) return { record, error: `${key}：${parsed.error}` }
     seen.add(key)

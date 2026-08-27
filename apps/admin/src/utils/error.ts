@@ -1,10 +1,12 @@
+import * as m from '@/paraglide/messages'
 import { parseJson } from '@/utils/effect'
 
 /**
  * 把任意拒绝值收成一句可展示的文案。
  * Error（含 ApiError）透出 message；有独立 detail 时拼上，避免只剩空壳状态码。
  */
-export function toErrorMessage(e: unknown, fallback = '发生未知错误'): string {
+export function toErrorMessage(e: unknown, fallback?: string): string {
+  const defaultFallback = fallback ?? m.err_unknown()
   if (e instanceof Error && e.message) {
     const detail = 'detail' in e && typeof e.detail === 'string' ? e.detail.trim() : ''
     if (detail && detail !== e.message && !e.message.includes(detail)) {
@@ -12,7 +14,7 @@ export function toErrorMessage(e: unknown, fallback = '发生未知错误'): str
     }
     return e.message
   }
-  return fallback
+  return defaultFallback
 }
 
 /** 管理信封或协议信封里抽出可展示的错误。 */

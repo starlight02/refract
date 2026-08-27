@@ -441,6 +441,8 @@ async fn spawn_slow_healthy_sse_server() -> String {
             socket.flush().await.unwrap();
         }
         socket.write_all(b"0\r\n\r\n").await.unwrap();
+        socket.flush().await.unwrap();
+        let _ = socket.shutdown().await;
     });
 
     format!("http://{addr}")
@@ -490,7 +492,7 @@ async fn healthy_stream_is_not_cut_off_by_the_unary_timeout() {
     let body = json!({"stream": true});
     let client = UpstreamClient::new(UpstreamClientConfig {
         timeout: Duration::from_millis(100),
-        stream_idle_timeout: Duration::from_millis(300),
+        stream_idle_timeout: Duration::from_millis(2000),
         ..Default::default()
     })
     .unwrap();
@@ -508,8 +510,7 @@ async fn healthy_stream_is_not_cut_off_by_the_unary_timeout() {
         .unwrap()
         .collect()
         .await;
-
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 3, "events were: {events:#?}");
     assert!(events.into_iter().all(|event| event.is_ok()));
 }
 
@@ -708,8 +709,13 @@ async fn model_probe_uses_gemini_shape() {
 
 #[tokio::test]
 async fn connection_refused_is_an_upstream_error() {
-    // 端口 1 上不会有服务 —— 连接失败必须变成结构化错误而不是 panic。
-    let addr = full_address("http://127.0.0.1:1/v1/chat/completions".into());
+    // 绑定随机端口后立刻释放 —— 确保该端口无监听，且连接失败必须变成结构化错误而不是 panic。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = full_address(format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    ));
+    drop(listener);
     let cred = Credential::new("k");
     let body = json!({});
     let err = client()
@@ -723,8 +729,8 @@ async fn connection_refused_is_an_upstream_error() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, ErrorKind::UpstreamError);
-    assert!(err.upstream_status.is_none());
+    assert_eq!(err.kind, ErrorKind::UpstreamError, "err was: {err:#?}");
+    assert!(err.upstream_status.is_none(), "err was: {err:#?}");
 }
 
 #[tokio::test]

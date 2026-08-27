@@ -6,6 +6,7 @@
  */
 import { computed } from 'vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
+import * as m from '@/paraglide/messages'
 import { PROTO_DEFAULTS } from '@/utils/channel-form'
 import type { Protocol, UpstreamAddress } from '@refract/contracts'
 
@@ -23,18 +24,18 @@ const protoDefaults = computed(() =>
 <template>
   <div v-if="variant === 'channel'" class="flex flex-col gap-3">
     <label class="flex cursor-pointer items-center gap-3">
-      <GlassSwitch v-model="address.unofficial" label="非官方地址" />
+      <GlassSwitch v-model="address.unofficial" :label="m.addr_unofficial()" />
       <span class="text-sm">
-        <span class="font-medium">非官方地址</span>
-        <span class="ml-2 text-xs text-ink-faint"> 关闭时一律使用协议官方地址 </span>
+        <span class="font-medium">{{ m.addr_unofficial() }}</span>
+        <span class="ml-2 text-xs text-ink-faint"> {{ m.addr_unofficial_desc() }} </span>
       </span>
     </label>
 
     <label v-if="address.unofficial" class="flex cursor-pointer items-center gap-3">
-      <GlassSwitch v-model="address.full_address" label="完整地址" />
+      <GlassSwitch v-model="address.full_address" :label="m.addr_full()" />
       <span class="text-sm">
-        <span class="font-medium">完整地址</span>
-        <span class="ml-2 text-xs text-ink-faint">直接指定最终 URL，不拼接不校验</span>
+        <span class="font-medium">{{ m.addr_full() }}</span>
+        <span class="ml-2 text-xs text-ink-faint">{{ m.addr_full_desc() }}</span>
       </span>
     </label>
 
@@ -56,27 +57,27 @@ const protoDefaults = computed(() =>
         <input
           v-model="address.version_prefix"
           type="text"
-          placeholder="/v1（留空用协议默认）"
+          :placeholder="m.addr_prefix_placeholder()"
           class="glass-field px-3 py-2 font-mono text-sm outline-none"
         />
         <input
           v-model="address.path"
           type="text"
-          placeholder="/chat/completions（留空用协议默认）"
+          :placeholder="m.addr_path_placeholder()"
           class="glass-field px-3 py-2 font-mono text-sm outline-none"
         />
       </div>
     </template>
 
     <p v-else class="rounded-lg bg-ink/5 px-3 py-2 text-xs text-ink-faint">
-      使用各协议的官方地址。要接中转站请打开「非官方地址」。
+      {{ m.addr_official_hint() }}
     </p>
   </div>
 
   <template v-else>
     <label class="flex cursor-pointer items-center gap-2 text-xs text-ink-soft">
       <input v-model="address.full_address" type="checkbox" class="accent-[var(--color-accent)]" />
-      完整地址
+      {{ m.addr_full() }}
     </label>
 
     <input

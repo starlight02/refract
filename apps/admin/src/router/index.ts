@@ -1,7 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { AUTH_REQUIRED_EVENT, auth } from '@/api/client'
+import * as m from '@/paraglide/messages'
 import DashboardView from '../views/DashboardView.vue'
-
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
@@ -78,19 +78,19 @@ router.beforeEach(async () => {
 
 // 让路由组件按首字母大写命名，开箱即得正确的页面标题。
 router.afterEach((to) => {
-  const titles: Record<string, string> = {
-    dashboard: '仪表盘',
-    channels: '渠道',
-    'channel-new': '新建渠道',
-    'channel-edit': '编辑渠道',
-    models: '模型',
-    playground: '调试台',
-    logs: '请求日志',
-    keys: 'API 密钥',
-    settings: '设置',
+  const titles: Record<string, () => string> = {
+    dashboard: m.title_dashboard,
+    channels: m.title_channels,
+    'channel-new': m.title_channel_new,
+    'channel-edit': m.title_channel_edit,
+    models: m.title_models,
+    playground: m.title_playground,
+    logs: m.title_logs,
+    keys: m.title_keys,
+    settings: m.title_settings,
   }
-  const title = titles[to.name as string] ?? 'Refract'
+  const getter = titles[to.name as string]
+  const title = getter ? getter() : 'Refract'
   document.title = `${title} · Refract`
 })
-
 export default router

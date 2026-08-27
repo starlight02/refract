@@ -13,8 +13,8 @@ import {
   DialogTitle,
 } from 'reka-ui'
 import AppIcon from '@/components/AppIcon.vue'
+import * as m from '@/paraglide/messages'
 import type { ChannelEndpoint, ModelProbe, Protocol } from '@refract/contracts'
-
 export interface ProbeDialogState {
   open: boolean
   protocol: Protocol | null
@@ -75,7 +75,7 @@ function deselectAllFiltered() {
         <DialogTitle class="flex items-center justify-between text-lg font-semibold">
           <span class="flex items-center gap-2">
             <AppIcon name="globe" :size="20" class="text-accent" />
-            上游模型在线探测
+            {{ m.probe_dialog_title() }}
           </span>
           <DialogClose
             class="rounded-lg p-1 text-ink-faint transition-colors hover:bg-ink/5 hover:text-ink cursor-pointer"
@@ -85,7 +85,7 @@ function deselectAllFiltered() {
         </DialogTitle>
 
         <DialogDescription class="mt-1 text-xs text-ink-faint">
-          已向上游地址探测真实可用模型列表。勾选需要接入的模型后一键导入当前端点。
+          {{ m.probe_dialog_desc() }}
         </DialogDescription>
 
         <div
@@ -95,23 +95,26 @@ function deselectAllFiltered() {
           <div
             class="size-8 animate-spin rounded-full border-2 border-accent border-t-transparent"
           ></div>
-          <p class="mt-3 text-sm text-ink-soft">正在向目标上游发送模型列表探测请求…</p>
-          <p class="mt-1 text-xs text-ink-faint">走 {{ probeDialog.protocol }} 协议模型列表接口</p>
+          <p class="mt-3 text-sm text-ink-soft">{{ m.probe_dialog_loading() }}</p>
+          <p class="mt-1 text-xs text-ink-faint">
+            {{ m.probe_dialog_proto_hint({ protocol: probeDialog.protocol ?? '' }) }}
+          </p>
         </div>
 
         <div
           v-else-if="probeDialog.error"
           class="my-4 rounded-xl border border-danger/30 bg-danger/10 p-4"
         >
-          <p class="text-sm font-semibold text-danger">探测失败</p>
+          <p class="text-sm font-semibold text-danger">{{ m.probe_dialog_failed() }}</p>
           <p class="mt-1 text-xs text-danger/90">{{ probeDialog.error }}</p>
           <p class="mt-2 text-[0.75rem] text-ink-faint">
-            请检查上方渠道地址（Base URL）是否正确、API
-            密钥是否已填写且有效，若为私有网络请检查网络连通性。
+            {{ m.probe_dialog_failed_hint() }}
           </p>
           <div class="mt-3 flex justify-end gap-2">
             <DialogClose as="template">
-              <button type="button" class="glass-button-ghost px-3 py-1.5 text-xs">关闭</button>
+              <button type="button" class="glass-button-ghost px-3 py-1.5 text-xs">
+                {{ m.common_close() }}
+              </button>
             </DialogClose>
             <button
               v-if="probeDialog.targetEndpoint"
@@ -119,7 +122,7 @@ function deselectAllFiltered() {
               class="glass-button-primary px-3 py-1.5 text-xs font-medium"
               @click="emit('retry')"
             >
-              重试
+              {{ m.common_retry() }}
             </button>
           </div>
         </div>
@@ -130,27 +133,32 @@ function deselectAllFiltered() {
               <input
                 v-model="probeDialog.filterQuery"
                 type="search"
-                placeholder="搜索上游模型 ID…"
+                :placeholder="m.probe_dialog_search_placeholder()"
                 class="glass-field w-full px-3 py-1.5 text-xs outline-none"
               />
             </div>
             <div class="flex items-center gap-2 text-xs">
               <span class="text-ink-faint">
-                发现 {{ probeDialog.models.length }} 个 · 已选 {{ probeDialog.selected.size }} 个
+                {{
+                  m.probe_dialog_stats({
+                    total: probeDialog.models.length,
+                    selected: probeDialog.selected.size,
+                  })
+                }}
               </span>
               <button
                 type="button"
                 class="glass-button-ghost px-2 py-1 text-xs"
                 @click="selectAllFiltered"
               >
-                全选{{ probeDialog.filterQuery ? '当前' : '' }}
+                {{ m.probe_dialog_select_all() }}
               </button>
               <button
                 type="button"
                 class="glass-button-ghost px-2 py-1 text-xs"
                 @click="deselectAllFiltered"
               >
-                全不选
+                {{ m.probe_dialog_deselect_all() }}
               </button>
             </div>
           </div>
@@ -159,53 +167,52 @@ function deselectAllFiltered() {
             v-if="probeDialog.models.length === 0"
             class="py-10 text-center text-sm text-ink-faint"
           >
-            上游返回了空模型列表。
+            {{ m.probe_dialog_empty_upstream() }}
           </div>
           <div
             v-else-if="filteredProbeModels.length === 0"
             class="py-10 text-center text-sm text-ink-faint"
           >
-            没有匹配 "{{ probeDialog.filterQuery }}" 的模型
+            {{ m.probe_dialog_no_match({ query: probeDialog.filterQuery }) }}
           </div>
           <div
             v-else
             class="glass max-h-72 min-h-36 flex-1 divide-y divide-ink/5 overflow-y-auto rounded-xl p-2.5"
           >
             <div
-              v-for="m in filteredProbeModels"
-              :key="m.id"
+              v-for="probeItem in filteredProbeModels"
+              :key="probeItem.id"
               class="flex cursor-pointer items-center justify-between rounded-lg px-2.5 py-1.5 transition-colors hover:bg-ink/5"
-              @click="toggleProbeSelected(m.id)"
+              @click="toggleProbeSelected(probeItem.id)"
             >
               <div class="min-w-0 flex-1 pr-2">
-                <p class="truncate font-mono text-xs font-medium text-ink">{{ m.id }}</p>
+                <p class="truncate font-mono text-xs font-medium text-ink">{{ probeItem.id }}</p>
                 <p
-                  v-if="m.display_name && m.display_name !== m.id"
+                  v-if="probeItem.display_name && probeItem.display_name !== probeItem.id"
                   class="truncate text-[0.7rem] text-ink-faint"
                 >
-                  {{ m.display_name }}
+                  {{ probeItem.display_name }}
                 </p>
               </div>
               <div
                 class="grid size-5 shrink-0 place-items-center rounded border transition-colors"
                 :class="
-                  probeDialog.selected.has(m.id)
+                  probeDialog.selected.has(probeItem.id)
                     ? 'border-accent bg-accent text-white'
                     : 'border-ink/20 bg-transparent'
                 "
               >
-                <AppIcon v-if="probeDialog.selected.has(m.id)" name="check" :size="12" />
+                <AppIcon v-if="probeDialog.selected.has(probeItem.id)" name="check" :size="12" />
               </div>
             </div>
           </div>
-
           <div class="mt-2 flex items-center justify-end gap-3 border-t border-ink/8 pt-2">
             <button
               type="button"
               class="glass-button-ghost px-4 py-2 text-xs"
               @click="probeDialog.open = false"
             >
-              取消
+              {{ m.common_cancel() }}
             </button>
             <button
               type="button"
@@ -213,7 +220,7 @@ function deselectAllFiltered() {
               :disabled="probeDialog.selected.size === 0"
               @click="emit('apply')"
             >
-              导入所选 ({{ probeDialog.selected.size }}) 个模型
+              {{ m.probe_dialog_import_selected({ count: probeDialog.selected.size }) }}
             </button>
           </div>
         </div>

@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { useToastStore, type ToastTone } from '@/stores/toast'
+import * as m from '@/paraglide/messages'
 import AppIcon from '@/components/AppIcon.vue'
 
 const toastStore = useToastStore()
-
 function toneIcon(tone: ToastTone): 'check' | 'danger' | 'warning' | 'info' {
   switch (tone) {
     case 'success':
@@ -68,8 +68,8 @@ function toneColorClass(tone: ToastTone): string {
 
         <button
           type="button"
-          class="-mr-1 -mt-1 shrink-0 rounded-lg p-1 text-ink-faint hover:bg-ink/5 hover:text-ink transition-colors"
-          aria-label="关闭通知"
+          class="-mr-1 -mt-1 shrink-0 rounded-lg p-1 text-ink-faint hover:bg-ink/5 hover:text-ink transition-colors cursor-pointer"
+          :aria-label="m.common_close()"
           @click="toastStore.dismiss(item.id)"
         >
           <AppIcon name="x" :size="14" />

@@ -8,10 +8,10 @@
  */
 import { computed, nextTick, onMounted, ref, toRef } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
+import * as m from '@/paraglide/messages'
 import { models as modelsApi, playground } from '@/api/client'
 import { useAction } from '@/composables/useAction'
 import { orElse, parseJson } from '@/utils/effect'
-
 interface ChatTurn {
   role: 'user' | 'assistant'
   content: string
@@ -24,7 +24,7 @@ const model = ref('')
 const system = ref('')
 const draft = ref('')
 const turns = ref<ChatTurn[]>([])
-const chat = useAction('请求失败')
+const chat = useAction(m.play_req_failed())
 const busy = toRef(chat, 'busy')
 const scroller = ref<HTMLElement | null>(null)
 
@@ -100,7 +100,7 @@ async function send() {
 
     const reader = response.body?.getReader()
     if (!reader) {
-      reply.error = '响应没有可读的流'
+      reply.error = m.play_stream_unread()
       return
     }
     const decoder = new TextDecoder()
@@ -134,17 +134,23 @@ function clear() {
   <div class="flex h-[calc(100vh-2.5rem)] flex-col gap-4 max-md:h-auto max-md:min-h-[70vh]">
     <header class="flex flex-wrap items-end justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold">调试台</h1>
+        <h1 class="text-2xl font-semibold">{{ m.play_title() }}</h1>
         <p class="mt-1 text-sm text-ink-faint">
-          请求走网关完整管线：路由、转码、熔断与日志一个不少。
+          {{ m.play_subtitle() }}
         </p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <label class="flex items-center gap-2 text-sm text-ink-soft">
-          模型
-          <select v-model="model" class="glass-field min-w-44 outline-none" aria-label="调试模型">
-            <option v-if="modelList.length === 0" value="" disabled>没有可用模型</option>
-            <option v-for="m in modelList" :key="m" :value="m">{{ m }}</option>
+          {{ m.play_model_label() }}
+          <select
+            v-model="model"
+            class="glass-field min-w-44 outline-none"
+            :aria-label="m.play_model_aria()"
+          >
+            <option v-if="modelList.length === 0" value="" disabled>
+              {{ m.play_no_models() }}
+            </option>
+            <option v-for="mName in modelList" :key="mName" :value="mName">{{ mName }}</option>
           </select>
         </label>
         <button
@@ -153,7 +159,7 @@ function clear() {
           :disabled="turns.length === 0"
           @click="clear"
         >
-          清空会话
+          {{ m.play_clear_history() }}
         </button>
       </div>
     </header>
@@ -161,8 +167,8 @@ function clear() {
     <input
       v-model="system"
       type="text"
-      placeholder="System 提示词（可选）"
-      aria-label="System 提示词"
+      :placeholder="m.play_system_placeholder()"
+      :aria-label="m.play_system_aria()"
       class="glass-field w-full outline-none"
     />
 
@@ -170,10 +176,10 @@ function clear() {
     <section
       ref="scroller"
       class="glass glass-specular min-h-64 flex-1 space-y-4 overflow-y-auto p-5"
-      aria-label="会话记录"
+      :aria-label="m.play_history_aria()"
     >
       <p v-if="turns.length === 0" class="py-16 text-center text-sm text-ink-faint">
-        选择模型，发出第一条消息试试。
+        {{ m.play_empty_hint() }}
       </p>
       <div
         v-for="(turn, i) in turns"
@@ -193,7 +199,11 @@ function clear() {
         >
           <template v-if="turn.error">{{ turn.error }}</template>
           <template v-else-if="turn.content">{{ turn.content }}</template>
-          <div v-else class="inline-flex items-center gap-1.5 py-1 px-0.5" aria-label="思考中">
+          <div
+            v-else
+            class="inline-flex items-center gap-1.5 py-1 px-0.5"
+            :aria-label="m.play_thinking_aria()"
+          >
             <span
               class="size-2 rounded-full bg-accent/70 animate-bounce [animation-delay:-0.3s]"
             ></span>
@@ -211,8 +221,8 @@ function clear() {
       <textarea
         v-model="draft"
         rows="2"
-        placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-        aria-label="消息输入"
+        :placeholder="m.play_input_placeholder()"
+        :aria-label="m.play_input_aria()"
         class="glass-field flex-1 resize-none px-3 py-2.5 text-sm outline-none"
         @keydown.enter.exact.prevent="send"
       ></textarea>
@@ -222,7 +232,7 @@ function clear() {
         class="glass-button-ghost !h-auto shrink-0 px-4 py-2.5 text-sm"
         @click="stop"
       >
-        停止
+        {{ m.common_stop() }}
       </button>
       <button
         v-else
@@ -231,7 +241,7 @@ function clear() {
         :disabled="!canSend"
       >
         <AppIcon name="bolt" :size="15" />
-        发送
+        {{ m.common_send() }}
       </button>
     </form>
   </div>

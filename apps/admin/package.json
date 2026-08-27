@@ -5,16 +5,18 @@
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
+    "paraglide": "paraglide-js compile --project ./project.inlang --outdir ./src/paraglide --strategy globalVariable localStorage cookie custom-browser baseLocale --output-structure locale-modules",
     "dev": "vp dev",
-    "build": "vp check && vue-tsc --build && vp build",
+    "build": "pnpm paraglide && vp check && vue-tsc --build && vp build",
     "preview": "vp preview",
-    "test:unit": "vp test",
+    "test:unit": "pnpm paraglide && vp test",
     "test:e2e": "playwright test",
-    "check": "vp check && vue-tsc --build",
+    "check": "pnpm paraglide && vp check && vue-tsc --build",
     "lint": "vp lint",
     "format": "vp fmt"
   },
   "dependencies": {
+    "@inlang/paraglide-js": "^2.24.1",
     "@lucide/vue": "^1.31.0",
     "@refract/contracts": "workspace:*",
     "effect": "4.0.0-rc.112",

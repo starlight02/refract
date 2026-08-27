@@ -7,6 +7,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import { useAction } from '@/composables/useAction'
+import * as m from '@/paraglide/messages'
 import GlassSpinner from '@/components/GlassSpinner.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import RoutingPolicySection from '@/components/settings/RoutingPolicySection.vue'
@@ -51,8 +52,8 @@ import type {
   RoutingPolicy,
 } from '@refract/contracts'
 
-const saveSettings = useAction('保存失败', { toast: true })
-const reloadSectionAction = useAction('加载失败')
+const saveSettings = useAction(m.settings_save_failed(), { toast: true })
+const reloadSectionAction = useAction(m.settings_load_failed())
 const sectionErrors = ref<Record<string, string | null>>({})
 const loading = ref(true)
 const loadError = ref<string | null>(null)
@@ -271,7 +272,7 @@ function onBeforeUnload(e: BeforeUnloadEvent) {
 
 onBeforeRouteLeave(() => {
   if (isDirty.value && !saveSettings.busy) {
-    const confirm = window.confirm('有未保存的系统设置，确定要离开吗？')
+    const confirm = window.confirm(m.settings_leave_confirm())
     if (!confirm) return false
   }
 })
@@ -380,7 +381,7 @@ onMounted(async () => {
     masterKeyRes,
   ]
   if (allSettledList.every((r) => r.status === 'rejected')) {
-    loadError.value = '全部设置项加载失败，请检查网络或后端状态'
+    loadError.value = m.settings_load_all_failed()
   }
 
   const stats = await orElse(() => dataApi.stats())
@@ -395,44 +396,43 @@ onBeforeUnmount(() => {
 async function save() {
   saveSettings.clear()
   if (!policyOk.value) {
-    saveError.value = '路由策略不合法：最大重试 0–32 次（0 = 不限），单请求上游调用上限 0–255'
+    saveError.value = m.settings_val_policy()
     return
   }
   if (!retentionOk.value) {
-    saveError.value = '日志保留天数必须是 1–3650 的整数'
+    saveError.value = m.settings_val_retention()
     return
   }
   if (!breakerOk.value) {
-    saveError.value = '熔断参数不合法：阈值 0–1000，冷却 1–86400 秒且上限不小于起始值'
+    saveError.value = m.settings_val_breaker()
     return
   }
   if (!pricingOk.value) {
-    saveError.value = '价表不合法：模式不能为空，价格必须是非负数字'
+    saveError.value = m.settings_val_pricing()
     return
   }
   if (!notifyOk.value) {
-    saveError.value = '通知设置不合法：webhook 需以 http(s):// 开头，重测间隔 0–1440 分钟'
+    saveError.value = m.settings_val_notify()
     return
   }
   if (!limitsOk.value) {
-    saveError.value = '全局限制不合法：RPM ≤ 1,000,000，并发 ≤ 100,000'
+    saveError.value = m.settings_val_limits()
     return
   }
   if (!ipLimitsOk.value) {
-    saveError.value = '单 IP 限制不合法：RPM ≤ 1,000,000'
+    saveError.value = m.settings_val_ip_limits()
     return
   }
   if (!backupOk.value) {
-    saveError.value = '自动备份不合法：间隔 ≤ 8760 小时，保留 1–100 份'
+    saveError.value = m.settings_val_backup()
     return
   }
   if (!emptyRetryOk.value) {
-    saveError.value = '空回复重试不合法：判定窗口需为 0–3600 秒，最大重试需为 0–100 次'
+    saveError.value = m.settings_val_empty_retry()
     return
   }
   if (!affinityOk.value) {
-    saveError.value =
-      '亲和规则不合法：名称需非空且唯一、每条规则至少一个来源、header 名不能为空、body 路径需以 / 开头、TTL 需为 1–604800 的整数'
+    saveError.value = m.settings_val_affinity()
     return
   }
   saveError.value = null
@@ -515,7 +515,7 @@ async function save() {
         affinitySnapshot = JSON.stringify(affinityCurrent())
       })
     },
-    () => '已保存',
+    () => m.settings_saved_msg(),
   )
 }
 </script>
@@ -523,12 +523,12 @@ async function save() {
 <template>
   <div class="mx-auto max-w-2xl pb-16">
     <header class="mb-6">
-      <h1 class="text-2xl font-semibold">设置</h1>
-      <p class="mt-1 text-sm text-ink-faint">变更需要保存才会生效。</p>
+      <h1 class="text-2xl font-semibold">{{ m.settings_title() }}</h1>
+      <p class="mt-1 text-sm text-ink-faint">{{ m.settings_subtitle() }}</p>
     </header>
 
     <div v-if="loading" class="py-24 text-center">
-      <GlassSpinner size="lg" label="正在拉取系统设置与健康状态…" />
+      <GlassSpinner size="lg" :label="m.settings_loading()" />
     </div>
 
     <div v-else-if="loadError" class="glass border-danger/30 p-4 text-sm text-danger">
@@ -607,7 +607,7 @@ async function save() {
           @click="save"
         >
           <AppIcon v-if="saveSettings.busy" name="spinner" class="animate-spin mr-1.5" :size="15" />
-          {{ saveSettings.busy ? '保存中…' : '保存设置' }}
+          {{ saveSettings.busy ? m.common_saving() : m.settings_save_btn() }}
         </button>
 
         <p v-if="saveSettings.error ?? saveError" class="ml-2 text-sm text-danger">

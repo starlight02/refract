@@ -442,6 +442,13 @@ export interface BackupFile {
   size_bytes: number
   created_at: string
 }
+/** 备份导入结果。 */
+export interface ImportResult {
+  channels_imported: number
+  keys_imported: number
+  skipped_channels?: string[]
+  skipped_keys?: string[]
+}
 
 /**
  * 密钥类设置的只写状态。

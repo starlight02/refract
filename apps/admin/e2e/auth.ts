@@ -25,6 +25,14 @@ export async function readIssuedAdminToken(): Promise<string> {
 
 /** 用服务端签发的管理令牌换 Session Cookie。 */
 export async function loginAsAdmin(page: Page): Promise<void> {
+  await page.context().addCookies([
+    {
+      name: 'PARAGLIDE_LOCALE',
+      value: 'zh-Hans',
+      domain: '127.0.0.1',
+      path: '/',
+    },
+  ])
   const token = await readIssuedAdminToken()
   const response = await page.request.post('/api/auth/login', {
     data: { token },

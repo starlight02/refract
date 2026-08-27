@@ -5,9 +5,11 @@
 import { ref } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
 import SettingsSectionError from '@/components/settings/SettingsSectionError.vue'
+import * as m from '@/paraglide/messages'
 import { useAction } from '@/composables/useAction'
 import { backup } from '@/api/client'
 import { parseJson } from '@/utils/effect'
+import type { ImportResult } from '@refract/contracts'
 
 defineProps<{
   loadError?: string | null
@@ -17,8 +19,8 @@ const emit = defineEmits<{
   retry: []
 }>()
 
-const exportBackupAction = useAction('导出失败', { toast: true })
-const importBackupAction = useAction('导入失败', { toast: true })
+const exportBackupAction = useAction(m.settings_backup_export_failed(), { toast: true })
+const importBackupAction = useAction(m.settings_backup_import_failed(), { toast: true })
 const importMode = ref<'merge' | 'replace'>('merge')
 const importFileInput = ref<HTMLInputElement | null>(null)
 /** 待确认的替换导入：文件已解析但还没提交，等用户二次确认。 */
@@ -37,7 +39,7 @@ async function exportBackup() {
       a.download = `refract-backup-${new Date().toISOString().slice(0, 10)}.json`
       a.click()
       window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
-      return '备份已下载'
+      return m.settings_backup_exported_msg()
     },
   )
 }
@@ -56,7 +58,7 @@ async function importBackup(event: Event) {
   pendingReplace.value = null
   const parsed = parseJson(await file.text())
   if (parsed === undefined) {
-    importBackupAction.notice = { tone: 'danger', text: '文件不是有效的 JSON' }
+    importBackupAction.notice = { tone: 'danger', text: m.settings_backup_invalid_json() }
     return
   }
 
@@ -86,17 +88,18 @@ function skippedDetail(kind: string, names: string[]): string {
 async function runImport(payload: unknown) {
   await importBackupAction.run(
     () => backup.import(payload, importMode.value),
-    (result) => {
+    (result: ImportResult) => {
       const detail = [
-        skippedDetail('渠道', result.skipped_channels ?? []),
-        skippedDetail('密钥', result.skipped_keys ?? []),
+        skippedDetail(m.common_channel(), result.skipped_channels ?? []),
+        skippedDetail(m.common_key(), result.skipped_keys ?? []),
       ]
         .filter(Boolean)
         .join(' ')
       return (
-        `导入完成：渠道 +${result.channels_imported}（跳过 ${result.channels_skipped}），` +
-        `密钥 +${result.keys_imported}（跳过 ${result.keys_skipped}）。` +
-        (detail ? ` ${detail}` : '')
+        m.settings_backup_imported_msg({
+          channels: String(result.channels_imported),
+          keys: String(result.keys_imported),
+        }) + (detail ? ` ${detail}` : '')
       )
     },
   )
@@ -107,10 +110,9 @@ async function runImport(payload: unknown) {
   <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
     <SettingsSectionError :message="loadError" @retry="emit('retry')" />
     <div>
-      <h2 class="text-sm font-semibold text-ink-soft uppercase">数据备份</h2>
+      <h2 class="text-sm font-semibold text-ink-soft uppercase">{{ m.settings_backup_title() }}</h2>
       <p class="mt-1 text-xs text-ink-faint">
-        导出渠道、API 密钥与设置为一个 JSON 文件；可在另一个 Refract 实例导入恢复。
-        导出文件含渠道凭据明文；网关密钥只含哈希，恢复后原密钥继续可用。
+        {{ m.settings_backup_desc() }}
       </p>
     </div>
 
@@ -126,7 +128,9 @@ async function runImport(payload: unknown) {
           :class="exportBackupAction.busy ? 'animate-spin' : ''"
           :size="15"
         />
-        {{ exportBackupAction.busy ? '导出中…' : '导出备份' }}
+        {{
+          exportBackupAction.busy ? m.settings_backup_exporting() : m.settings_backup_export_btn()
+        }}
       </button>
 
       <button
@@ -140,14 +144,16 @@ async function runImport(payload: unknown) {
           :class="importBackupAction.busy ? 'animate-spin' : ''"
           :size="15"
         />
-        {{ importBackupAction.busy ? '导入中…' : '导入备份' }}
+        {{
+          importBackupAction.busy ? m.settings_backup_importing() : m.settings_backup_import_btn()
+        }}
       </button>
       <input
         ref="importFileInput"
         type="file"
         accept="application/json,.json"
         class="hidden"
-        aria-label="选择备份文件"
+        :aria-label="m.settings_backup_file_aria()"
         @change="importBackup"
       />
 
@@ -160,7 +166,7 @@ async function runImport(payload: unknown) {
             name="import-mode"
             class="accent-[var(--color-accent)]"
           />
-          合并（跳过同名）
+          {{ m.settings_backup_mode_merge() }}
         </label>
         <label class="flex cursor-pointer items-center gap-1.5">
           <input
@@ -170,7 +176,7 @@ async function runImport(payload: unknown) {
             name="import-mode"
             class="accent-[var(--color-accent)]"
           />
-          替换（清空后导入）
+          {{ m.settings_backup_mode_replace() }}
         </label>
       </div>
     </div>
@@ -179,11 +185,14 @@ async function runImport(payload: unknown) {
       v-if="pendingReplace"
       class="flex flex-wrap items-center gap-3 rounded-lg border border-danger/30 bg-danger/8 px-4 py-3"
       role="alertdialog"
-      aria-label="确认替换导入"
+      :aria-label="m.settings_backup_replace_confirm_title()"
     >
       <p class="text-xs text-ink-soft">
-        替换导入会<span class="font-semibold text-danger">先清空现有全部渠道与密钥</span
-        >，且无法恢复。确定用「{{ pendingReplace.name }}」替换吗？
+        {{ m.settings_backup_replace_warn_prefix()
+        }}<span class="font-semibold text-danger">{{
+          m.settings_backup_replace_warn_highlight()
+        }}</span
+        >{{ m.settings_backup_replace_warn_suffix({ name: pendingReplace.name }) }}
       </p>
       <div class="flex items-center gap-2">
         <button
@@ -193,9 +202,19 @@ async function runImport(payload: unknown) {
           @click="confirmReplaceImport"
         >
           <AppIcon v-if="importBackupAction.busy" name="spinner" class="animate-spin" :size="12" />
-          {{ importBackupAction.busy ? '替换中…' : '确认替换' }}
+          {{
+            importBackupAction.busy
+              ? m.settings_backup_replacing()
+              : m.settings_backup_replace_confirm_btn()
+          }}
         </button>
-        <button type="button" @click="pendingReplace = null">取消</button>
+        <button
+          type="button"
+          class="glass-button-ghost px-3 py-1.5 text-xs cursor-pointer"
+          @click="pendingReplace = null"
+        >
+          {{ m.common_cancel() }}
+        </button>
       </div>
     </div>
   </section>

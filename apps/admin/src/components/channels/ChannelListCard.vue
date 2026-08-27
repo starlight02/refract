@@ -6,6 +6,7 @@ import { computed } from 'vue'
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
 import AppIcon from '@/components/AppIcon.vue'
+import * as m from '@/paraglide/messages'
 import type { Channel, ChannelTestResult, EndpointHealth, Protocol } from '@refract/contracts'
 
 const props = defineProps<{
@@ -53,9 +54,11 @@ function hasTranscode(channel: Channel): boolean {
 
 function addressLabel(channel: Channel): string {
   const a = channel.address
-  if (!a.unofficial) return '官方地址'
-  if (a.full_address) return a.base_url || '（未填完整地址）'
-  return [a.base_url, a.version_prefix, a.path].filter(Boolean).join('') || '（未填地址）'
+  if (!a.unofficial) return m.ch_card_official_addr()
+  if (a.full_address) return a.base_url || m.ch_card_unfilled_full_addr()
+  return (
+    [a.base_url, a.version_prefix, a.path].filter(Boolean).join('') || m.ch_card_unfilled_addr()
+  )
 }
 
 function canProbeBalance(channel: Channel): boolean {
@@ -67,12 +70,12 @@ function canProbeBalance(channel: Channel): boolean {
 function suspendRemaining(h: EndpointHealth): string {
   if (!h.suspended_until) return ''
   const ms = new Date(h.suspended_until).getTime() - Date.now()
-  if (ms <= 0) return '即将恢复'
+  if (ms <= 0) return m.ch_card_recovering_soon()
   const secs = Math.ceil(ms / 1000)
-  if (secs < 60) return `${secs} 秒后自动恢复`
+  if (secs < 60) return m.ch_card_recovering_secs({ secs })
   const mins = Math.ceil(secs / 60)
-  if (mins < 60) return `${mins} 分钟后自动恢复`
-  return `${Math.ceil(mins / 60)} 小时后自动恢复`
+  if (mins < 60) return m.ch_card_recovering_mins({ mins })
+  return m.ch_card_recovering_hours({ hours: Math.ceil(mins / 60) })
 }
 
 function resetKey(h: EndpointHealth): string {
@@ -101,7 +104,7 @@ function resetKey(h: EndpointHealth): string {
           "
           role="checkbox"
           :aria-checked="selected"
-          :aria-label="`选择 ${ch.name}`"
+          :aria-label="m.ch_card_select_aria({ name: ch.name })"
         >
           <AppIcon name="check" :size="12" />
         </span>
@@ -115,7 +118,7 @@ function resetKey(h: EndpointHealth): string {
             class="proto-badge"
             style="color: var(--color-accent)"
           >
-            聚合
+            {{ m.ch_card_aggregate() }}
           </span>
           <ProtocolBadge
             v-for="p in protocols(ch)"
@@ -128,18 +131,18 @@ function resetKey(h: EndpointHealth): string {
             v-if="hasTranscode(ch)"
             class="proto-badge"
             style="color: var(--color-warning)"
-            title="该渠道有端点开启了协议转换"
+            :title="m.ch_card_transcode_title()"
           >
-            转换
+            {{ m.ch_card_transcode_tag() }}
           </span>
 
           <span
             v-if="ch.auto_disabled"
             class="proto-badge"
             style="color: var(--color-danger)"
-            title="连续凭据错误被自动停用；按设置的间隔重测，通过后自动恢复。手动启用可立即清除。"
+            :title="m.ch_card_auto_disabled_title()"
           >
-            自动停用
+            {{ m.ch_card_auto_disabled_tag() }}
           </span>
         </div>
 
@@ -149,21 +152,26 @@ function resetKey(h: EndpointHealth): string {
 
         <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-faint">
           <span
-            >优先级 <span class="tabular font-medium text-ink-soft">{{ ch.priority }}</span></span
+            >{{ m.ch_card_priority() }}
+            <span class="tabular font-medium text-ink-soft">{{ ch.priority }}</span></span
           >
           <span
-            >权重 <span class="tabular font-medium text-ink-soft">{{ ch.weight }}</span></span
+            >{{ m.ch_card_weight() }}
+            <span class="tabular font-medium text-ink-soft">{{ ch.weight }}</span></span
           >
           <span
             ><span class="tabular font-medium text-ink-soft">{{ modelCount(ch) }}</span>
-            个模型</span
+            {{ m.ch_card_models_count({ count: '' }).trim() }}</span
           >
           <span v-if="ch.endpoints.length > 1">
             <span class="tabular font-medium text-ink-soft">{{ ch.endpoints.length }}</span>
-            个端点
+            {{ m.ch_card_endpoints_count({ count: '' }).trim() }}
           </span>
-          <span v-if="ch.balance != null" :title="`刷新于 ${ch.balance_updated_at ?? ''}`">
-            余额
+          <span
+            v-if="ch.balance != null"
+            :title="m.ch_card_balance_updated({ time: ch.balance_updated_at ?? '' })"
+          >
+            {{ m.ch_card_balance() }}
             <span
               class="tabular font-medium"
               :class="ch.balance < 1 ? 'text-danger' : 'text-ink-soft'"
@@ -187,7 +195,7 @@ function resetKey(h: EndpointHealth): string {
                 : 'bg-danger/12 text-danger'
           "
         >
-          <template v-if="testResult === 'pending'">测试中…</template>
+          <template v-if="testResult === 'pending'">{{ m.common_testing() }}</template>
           <template v-else>
             <span class="inline-flex items-center gap-1.5">
               <AppIcon :name="testResult.success ? 'check' : 'x'" :size="13" />
@@ -205,9 +213,9 @@ function resetKey(h: EndpointHealth): string {
           class="mt-2.5 rounded-lg bg-danger/12 px-3 py-2 text-xs text-danger"
         >
           <div class="flex flex-wrap items-center gap-2">
-            <span class="font-semibold">{{ h.protocol }} 端点熔断中</span>
+            <span class="font-semibold">{{ m.ch_card_suspended_msg({ proto: h.protocol }) }}</span>
             <span class="text-danger/80">{{ suspendRemaining(h) }}</span>
-            <span>连续失败 {{ h.consecutive_fails }} 次</span>
+            <span>{{ m.ch_card_consecutive_fails({ count: h.consecutive_fails }) }}</span>
             <button
               type="button"
               class="ml-auto inline-flex items-center gap-1 rounded-md bg-danger/15 px-2 py-1 font-medium hover:bg-danger/25 disabled:opacity-50"
@@ -220,7 +228,11 @@ function resetKey(h: EndpointHealth): string {
                 class="animate-spin"
                 :size="11"
               />
-              {{ resetting.has(resetKey(h)) ? '解除中…' : '解除熔断' }}
+              {{
+                resetting.has(resetKey(h))
+                  ? m.ch_card_resetting_breaker()
+                  : m.ch_card_reset_breaker()
+              }}
             </button>
           </div>
           <p v-if="h.last_error" class="mt-1.5 line-clamp-2 text-danger/80">
@@ -233,7 +245,11 @@ function resetKey(h: EndpointHealth): string {
         <GlassSwitch
           class="mr-1"
           :model-value="ch.enabled"
-          :label="ch.enabled ? `禁用 ${ch.name}` : `启用 ${ch.name}`"
+          :label="
+            ch.enabled
+              ? m.ch_card_toggle_disable({ name: ch.name })
+              : m.ch_card_toggle_enable({ name: ch.name })
+          "
           tone="success"
           @update:model-value="emit('toggle-enabled', $event)"
         />
@@ -249,7 +265,7 @@ function resetKey(h: EndpointHealth): string {
             :class="testResult === 'pending' ? 'animate-spin' : ''"
             :size="13"
           />
-          {{ testResult === 'pending' ? '测试中…' : '测试' }}
+          {{ testResult === 'pending' ? m.common_testing() : m.common_test() }}
         </button>
 
         <button
@@ -257,7 +273,7 @@ function resetKey(h: EndpointHealth): string {
           type="button"
           class="glass-button-ghost px-2.5 py-1.5 text-xs"
           :disabled="balanceBusy"
-          title="查询上游余额（OpenAI 兼容 billing 端点）"
+          :title="m.ch_card_query_balance_tip()"
           @click="emit('balance')"
         >
           <AppIcon
@@ -265,7 +281,7 @@ function resetKey(h: EndpointHealth): string {
             :class="balanceBusy ? 'animate-spin' : ''"
             :size="13"
           />
-          {{ balanceBusy ? '查询中…' : '余额' }}
+          {{ balanceBusy ? m.common_clearing() : m.ch_card_balance() }}
         </button>
 
         <button
@@ -279,7 +295,7 @@ function resetKey(h: EndpointHealth): string {
             :class="copying ? 'animate-spin' : ''"
             :size="13"
           />
-          {{ copying ? '复制中…' : '复制' }}
+          {{ copying ? m.common_copying() : m.common_copy() }}
         </button>
 
         <button
@@ -288,7 +304,7 @@ function resetKey(h: EndpointHealth): string {
           @click="emit('edit')"
         >
           <AppIcon name="pencil" :size="13" />
-          编辑
+          {{ m.common_edit() }}
         </button>
 
         <button
@@ -298,7 +314,7 @@ function resetKey(h: EndpointHealth): string {
           @click="emit('ask-delete')"
         >
           <AppIcon name="trash" :size="13" />
-          删除
+          {{ m.common_delete() }}
         </button>
         <template v-else>
           <button
@@ -308,15 +324,15 @@ function resetKey(h: EndpointHealth): string {
             @click="emit('confirm-delete')"
           >
             <AppIcon v-if="deleting" name="spinner" class="animate-spin" :size="12" />
-            {{ deleting ? '删除中…' : '确认' }}
+            {{ deleting ? m.common_deleting() : m.common_confirm() }}
           </button>
           <button
             type="button"
-            class="glass-button-ghost px-2.5 py-1.5 text-xs"
+            class="glass-button-ghost px-2.5 py-1.5 text-xs cursor-pointer"
             :disabled="deleting"
             @click="emit('cancel-delete')"
           >
-            取消
+            {{ m.common_cancel() }}
           </button>
         </template>
       </div>

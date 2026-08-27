@@ -17,11 +17,12 @@ import ProbeModelsDialog, {
   type ProbeDialogState,
 } from '@/components/channel-editor/ProbeModelsDialog.vue'
 import UpstreamAddressFields from '@/components/channel-editor/UpstreamAddressFields.vue'
-import { PROTOCOL_ORDER, withoutProtocol } from '@/components/protocol'
-import { useChannelsStore } from '@/stores/channels'
-import { channels as channelsApi } from '@/api/client'
-import { numOrNull, numOr } from '@/utils/num'
 import { useAction } from '@/composables/useAction'
+import * as m from '@/paraglide/messages'
+import { channels as channelsApi } from '@/api/client'
+import { useChannelsStore } from '@/stores/channels'
+import { numOr, numOrNull } from '@/utils/num'
+import { withoutProtocol, PROTOCOL_ORDER } from '@/components/protocol'
 import {
   emptyHeaderRow,
   headerRowsError,
@@ -37,7 +38,6 @@ import {
 import { blankChannel, looksMasked, newEndpoint, poolCredentials } from '@/utils/channel-form'
 import { validateChannel } from '@/utils/channel-validation'
 import type { Channel, ChannelEndpoint, ModelEntry } from '@refract/contracts'
-
 const route = useRoute()
 const router = useRouter()
 const store = useChannelsStore()
@@ -70,7 +70,7 @@ function onBeforeUnload(e: BeforeUnloadEvent) {
 
 onBeforeRouteLeave(() => {
   if (isDirty.value && !isSubmitting.value) {
-    const confirm = window.confirm('有未保存的渠道配置更改，确定要离开吗？')
+    const confirm = window.confirm(m.ch_edit_leave_confirm())
     if (!confirm) return false
   }
 })
@@ -82,10 +82,10 @@ const editingId = computed(() => {
 const isEdit = computed(() => editingId.value !== null && !Number.isNaN(editingId.value))
 
 const form = ref<Channel>(blankChannel())
-const loadChannel = useAction('加载渠道失败')
-const saveChannel = useAction('保存失败', { toast: true })
-const destroyChannel = useAction('删除失败', { toast: true })
-const probeModels = useAction('探测上游模型列表失败，请检查 Base URL 和密钥是否正确')
+const loadChannel = useAction(m.ch_edit_load_failed())
+const saveChannel = useAction(m.ch_edit_save_failed(), { toast: true })
+const destroyChannel = useAction(m.ch_edit_delete_failed(), { toast: true })
+const probeModels = useAction(m.ch_edit_probe_failed_generic())
 const loading = toRef(loadChannel, 'busy')
 const saving = toRef(saveChannel, 'busy')
 const destroying = toRef(destroyChannel, 'busy')
@@ -290,7 +290,7 @@ async function save() {
     },
     () => {
       router.push('/channels')
-      return '渠道已保存'
+      return m.ch_edit_saved_msg()
     },
   )
   if (saved === undefined) isSubmitting.value = false
@@ -305,7 +305,7 @@ async function destroy() {
     () => store.remove(editingId.value as number),
     () => {
       router.push('/channels')
-      return '渠道已删除'
+      return m.ch_edit_deleted_msg()
     },
   )
   if (removed === undefined) isSubmitting.value = false
@@ -317,10 +317,10 @@ async function destroy() {
     <header class="mb-6 flex items-end justify-between gap-4">
       <div>
         <h1 class="text-2xl font-semibold">
-          {{ isEdit ? '编辑渠道' : '新建渠道' }}
+          {{ isEdit ? m.ch_edit_title_edit() : m.ch_edit_title_new() }}
         </h1>
         <p class="mt-1 text-sm text-ink-faint">
-          渠道类型即协议 —— 与厂商无关，同一个中转站可以用聚合渠道表达多种协议。
+          {{ m.ch_edit_subtitle() }}
         </p>
       </div>
       <button
@@ -328,21 +328,23 @@ async function destroy() {
         class="glass-button-ghost px-3.5 py-2 text-sm"
         @click="router.push('/channels')"
       >
-        返回
+        {{ m.common_back() }}
       </button>
     </header>
 
     <div v-if="loading" class="py-24 text-center">
-      <GlassSpinner size="lg" label="正在读取渠道配置…" />
+      <GlassSpinner size="lg" :label="m.ch_edit_loading()" />
     </div>
 
     <form v-else class="flex flex-col gap-4" @submit.prevent="save">
       <ChannelBasicsSection v-model="form" v-model:tags-text="tagsText" />
 
       <section class="glass glass-specular p-5">
-        <h2 class="mb-1 text-sm font-semibold text-ink-soft uppercase">默认地址</h2>
+        <h2 class="mb-1 text-sm font-semibold text-ink-soft uppercase">
+          {{ m.ch_edit_default_addr_title() }}
+        </h2>
         <p class="mb-4 text-xs text-ink-faint">
-          端点未单独配置地址时继承这里。三段拼接：base URL + 版本前缀 + 路径。
+          {{ m.ch_edit_default_addr_desc() }}
         </p>
         <UpstreamAddressFields v-model="form.address" variant="channel" />
       </section>
@@ -351,7 +353,9 @@ async function destroy() {
 
       <section class="glass glass-specular p-5">
         <div class="mb-1 flex items-center justify-between">
-          <h2 class="text-sm font-semibold text-ink-soft uppercase">协议端点</h2>
+          <h2 class="text-sm font-semibold text-ink-soft uppercase">
+            {{ m.ch_edit_endpoints_title() }}
+          </h2>
           <button
             v-if="isAggregate && availableProtocols.length > 0"
             type="button"
@@ -359,15 +363,11 @@ async function destroy() {
             @click="addEndpoint"
           >
             <AppIcon name="plus" :size="14" />
-            添加端点
+            {{ m.ch_edit_add_endpoint() }}
           </button>
         </div>
         <p class="mb-4 text-xs text-ink-faint">
-          {{
-            isAggregate
-              ? '每个端点可独立配置地址、密钥、模型与协议转换。order 越小越优先命中。'
-              : '单协议渠道恰好一个端点，协议与渠道类型一致。'
-          }}
+          {{ isAggregate ? m.ch_edit_endpoints_hint_agg() : m.ch_edit_endpoints_hint_single() }}
         </p>
 
         <div class="flex flex-col gap-4">
@@ -393,7 +393,7 @@ async function destroy() {
       />
 
       <div v-if="validation.length > 0" class="glass border-warning/30 p-4">
-        <p class="mb-2 text-xs font-medium text-warning">保存前需要修正：</p>
+        <p class="mb-2 text-xs font-medium text-warning">{{ m.ch_edit_validation_errors() }}</p>
         <ul class="list-inside list-disc text-xs text-ink-soft">
           <li v-for="e in validation" :key="e">{{ e }}</li>
         </ul>
@@ -408,7 +408,13 @@ async function destroy() {
           :disabled="!canSave"
         >
           <AppIcon v-if="saving" name="spinner" class="animate-spin mr-1" :size="15" />
-          {{ saving ? '保存中…' : isEdit ? '保存修改' : '创建渠道' }}
+          {{
+            saving
+              ? m.common_saving()
+              : isEdit
+                ? m.ch_edit_save_changes()
+                : m.ch_edit_create_channel()
+          }}
         </button>
 
         <button
@@ -417,7 +423,7 @@ async function destroy() {
           :disabled="saving || destroying"
           @click="router.push('/channels')"
         >
-          取消
+          {{ m.common_cancel() }}
         </button>
 
         <template v-if="isEdit">
@@ -429,7 +435,7 @@ async function destroy() {
             @click="pendingDelete = true"
           >
             <AppIcon name="trash" :size="14" />
-            删除渠道
+            {{ m.ch_edit_delete_channel() }}
           </button>
           <div v-else class="ml-auto flex items-center gap-2">
             <button
@@ -439,7 +445,7 @@ async function destroy() {
               @click="destroy"
             >
               <AppIcon v-if="destroying" name="spinner" class="animate-spin" :size="13" />
-              {{ destroying ? '删除中…' : '确认删除' }}
+              {{ destroying ? m.common_deleting() : m.ch_edit_confirm_delete_btn() }}
             </button>
             <button
               type="button"
@@ -447,7 +453,7 @@ async function destroy() {
               :disabled="destroying"
               @click="pendingDelete = false"
             >
-              取消
+              {{ m.common_cancel() }}
             </button>
           </div>
         </template>

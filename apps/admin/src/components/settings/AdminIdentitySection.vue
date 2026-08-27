@@ -5,6 +5,7 @@
 import { computed, onMounted, ref } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
 import SettingsSectionError from '@/components/settings/SettingsSectionError.vue'
+import * as m from '@/paraglide/messages'
 import { useAction } from '@/composables/useAction'
 import { auth as authApi, settings } from '@/api/client'
 import { orElse } from '@/utils/effect'
@@ -20,9 +21,9 @@ const emit = defineEmits<{
 const sessionActive = ref(true)
 const tokenDraft = ref('')
 const showTokenDraft = ref(false)
-const applyAdminToken = useAction('设置失败', { toast: true })
-const clearAdminToken = useAction('关闭失败', { toast: true })
-const logoutSession = useAction('退出失败', { toast: true })
+const applyAdminToken = useAction(m.settings_admin_apply_failed(), { toast: true })
+const clearAdminToken = useAction(m.settings_admin_clear_failed(), { toast: true })
+const logoutSession = useAction(m.settings_admin_logout_failed(), { toast: true })
 const tokenBusy = computed(() => applyAdminToken.busy || clearAdminToken.busy || logoutSession.busy)
 
 onMounted(async () => {
@@ -43,7 +44,7 @@ async function applyToken() {
     () => {
       sessionActive.value = true
       tokenDraft.value = ''
-      return '令牌已生效，会话已更新。'
+      return m.settings_admin_applied_msg()
     },
   )
 }
@@ -55,7 +56,7 @@ async function clearToken() {
     () => settings.setAdminToken(null),
     () => {
       sessionActive.value = true
-      return '管理鉴权已关闭。'
+      return m.settings_admin_cleared_msg()
     },
   )
 }
@@ -76,39 +77,37 @@ async function logout() {
   <section class="glass glass-specular mt-5 flex flex-col gap-4 p-5">
     <SettingsSectionError :message="loadError" @retry="emit('retry')" />
     <div>
-      <h2 class="text-sm font-semibold text-ink-soft uppercase">管理身份与令牌</h2>
-      <p class="mt-1 text-xs text-ink-faint">
-        默认管理员账号为
-        <code class="font-mono text-ink-soft">admin@localhost</code>。启用后管理界面与 /api
-        的所有请求都需要携带该令牌。服务端只保存哈希，令牌本身无法读回。首次凭据保存在数据目录的
-        <code class="font-mono text-ink-soft">.admin_token</code> 文件中，10 分钟后自动删除；
-        若令牌丢失或文件过期，必须在宿主机或容器内使用
-        <code class="font-mono text-ink-soft">refract-server --reset-admin</code> 重启实例。
+      <h2 class="text-sm font-semibold text-ink-soft uppercase">{{ m.settings_admin_title() }}</h2>
+      <p class="mt-1 text-xs text-ink-faint leading-relaxed">
+        {{ m.settings_admin_desc_p1() }}
+        <code class="font-mono text-ink-soft">admin@localhost</code>{{ m.settings_admin_desc_p2()
+        }}<code class="font-mono text-ink-soft">.admin_token</code>{{ m.settings_admin_desc_p3()
+        }}<code class="font-mono text-ink-soft">refract-server --reset-admin</code
+        >{{ m.settings_admin_desc_p4() }}
       </p>
     </div>
     <p class="text-xs text-ink-faint">
-      会话通过安全 HttpOnly Cookie 维护，浏览器不持久化任何明文令牌。
+      {{ m.settings_admin_cookie_notice() }}
     </p>
     <div class="relative">
       <input
         v-model="tokenDraft"
         :type="showTokenDraft ? 'text' : 'password'"
-        placeholder="新令牌（启用或更换）"
+        :placeholder="m.settings_admin_token_placeholder()"
         autocomplete="new-password"
-        aria-label="新管理令牌"
+        :aria-label="m.settings_admin_token_aria()"
         class="glass-field w-full px-3 py-2 pr-16 font-mono text-sm outline-none"
       />
       <button
         type="button"
         class="absolute top-1/2 right-2 -translate-y-1/2 rounded-md px-2 py-1 text-xs text-ink-faint hover:text-ink"
-        :aria-label="showTokenDraft ? '隐藏管理令牌' : '显示管理令牌'"
+        :aria-label="showTokenDraft ? m.settings_admin_hide_token() : m.settings_admin_show_token()"
         :aria-pressed="showTokenDraft"
         @click="showTokenDraft = !showTokenDraft"
       >
-        {{ showTokenDraft ? '隐藏' : '显示' }}
+        {{ showTokenDraft ? m.common_hide() : m.common_show() }}
       </button>
     </div>
-
     <div class="flex flex-wrap items-center gap-3">
       <button
         type="button"
@@ -117,7 +116,7 @@ async function logout() {
         @click="applyToken"
       >
         <AppIcon v-if="tokenBusy" name="spinner" class="animate-spin mr-1" :size="14" />
-        {{ tokenBusy ? '处理中…' : '启用或更换' }}
+        {{ tokenBusy ? m.common_processing() : m.settings_admin_apply_btn() }}
       </button>
       <button
         type="button"
@@ -126,7 +125,7 @@ async function logout() {
         @click="clearToken"
       >
         <AppIcon v-if="tokenBusy" name="spinner" class="animate-spin mr-1" :size="14" />
-        {{ tokenBusy ? '关闭中…' : '关闭管理鉴权' }}
+        {{ tokenBusy ? m.common_closing() : m.settings_admin_clear_btn() }}
       </button>
       <button
         type="button"
@@ -134,7 +133,7 @@ async function logout() {
         :disabled="tokenBusy"
         @click="logout"
       >
-        退出登录
+        {{ m.settings_admin_logout_btn() }}
       </button>
     </div>
   </section>

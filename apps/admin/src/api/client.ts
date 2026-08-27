@@ -15,31 +15,33 @@ import type {
   ApiKey,
   BackupFile,
   BackupSettings,
-  IpLimits,
-  SecretConfigured,
-  ChannelStat,
-  EmptyResponseRetryPolicy,
-  GlobalLimits,
-  NotifySettings,
-  TimeBucket,
   BreakerPolicy,
   Channel,
+  ChannelStat,
   ChannelTestResult,
   CreatedApiKey,
+  EmptyResponseRetryPolicy,
   EndpointHealth,
+  GlobalLimits,
+  IpLimits,
   KeyUsageStat,
   LogFilter,
   LogRetentionSetting,
   ModelPrice,
   ModelStat,
   NewApiKey,
+  NotifySettings,
   ProbeResult,
   Protocol,
   RequestLog,
   RoutingPolicy,
+  SecretConfigured,
   StatsSummary,
+  TimeBucket,
   UpstreamAddress,
 } from '@refract/contracts'
+import * as m from '@/paraglide/messages'
+import { encryptPayload } from './crypto'
 import { TaggedError } from 'effect/Data'
 import {
   type Effect,
@@ -52,9 +54,7 @@ import {
   tryPromise,
 } from 'effect/Effect'
 import { spaced } from 'effect/Schedule'
-import { encryptPayload } from './crypto'
 import { readErrorEnvelope } from '@/utils/error'
-
 /** 后端返回的错误信封。 */
 export interface ErrorEnvelope {
   code: string
@@ -137,7 +137,7 @@ interface Envelope<T> {
 function fetchFailure(error: unknown): ApiError | BackendUnavailable | DOMException {
   // 中断不是失败：原样抛回，调用方既有的 AbortError 判断继续生效。
   if (error instanceof DOMException && error.name === 'AbortError') return error
-  const message = error instanceof Error && error.message ? error.message : '网络请求失败'
+  const message = error instanceof Error && error.message ? error.message : m.err_network()
   const api = new ApiError({
     status: 0,
     code: 'network_error',

@@ -21,6 +21,7 @@ import {
   Gauge,
   Globe,
   Info,
+  Languages,
   KeyRound,
   List,
   ListChecks,
@@ -68,6 +69,8 @@ const ICONS = {
   bolt: Zap,
   /** 导出：下载。 */
   download: Download,
+  /** 语言切换。 */
+  languages: Languages,
   /** 网络 / 上游。 */
   globe: Globe,
   /** AI / 推荐预设。 */

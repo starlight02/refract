@@ -6,6 +6,7 @@
  */
 import { computed, ref } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
+import * as m from '@/paraglide/messages'
 import { PROTOCOL_LABEL, PROTOCOL_ORDER } from '@/components/protocol'
 import {
   emptyOverrideRow,
@@ -39,7 +40,7 @@ function valueHint(row: OverrideRow): string | null {
   if (!row.valueText.trim()) return null
   const parsed = parseOverrideValue(row.valueText)
   if (!parsed.ok) return parsed.error
-  if (parsed.value === null) return '删除该字段'
+  if (parsed.value === null) return m.override_delete_value_hint()
   return typeof parsed.value
 }
 </script>
@@ -47,18 +48,15 @@ function valueHint(row: OverrideRow): string | null {
 <template>
   <div class="flex flex-col gap-3">
     <div>
-      <span class="text-xs font-medium text-ink-soft">参数覆盖</span>
+      <span class="text-xs font-medium text-ink-soft">{{ m.override_title() }}</span>
       <p class="mt-1 text-[0.7rem] text-ink-faint">
-        通用字段合并进所有端点的请求体；协议分组只在打到对应协议时展开。值为 JSON，<code
-          class="font-mono"
-          >null</code
-        >
-        表示删除该字段。
+        {{ m.override_desc_p1() }}<code class="font-mono">{ "temperature": 0.7 }</code
+        >{{ m.override_desc_p2() }}
       </p>
     </div>
 
     <section class="flex flex-col gap-2">
-      <span class="text-[0.7rem] font-medium text-ink-soft">通用（所有协议）</span>
+      <span class="text-[0.7rem] font-medium text-ink-soft">{{ m.override_common_section() }}</span>
       <div
         v-for="(row, index) in draft.common"
         :key="`common-${index}`"
@@ -67,7 +65,7 @@ function valueHint(row: OverrideRow): string | null {
         <input
           v-model="row.key"
           type="text"
-          placeholder="字段名"
+          :placeholder="m.override_key_placeholder()"
           spellcheck="false"
           class="glass-field w-36 shrink-0 px-2 py-1.5 font-mono text-xs outline-none"
         />
@@ -85,8 +83,8 @@ function valueHint(row: OverrideRow): string | null {
         </div>
         <button
           type="button"
-          class="rounded px-2 py-1.5 text-xs text-ink-faint hover:bg-danger/12 hover:text-danger"
-          aria-label="删除字段"
+          class="rounded px-2 py-1.5 text-xs text-ink-faint hover:bg-danger/12 hover:text-danger cursor-pointer"
+          :aria-label="m.override_delete_field_aria()"
           @click="removeRow(draft.common, index)"
         >
           <AppIcon name="trash" :size="13" />
@@ -98,12 +96,13 @@ function valueHint(row: OverrideRow): string | null {
         @click="addRow(draft.common)"
       >
         <AppIcon name="plus" :size="12" />
-        添加字段
+        {{ m.override_add_field() }}
       </button>
     </section>
-
     <section class="flex flex-col gap-2">
-      <span class="text-[0.7rem] font-medium text-ink-soft">按协议</span>
+      <span class="text-[0.7rem] font-medium text-ink-soft">{{
+        m.override_protocol_section()
+      }}</span>
       <div class="flex flex-wrap gap-1">
         <button
           v-for="protocol in PROTOCOL_ORDER"
@@ -131,7 +130,7 @@ function valueHint(row: OverrideRow): string | null {
         <input
           v-model="row.key"
           type="text"
-          placeholder="字段名"
+          :placeholder="m.override_key_placeholder()"
           spellcheck="false"
           class="glass-field w-36 shrink-0 px-2 py-1.5 font-mono text-xs outline-none"
         />
@@ -149,8 +148,8 @@ function valueHint(row: OverrideRow): string | null {
         </div>
         <button
           type="button"
-          class="rounded px-2 py-1.5 text-xs text-ink-faint hover:bg-danger/12 hover:text-danger"
-          aria-label="删除字段"
+          class="rounded px-2 py-1.5 text-xs text-ink-faint hover:bg-danger/12 hover:text-danger cursor-pointer"
+          :aria-label="m.override_delete_field_aria()"
           @click="removeRow(draft.protocols[activeProtocol], index)"
         >
           <AppIcon name="trash" :size="13" />
@@ -162,10 +161,9 @@ function valueHint(row: OverrideRow): string | null {
         @click="addRow(draft.protocols[activeProtocol])"
       >
         <AppIcon name="plus" :size="12" />
-        添加 {{ PROTOCOL_LABEL[activeProtocol] }} 字段
+        {{ m.override_add_proto_field({ proto: PROTOCOL_LABEL[activeProtocol] }) }}
       </button>
     </section>
-
     <p v-if="draftError" class="text-xs text-danger" role="alert">{{ draftError }}</p>
   </div>
 </template>

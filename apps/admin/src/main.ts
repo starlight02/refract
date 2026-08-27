@@ -5,7 +5,9 @@ import { createPinia } from 'pinia'
 
 import App from './App.vue'
 import router from './router'
+import { initLocale } from './utils/locale'
 
+initLocale()
 const app = createApp(App)
 
 // Vapor 互操作。vite.config.ts 开了 `features.vapor`，所有 SFC 都编译成

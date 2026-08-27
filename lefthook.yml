@@ -17,11 +17,11 @@ pre-commit:
       run: pnpm exec vp fmt {staged_files}
       stage_fixed: true
 
-    # 3) 后台质量门禁：oxlint + 类型检查（与 CI 的 admin check 一致）。
+    # 3) 后台质量门禁：先编译 i18n，再 oxlint（与 CI 的 admin check 一致）。
     - name: admin check
       root: "apps/admin/"
       glob: "*.{ts,tsx,vue,css,json,html}"
-      run: pnpm exec vp check
+      run: pnpm paraglide && pnpm exec vp check
 
     # 4) 首页格式化与质量门禁。首页是独立 React 产品，不能让后台 hook
     # 代替它的 lint/type-check。

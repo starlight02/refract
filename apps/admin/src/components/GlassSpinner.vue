@@ -1,12 +1,5 @@
 <script setup lang="ts">
-/**
- * 液态玻璃动态加载指示器 (GlassSpinner)
- *
- * 采用 Apple 极简晶钻高光圆环与平滑微动效：
- * - 双层微透明光环轨迹，消除纯静态文字等待焦虑
- * - 响应式多尺寸支持 (sm=16px / md=24px / lg=32px / xl=40px)
- * - 流畅优雅的微呼吸光晕
- */
+import * as m from '@/paraglide/messages'
 withDefaults(
   defineProps<{
     size?: 'sm' | 'md' | 'lg' | 'xl'
@@ -40,7 +33,7 @@ const TONE_MAP = {
       class="animate-spin rounded-full transition-transform duration-300 ease-out"
       :class="[SIZE_MAP[size], TONE_MAP[tone]]"
       role="status"
-      aria-label="加载中"
+      :aria-label="m.common_loading()"
     />
     <span v-if="label" class="text-xs font-medium tracking-wide text-ink-faint select-none">
       {{ label }}

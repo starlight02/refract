@@ -4,6 +4,7 @@
  */
 import ExtraHeadersEditor from '@/components/ExtraHeadersEditor.vue'
 import ParamOverrideEditor from '@/components/ParamOverrideEditor.vue'
+import * as m from '@/paraglide/messages'
 import type { HeaderRow } from '@/utils/extra-headers'
 import type { OverrideDraft } from '@/utils/param-override'
 import type { Channel } from '@refract/contracts'
@@ -30,12 +31,14 @@ function normalizeEmptyRetryOverride(key: 'window_secs' | 'max_retries') {
       @click="showAdvanced = !showAdvanced"
     >
       <span>
-        <span class="text-sm font-semibold text-ink-soft uppercase">高级</span>
+        <span class="text-sm font-semibold text-ink-soft uppercase">{{ m.ch_adv_title() }}</span>
         <span class="ml-2 text-xs text-ink-faint">
-          参数覆盖、自定义请求头、空回复重试、代理、测试模型、备注
+          {{ m.ch_adv_desc() }}
         </span>
       </span>
-      <span class="text-xs text-ink-faint">{{ showAdvanced ? '收起' : '展开' }}</span>
+      <span class="text-xs text-ink-faint">{{
+        showAdvanced ? m.common_collapse() : m.common_expand()
+      }}</span>
     </button>
 
     <div v-if="showAdvanced" class="mt-4 flex flex-col gap-4">
@@ -44,33 +47,33 @@ function normalizeEmptyRetryOverride(key: 'window_secs' | 'max_retries') {
       <ExtraHeadersEditor v-model="headerRows" />
 
       <div>
-        <span class="text-xs font-medium text-ink-soft">上游 200 空回复重试</span>
+        <span class="text-xs font-medium text-ink-soft">{{ m.ch_adv_empty_retry_title() }}</span>
         <p class="mt-1 text-[0.7rem] text-ink-faint">
-          留空继承全局设置；填写 0 可为本渠道关闭对应限制。耗时按“完成时刻 − 首字节时刻”计算。
+          {{ m.ch_adv_empty_retry_desc() }}
         </p>
         <div class="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <label class="flex flex-col gap-1.5">
-            <span class="text-xs text-ink-soft">判定窗口（秒）</span>
+            <span class="text-xs text-ink-soft">{{ m.ch_adv_empty_retry_window() }}</span>
             <input
               v-model.number="form.empty_response_retry.window_secs"
               type="number"
               min="0"
               max="3600"
               step="1"
-              placeholder="留空继承全局"
+              :placeholder="m.ch_adv_empty_retry_inherit()"
               class="glass-field tabular px-3 py-2 text-sm outline-none"
               @change="normalizeEmptyRetryOverride('window_secs')"
             />
           </label>
           <label class="flex flex-col gap-1.5">
-            <span class="text-xs text-ink-soft">最大重试次数</span>
+            <span class="text-xs text-ink-soft">{{ m.ch_adv_empty_retry_max() }}</span>
             <input
               v-model.number="form.empty_response_retry.max_retries"
               type="number"
               min="0"
               max="100"
               step="1"
-              placeholder="留空继承全局"
+              :placeholder="m.ch_adv_empty_retry_inherit()"
               class="glass-field tabular px-3 py-2 text-sm outline-none"
               @change="normalizeEmptyRetryOverride('max_retries')"
             />
@@ -81,7 +84,8 @@ function normalizeEmptyRetryOverride(key: 'window_secs' | 'max_retries') {
       <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <label class="flex flex-col gap-1.5">
           <span class="text-xs font-medium text-ink-soft">
-            出站代理<span class="font-normal text-ink-faint">，http/socks5</span>
+            {{ m.ch_adv_proxy()
+            }}<span class="font-normal text-ink-faint">{{ m.ch_adv_proxy_hint() }}</span>
           </span>
           <input
             v-model="form.proxy"
@@ -93,12 +97,13 @@ function normalizeEmptyRetryOverride(key: 'window_secs' | 'max_retries') {
 
         <label class="flex flex-col gap-1.5">
           <span class="text-xs font-medium text-ink-soft">
-            测试模型<span class="font-normal text-ink-faint">，连通性测试与定时重测用</span>
+            {{ m.ch_adv_test_model()
+            }}<span class="font-normal text-ink-faint">{{ m.ch_adv_test_model_hint() }}</span>
           </span>
           <input
             v-model="form.test_model"
             type="text"
-            placeholder="留空用端点第一个模型"
+            :placeholder="m.ch_adv_test_model_placeholder()"
             class="glass-field px-3 py-2 font-mono text-sm outline-none"
           />
         </label>
@@ -106,12 +111,13 @@ function normalizeEmptyRetryOverride(key: 'window_secs' | 'max_retries') {
 
       <label class="flex flex-col gap-1.5">
         <span class="text-xs font-medium text-ink-soft">
-          备注<span class="font-normal text-ink-faint">，仅自己可见</span>
+          {{ m.ch_adv_note()
+          }}<span class="font-normal text-ink-faint">{{ m.ch_adv_note_hint() }}</span>
         </span>
         <input
           v-model="form.note"
           type="text"
-          placeholder="主力站，月底记得续费"
+          :placeholder="m.ch_adv_note_placeholder()"
           class="glass-field px-3 py-2 text-sm outline-none"
         />
       </label>

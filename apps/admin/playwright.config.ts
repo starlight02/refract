@@ -22,6 +22,7 @@ export default defineConfig({
     actionTimeout: 10_000,
     baseURL: 'http://127.0.0.1:4539',
     trace: 'on-first-retry',
+    locale: 'zh-CN',
     // 默认无头：E2E 大多在自动化里跑；想亲眼看浏览器时 HEADED=1。
     headless: process.env.HEADED ? false : true,
   },

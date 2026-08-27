@@ -21,6 +21,8 @@ import {
 import { useKeysStore } from '@/stores/keys'
 import { logs as logsApi } from '@/api/client'
 import { useAction } from '@/composables/useAction'
+import * as m from '@/paraglide/messages'
+import { getLocale } from '@/paraglide/runtime'
 import { orElse } from '@/utils/effect'
 import { numOr } from '@/utils/num'
 import type { ApiKey, KeyUsageStat, NewApiKey } from '@refract/contracts'
@@ -37,7 +39,7 @@ async function refreshUsage() {
 
 /** 弹窗状态机：关闭 → 填表 → 展示明文。 */
 const dialog = ref<'closed' | 'form' | 'created'>('closed')
-const saveKey = reactive(useAction('保存失败'))
+const saveKey = reactive(useAction(m.keys_save_failed()))
 const plaintext = ref('')
 const copied = ref(false)
 const pendingDelete = ref<number | null>(null)
@@ -190,7 +192,9 @@ const hasKeys = computed(() => store.items.length > 0)
 function fmtTime(iso?: string | null): string {
   if (!iso) return '—'
   const d = new Date(iso)
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { hour12: false })
+  return Number.isNaN(d.getTime())
+    ? iso
+    : d.toLocaleString(getLocale() === 'zh-Hans' ? 'zh-CN' : 'en-US', { hour12: false })
 }
 
 function isExpired(key: ApiKey): boolean {
@@ -204,9 +208,9 @@ function isExpired(key: ApiKey): boolean {
   <div class="flex flex-col gap-5">
     <header class="flex flex-wrap items-end justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold">API 密钥</h1>
+        <h1 class="text-2xl font-semibold">{{ m.keys_title() }}</h1>
         <p class="mt-1 text-sm text-ink-faint">
-          客户端用这些密钥访问网关。留空模型/标签白名单表示不限制。
+          {{ m.keys_subtitle() }}
         </p>
       </div>
       <button
@@ -215,7 +219,7 @@ function isExpired(key: ApiKey): boolean {
         @click="openForm"
       >
         <AppIcon name="plus" :size="15" />
-        新建密钥
+        {{ m.keys_new_key() }}
       </button>
     </header>
 
@@ -224,20 +228,20 @@ function isExpired(key: ApiKey): boolean {
     </p>
 
     <div v-if="store.loading && !hasKeys" class="py-24 text-center">
-      <GlassSpinner size="lg" label="正在读取 API 密钥列表…" />
+      <GlassSpinner size="lg" :label="m.keys_loading()" />
     </div>
 
     <section v-else-if="!hasKeys" class="glass glass-specular py-16 text-center">
       <div class="shape-app-icon mx-auto grid size-14 place-items-center bg-ink/6 text-ink-faint">
         <AppIcon name="key" :size="26" />
       </div>
-      <p class="mt-4 text-sm text-ink-faint">还没有密钥</p>
+      <p class="mt-4 text-sm text-ink-faint">{{ m.keys_empty_title() }}</p>
       <button
         type="button"
         class="glass-button-primary mt-4 px-4 py-2 text-sm font-medium"
         @click="openForm"
       >
-        创建第一个
+        {{ m.keys_create_first() }}
       </button>
     </section>
 
@@ -259,27 +263,33 @@ function isExpired(key: ApiKey): boolean {
                 v-if="isExpired(key)"
                 class="rounded-pill bg-danger/12 px-2 py-0.5 text-xs text-danger"
               >
-                已过期
+                {{ m.keys_status_expired() }}
               </span>
               <span
                 v-else-if="!key.enabled"
                 class="rounded-pill bg-ink/10 px-2 py-0.5 text-xs text-ink-faint"
               >
-                已停用
+                {{ m.keys_status_disabled() }}
               </span>
             </div>
 
             <div class="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-ink-faint">
-              <span>创建 {{ fmtTime(key.created_at) }}</span>
-              <span>最后使用 {{ fmtTime(key.last_used_at) }}</span>
-              <span v-if="key.expires_at">过期 {{ fmtTime(key.expires_at) }}</span>
+              <span>{{ m.keys_created_at({ time: fmtTime(key.created_at) }) }}</span>
+              <span>{{ m.keys_last_used({ time: fmtTime(key.last_used_at) }) }}</span>
+              <span v-if="key.expires_at">{{
+                m.keys_expires_at({ time: fmtTime(key.expires_at) })
+              }}</span>
               <span v-if="key.rpm_limit > 0" class="tabular">{{ key.rpm_limit }} RPM</span>
               <span v-if="key.tpm_limit > 0" class="tabular">
                 {{ key.tpm_limit.toLocaleString() }} TPM
               </span>
               <span v-if="key.budget > 0" class="tabular">
-                预算 ${{ key.used_budget.toFixed(2)
-                }}<span class="text-ink-faint">/{{ key.budget.toFixed(2) }}</span>
+                {{
+                  m.keys_budget_stat({
+                    used: key.used_budget.toFixed(2),
+                    total: key.budget.toFixed(2),
+                  })
+                }}
               </span>
             </div>
 
@@ -290,14 +300,12 @@ function isExpired(key: ApiKey): boolean {
               class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs"
             >
               <span class="text-ink-soft">
-                24h
-                <span class="tabular font-medium">{{
-                  usageByKey.get(key.id)!.requests.toLocaleString()
-                }}</span>
-                次
+                {{ m.keys_24h_reqs({ count: usageByKey.get(key.id)!.requests.toLocaleString() }) }}
               </span>
               <span v-if="usageByKey.get(key.id)!.failures > 0" class="tabular text-danger">
-                失败 {{ usageByKey.get(key.id)!.failures.toLocaleString() }}
+                {{
+                  m.keys_24h_failures({ count: usageByKey.get(key.id)!.failures.toLocaleString() })
+                }}
               </span>
               <span class="tabular text-ink-faint">
                 ↑{{ usageByKey.get(key.id)!.input_tokens.toLocaleString() }} ↓{{
@@ -337,7 +345,7 @@ function isExpired(key: ApiKey): boolean {
                互不相干 —— 改成紧凑的一组。 -->
           <div v-if="key.quota > 0" class="w-full shrink-0 sm:w-40">
             <div class="flex items-baseline justify-between text-xs">
-              <span class="text-ink-faint">配额</span>
+              <span class="text-ink-faint">{{ m.keys_quota_label() }}</span>
               <span class="tabular">
                 {{ key.used_quota.toLocaleString() }}
                 <span class="text-ink-faint">/ {{ key.quota.toLocaleString() }}</span>
@@ -358,7 +366,7 @@ function isExpired(key: ApiKey): boolean {
             </div>
           </div>
           <div v-else class="flex shrink-0 items-baseline gap-1.5 text-xs">
-            <span class="text-ink-faint">配额</span>
+            <span class="text-ink-faint">{{ m.keys_quota_label() }}</span>
             <span class="tabular">
               {{ key.used_quota.toLocaleString() }}
               <span class="text-ink-faint">/ ∞</span>
@@ -368,7 +376,11 @@ function isExpired(key: ApiKey): boolean {
           <div class="flex shrink-0 flex-wrap items-center gap-2">
             <GlassSwitch
               :model-value="key.enabled"
-              :label="key.enabled ? `禁用 ${key.name}` : `启用 ${key.name}`"
+              :label="
+                key.enabled
+                  ? m.keys_disable_key_label({ name: key.name })
+                  : m.keys_enable_key_label({ name: key.name })
+              "
               tone="success"
               @update:model-value="store.toggleEnabled(key.id, $event)"
             />
@@ -379,7 +391,7 @@ function isExpired(key: ApiKey): boolean {
               @click="openEdit(key)"
             >
               <AppIcon name="pencil" :size="13" />
-              编辑
+              {{ m.common_edit() }}
             </button>
 
             <button
@@ -387,7 +399,7 @@ function isExpired(key: ApiKey): boolean {
               type="button"
               class="glass-button-ghost px-2.5 py-1.5 text-xs"
               :disabled="resettingId === key.id"
-              title="已用配额清零"
+              :title="m.keys_reset_usage_title()"
               @click="resetUsage(key.id)"
             >
               <AppIcon
@@ -395,7 +407,7 @@ function isExpired(key: ApiKey): boolean {
                 :class="resettingId === key.id ? 'animate-spin' : ''"
                 :size="13"
               />
-              {{ resettingId === key.id ? '重置中…' : '重置用量' }}
+              {{ resettingId === key.id ? m.common_resetting() : m.keys_reset_usage() }}
             </button>
 
             <template v-if="pendingDelete === key.id">
@@ -411,7 +423,7 @@ function isExpired(key: ApiKey): boolean {
                   class="animate-spin"
                   :size="12"
                 />
-                {{ deletingId === key.id ? '删除中…' : '确认删除' }}
+                {{ deletingId === key.id ? m.common_deleting() : m.keys_confirm_delete() }}
               </button>
               <button
                 type="button"
@@ -419,7 +431,7 @@ function isExpired(key: ApiKey): boolean {
                 :disabled="deletingId === key.id"
                 @click="pendingDelete = null"
               >
-                取消
+                {{ m.common_cancel() }}
               </button>
             </template>
             <button
@@ -429,7 +441,7 @@ function isExpired(key: ApiKey): boolean {
               @click="pendingDelete = key.id"
             >
               <AppIcon name="trash" :size="13" />
-              删除
+              {{ m.common_delete() }}
             </button>
           </div>
         </div>
@@ -450,30 +462,27 @@ function isExpired(key: ApiKey): boolean {
           <!-- 填表 -->
           <template v-if="dialog === 'form'">
             <DialogTitle class="text-lg font-semibold">
-              {{ editingId !== null ? '编辑 API 密钥' : '新建 API 密钥' }}
+              {{ editingId !== null ? m.keys_modal_title_edit() : m.keys_modal_title_new() }}
             </DialogTitle>
             <DialogDescription class="mt-1 text-xs text-ink-faint">
-              {{
-                editingId !== null
-                  ? '只改治理属性，密钥本体不变，客户端无需换钥匙。'
-                  : '明文只会出现一次，创建后请立刻保存。'
-              }}
+              {{ editingId !== null ? m.keys_modal_desc_edit() : m.keys_modal_desc_new() }}
             </DialogDescription>
 
             <form class="mt-5 flex flex-col gap-4" @submit.prevent="submit">
               <label class="flex flex-col gap-1.5">
-                <span class="text-xs font-medium text-ink-soft">名称</span>
+                <span class="text-xs font-medium text-ink-soft">{{ m.keys_field_name() }}</span>
                 <input
                   v-model="draft.name"
                   type="text"
-                  placeholder="例如：本地开发"
+                  :placeholder="m.keys_field_name_placeholder()"
                   class="glass-field px-3 py-2 text-sm outline-none"
                 />
               </label>
 
               <label class="flex flex-col gap-1.5">
                 <span class="text-xs font-medium text-ink-soft">
-                  允许的模型<span class="font-normal text-ink-faint">，逗号分隔，留空不限</span>
+                  {{ m.keys_field_models()
+                  }}<span class="font-normal text-ink-faint">{{ m.keys_field_models_hint() }}</span>
                 </span>
                 <input
                   v-model="draft.models"
@@ -485,12 +494,13 @@ function isExpired(key: ApiKey): boolean {
 
               <label class="flex flex-col gap-1.5">
                 <span class="text-xs font-medium text-ink-soft">
-                  允许的渠道标签<span class="font-normal text-ink-faint">，逗号分隔，留空不限</span>
+                  {{ m.keys_field_tags()
+                  }}<span class="font-normal text-ink-faint">{{ m.keys_field_tags_hint() }}</span>
                 </span>
                 <input
                   v-model="draft.tags"
                   type="text"
-                  placeholder="生产"
+                  :placeholder="m.keys_field_tags_placeholder()"
                   class="glass-field px-3 py-2 text-sm outline-none"
                 />
               </label>
@@ -498,7 +508,10 @@ function isExpired(key: ApiKey): boolean {
               <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <label class="flex flex-col gap-1.5">
                   <span class="text-xs font-medium text-ink-soft">
-                    配额<span class="font-normal text-ink-faint">，0 不限</span>
+                    {{ m.keys_field_quota()
+                    }}<span class="font-normal text-ink-faint">{{
+                      m.keys_field_quota_hint()
+                    }}</span>
                   </span>
                   <input
                     v-model.number="draft.quota"
@@ -510,7 +523,10 @@ function isExpired(key: ApiKey): boolean {
 
                 <label class="flex flex-col gap-1.5">
                   <span class="text-xs font-medium text-ink-soft">
-                    过期<span class="font-normal text-ink-faint">，留空永久</span>
+                    {{ m.keys_field_expires()
+                    }}<span class="font-normal text-ink-faint">{{
+                      m.keys_field_expires_hint()
+                    }}</span>
                   </span>
                   <input
                     v-model="draft.expiresAt"
@@ -521,7 +537,10 @@ function isExpired(key: ApiKey): boolean {
 
                 <label class="flex flex-col gap-1.5">
                   <span class="text-xs font-medium text-ink-soft">
-                    预算 $<span class="font-normal text-ink-faint">，按价表累计，0 不限</span>
+                    {{ m.keys_field_budget()
+                    }}<span class="font-normal text-ink-faint">{{
+                      m.keys_field_budget_hint()
+                    }}</span>
                   </span>
                   <input
                     v-model.number="draft.budget"
@@ -534,7 +553,8 @@ function isExpired(key: ApiKey): boolean {
 
                 <label class="flex flex-col gap-1.5">
                   <span class="text-xs font-medium text-ink-soft">
-                    RPM<span class="font-normal text-ink-faint">，每分钟请求数，0 不限</span>
+                    {{ m.keys_field_rpm()
+                    }}<span class="font-normal text-ink-faint">{{ m.keys_field_rpm_hint() }}</span>
                   </span>
                   <input
                     v-model.number="draft.rpm"
@@ -546,7 +566,8 @@ function isExpired(key: ApiKey): boolean {
 
                 <label class="flex flex-col gap-1.5">
                   <span class="text-xs font-medium text-ink-soft">
-                    TPM<span class="font-normal text-ink-faint">，每分钟 token 数，0 不限</span>
+                    {{ m.keys_field_tpm()
+                    }}<span class="font-normal text-ink-faint">{{ m.keys_field_tpm_hint() }}</span>
                   </span>
                   <input
                     v-model.number="draft.tpm"
@@ -559,12 +580,13 @@ function isExpired(key: ApiKey): boolean {
 
               <label class="flex flex-col gap-1.5">
                 <span class="text-xs font-medium text-ink-soft">
-                  备注<span class="font-normal text-ink-faint">，仅自己可见</span>
+                  {{ m.keys_field_note()
+                  }}<span class="font-normal text-ink-faint">{{ m.keys_field_note_hint() }}</span>
                 </span>
                 <input
                   v-model="draft.note"
                   type="text"
-                  placeholder="给 Cursor 用的"
+                  :placeholder="m.keys_field_note_placeholder()"
                   class="glass-field px-3 py-2 text-sm outline-none"
                 />
               </label>
@@ -583,14 +605,20 @@ function isExpired(key: ApiKey): boolean {
                     class="animate-spin mr-1"
                     :size="14"
                   />
-                  {{ saveKey.busy ? '保存中…' : editingId !== null ? '保存' : '创建' }}
+                  {{
+                    saveKey.busy
+                      ? m.common_saving()
+                      : editingId !== null
+                        ? m.common_save()
+                        : m.common_create()
+                  }}
                 </button>
                 <button
                   type="button"
                   class="glass-button-ghost px-3 py-2.5 text-sm"
                   @click="closeDialog"
                 >
-                  取消
+                  {{ m.common_cancel() }}
                 </button>
               </div>
             </form>
@@ -598,9 +626,11 @@ function isExpired(key: ApiKey): boolean {
 
           <!-- 展示明文 -->
           <template v-else-if="dialog === 'created'">
-            <DialogTitle class="text-lg font-semibold">密钥已创建</DialogTitle>
+            <DialogTitle class="text-lg font-semibold">{{
+              m.keys_created_modal_title()
+            }}</DialogTitle>
             <DialogDescription class="mt-1 text-xs text-warning">
-              这是唯一一次显示完整密钥。关闭后无法再取回。
+              {{ m.keys_created_modal_warning() }}
             </DialogDescription>
 
             <div class="mt-4 rounded-lg bg-ink/8 p-3">
@@ -613,14 +643,14 @@ function isExpired(key: ApiKey): boolean {
                 class="glass-button-primary px-4 py-2.5 text-sm font-medium"
                 @click="copyPlaintext"
               >
-                {{ copied ? '已复制' : '复制' }}
+                {{ copied ? m.keys_copied() : m.keys_copy() }}
               </button>
               <button
                 type="button"
                 class="glass-button-ghost px-3 py-2.5 text-sm"
                 @click="closeDialog"
               >
-                我已保存，关闭
+                {{ m.keys_saved_and_close() }}
               </button>
             </div>
           </template>

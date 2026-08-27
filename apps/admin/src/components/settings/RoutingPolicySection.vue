@@ -4,6 +4,7 @@
  */
 import GlassSwitch from '@/components/GlassSwitch.vue'
 import SettingsSectionError from '@/components/settings/SettingsSectionError.vue'
+import * as m from '@/paraglide/messages'
 import type { EmptyResponseRetryPolicy, RoutingPolicy, SelectionMode } from '@refract/contracts'
 
 const policy = defineModel<RoutingPolicy>({ required: true })
@@ -21,36 +22,38 @@ const emit = defineEmits<{
   retryEmptyRetry: []
 }>()
 
-const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[] = [
+const SELECTION_OPTIONS: { value: SelectionMode; label: () => string; desc: () => string }[] = [
   {
     value: 'weighted_random',
-    label: '加权随机（推荐）',
-    desc: '同优先级内按权重随机选取。适合多渠道流量分配。',
+    label: m.settings_sel_weighted,
+    desc: m.settings_sel_weighted_desc,
   },
-  { value: 'round_robin', label: '轮询', desc: '同优先级内按顺序轮转。适合等量消耗多家余额。' },
-  { value: 'first', label: '固定首选', desc: '总是命中同优先级内第一个可用渠道。简单但单点。' },
+  { value: 'round_robin', label: m.settings_sel_rr, desc: m.settings_sel_rr_desc },
+  { value: 'first', label: m.settings_sel_first, desc: m.settings_sel_first_desc },
 ]
 </script>
 
 <template>
   <section class="glass glass-specular flex flex-col gap-5 p-5">
     <SettingsSectionError :message="loadError" @retry="emit('retry')" />
-    <h2 class="text-sm font-semibold text-ink-soft uppercase">路由策略</h2>
+    <h2 class="text-sm font-semibold text-ink-soft uppercase">{{ m.settings_routing_title() }}</h2>
 
     <!-- 原生优先（需求 6） -->
     <label class="flex cursor-pointer items-center gap-3">
-      <GlassSwitch v-model="policy.native_first" label="原生优先" />
+      <GlassSwitch v-model="policy.native_first" :label="m.settings_native_first()" />
       <div>
-        <span class="text-sm font-medium">原生优先</span>
+        <span class="text-sm font-medium">{{ m.settings_native_first() }}</span>
         <p class="mt-0.5 text-xs text-ink-faint">
-          关闭时路由逻辑与 new-api 一致。打开时命中同一模型的原生协议端点始终排在转换端点之前。
+          {{ m.settings_native_first_desc() }}
         </p>
       </div>
     </label>
 
     <!-- 选择模式 -->
     <div>
-      <span class="mb-2 block text-sm font-medium text-ink-soft">选择模式</span>
+      <span class="mb-2 block text-sm font-medium text-ink-soft">{{
+        m.settings_selection_mode()
+      }}</span>
       <div class="flex flex-col gap-2">
         <label
           v-for="o in SELECTION_OPTIONS"
@@ -68,8 +71,8 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
             class="mt-0.5 accent-[var(--color-accent)]"
           />
           <div>
-            <p class="text-sm font-medium">{{ o.label }}</p>
-            <p class="mt-0.5 text-xs text-ink-faint">{{ o.desc }}</p>
+            <p class="text-sm font-medium">{{ o.label() }}</p>
+            <p class="mt-0.5 text-xs text-ink-faint">{{ o.desc() }}</p>
           </div>
         </label>
       </div>
@@ -78,8 +81,8 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
     <!-- 最大重试 -->
     <label class="flex flex-col gap-1.5">
       <span class="text-sm font-medium text-ink-soft">
-        最大重试次数
-        <span class="ml-2 font-normal text-ink-faint"> 0 = 不限。建议 2–3。过大会拉长超时。 </span>
+        {{ m.settings_max_attempts() }}
+        <span class="ml-2 font-normal text-ink-faint">{{ m.settings_max_attempts_hint() }}</span>
       </span>
       <input
         v-model.number="policy.max_attempts"
@@ -93,9 +96,9 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
     <!-- 单请求上游调用上限 -->
     <label class="flex flex-col gap-1.5">
       <span class="text-sm font-medium text-ink-soft">
-        单请求上游调用上限
+        {{ m.settings_max_upstream_calls() }}
         <span class="ml-2 font-normal text-ink-faint">
-          含重试在内的上游调用总次数，0 = 不限，默认 8。
+          {{ m.settings_max_upstream_calls_hint() }}
         </span>
       </span>
       <input
@@ -105,12 +108,12 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
         max="255"
         step="1"
         inputmode="numeric"
-        aria-label="单请求上游调用次数上限"
+        :aria-label="m.settings_max_upstream_calls_aria()"
         class="glass-field tabular w-32 px-3 py-2 text-sm outline-none"
       />
     </label>
     <p v-if="!valid" class="text-xs text-danger" role="alert">
-      最大重试 0–32（0 = 不限）；上游调用上限 0–255。
+      {{ m.settings_routing_val_err() }}
     </p>
 
     <!-- 重试同一渠道 -->
@@ -121,24 +124,23 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
         class="accent-[var(--color-accent)]"
       />
       <span class="text-sm">
-        重试时允许再次命中同一渠道
-        <span class="text-xs text-ink-faint"
-          >—— 建议关闭，否则 500 可能只是上游临时故障，原渠道未必恢复</span
-        >
+        {{ m.settings_retry_same_channel() }}
+        <span class="text-xs text-ink-faint">{{ m.settings_retry_same_channel_hint() }}</span>
       </span>
     </label>
 
     <!-- HTTP 200 空回复重试 -->
     <div class="border-t border-ink/8 pt-4">
       <SettingsSectionError :message="emptyRetryError" @retry="emit('retryEmptyRetry')" />
-      <span class="text-sm font-medium text-ink-soft">上游 200 空回复重试</span>
+      <span class="text-sm font-medium text-ink-soft">{{ m.settings_empty_retry_title() }}</span>
       <p class="mt-1 text-xs text-ink-faint">
-        上游返回 HTTP 200 但没有文本、推理、拒答或工具调用，且“完成时刻 −
-        首字节时刻”不超过判定窗口时，在同一渠道重试。任一值为 0 即关闭。
+        {{ m.settings_empty_retry_desc() }}
       </p>
       <div class="mt-3 grid max-w-md grid-cols-1 gap-4 sm:grid-cols-2">
         <label class="flex flex-col gap-1.5">
-          <span class="text-xs font-medium text-ink-soft">判定窗口（秒）</span>
+          <span class="text-xs font-medium text-ink-soft">{{
+            m.settings_empty_retry_window()
+          }}</span>
           <input
             v-model.number="emptyResponseRetry.window_secs"
             type="number"
@@ -150,7 +152,7 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
           />
         </label>
         <label class="flex flex-col gap-1.5">
-          <span class="text-xs font-medium text-ink-soft">最大重试次数</span>
+          <span class="text-xs font-medium text-ink-soft">{{ m.settings_empty_retry_max() }}</span>
           <input
             v-model.number="emptyResponseRetry.max_retries"
             type="number"
@@ -163,19 +165,18 @@ const SELECTION_OPTIONS: { value: SelectionMode; label: string; desc: string }[]
         </label>
       </div>
       <p v-if="!emptyRetryValid" class="mt-2 text-xs text-danger" role="alert">
-        判定窗口需为 0–3600 秒，最大重试需为 0–100 次。
+        {{ m.settings_empty_retry_val_err() }}
       </p>
 
       <label class="mt-4 flex cursor-pointer items-center gap-3 border-t border-ink/8 pt-4">
         <GlassSwitch
           v-model="emptyResponseRetry.reject_nonstandard_200"
-          label="非标准 200 转为 500"
+          :label="m.settings_reject_nonstandard_200()"
         />
         <div>
-          <span class="text-sm font-medium">非标准 200 转为 500</span>
+          <span class="text-sm font-medium">{{ m.settings_reject_nonstandard_200() }}</span>
           <p class="mt-0.5 text-xs text-ink-faint">
-            开启后，纯文本、HTML 或无法识别的 JSON/SSE 等不符合渠道协议的 HTTP 200
-            响应会转换为不可重试的 500，并返回明确错误提示。
+            {{ m.settings_reject_nonstandard_200_desc() }}
           </p>
         </div>
       </label>

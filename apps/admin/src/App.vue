@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, toRef } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, toRef } from 'vue'
 import { RouterLink, RouterView } from 'vue-router'
 import {
   DialogContent,
@@ -9,14 +9,16 @@ import {
   DialogRoot,
   DialogTitle,
 } from 'reka-ui'
-import { AUTH_REQUIRED_EVENT, BACKEND_DOWN_EVENT, BACKEND_RESTORED_EVENT, auth } from '@/api/client'
-import { CRYPTO_PLAINTEXT_EVENT } from '@/api/crypto'
-import { authGate } from '@/router'
 import AppIcon from '@/components/AppIcon.vue'
 import GlassToastContainer from '@/components/GlassToastContainer.vue'
 import { useAction } from '@/composables/useAction'
+import * as m from '@/paraglide/messages'
+import { getLocale, setLocale } from '@/paraglide/runtime'
+import { authGate } from '@/router'
 import { orElse } from '@/utils/effect'
 import { initLiquidGlass } from '@/utils/liquidGlass'
+import { AUTH_REQUIRED_EVENT, BACKEND_DOWN_EVENT, BACKEND_RESTORED_EVENT, auth } from '@/api/client'
+import { CRYPTO_PLAINTEXT_EVENT } from '@/api/crypto'
 
 /** 深色模式偏好的存储键。 */
 const THEME_KEY = 'refract.theme'
@@ -26,6 +28,11 @@ const THEME_KEY = 'refract.theme'
  * media query），这里只做镜像，避免出现「ref 说亮、DOM 是暗」的错位。
  */
 const isDark = ref(false)
+const currentLocale = computed(() => getLocale())
+
+function toggleLanguage() {
+  setLocale(getLocale() === 'zh-Hans' ? 'en' : 'zh-Hans')
+}
 
 function applyTheme(dark: boolean) {
   isDark.value = dark
@@ -60,9 +67,9 @@ onMounted(async () => {
 const tokenDialogOpen = ref(false)
 const tokenDraft = ref('')
 const showToken = ref(false)
-const login = useAction('登录失败，请检查管理令牌')
-const tokenBusy = toRef(login, 'busy')
+const login = useAction(m.auth_login_failed())
 const tokenError = toRef(login, 'error')
+const tokenBusy = toRef(login, 'busy')
 
 function onAuthRequired() {
   if (!tokenDialogOpen.value) {
@@ -135,22 +142,22 @@ onMounted(() => window.addEventListener(CRYPTO_PLAINTEXT_EVENT, onCryptoPlaintex
 onBeforeUnmount(() => window.removeEventListener(CRYPTO_PLAINTEXT_EVENT, onCryptoPlaintext))
 
 /** 桌面侧栏主导航。 */
-const navItems = [
-  { name: 'dashboard', label: '仪表盘', icon: 'gauge' },
-  { name: 'channels', label: '渠道', icon: 'channels' },
-  { name: 'models', label: '模型', icon: 'boxes' },
-  { name: 'playground', label: '调试台', icon: 'chat' },
-  { name: 'logs', label: '请求日志', icon: 'logs' },
-  { name: 'keys', label: 'API 密钥', icon: 'key' },
-] as const
+const navItems = computed(() => [
+  { name: 'dashboard', label: m.nav_dashboard(), icon: 'gauge' as const },
+  { name: 'channels', label: m.nav_channels(), icon: 'channels' as const },
+  { name: 'models', label: m.nav_models(), icon: 'boxes' as const },
+  { name: 'playground', label: m.nav_playground(), icon: 'chat' as const },
+  { name: 'logs', label: m.nav_logs(), icon: 'logs' as const },
+  { name: 'keys', label: m.nav_keys(), icon: 'key' as const },
+])
 /** 移动端底栏只放五个高频入口 —— 模型与调试台是桌面场景。 */
-const mobileNavItems = [
-  { name: 'dashboard', label: '仪表盘', icon: 'gauge' },
-  { name: 'channels', label: '渠道', icon: 'channels' },
-  { name: 'logs', label: '请求日志', icon: 'logs' },
-  { name: 'keys', label: 'API 密钥', icon: 'key' },
-  { name: 'settings', label: '设置', icon: 'settings' },
-] as const
+const mobileNavItems = computed(() => [
+  { name: 'dashboard', label: m.nav_dashboard(), icon: 'gauge' as const },
+  { name: 'channels', label: m.nav_channels(), icon: 'channels' as const },
+  { name: 'logs', label: m.nav_logs(), icon: 'logs' as const },
+  { name: 'keys', label: m.nav_keys(), icon: 'key' as const },
+  { name: 'settings', label: m.nav_settings(), icon: 'settings' as const },
+])
 // 版本号由 vite.config.ts 在构建期从 apps/admin/package.json 注入，与后端版本同步演进。
 const version = __APP_VERSION__
 </script>
@@ -175,7 +182,7 @@ const version = __APP_VERSION__
         role="status"
       >
         <AppIcon name="spinner" class="animate-spin text-warning shrink-0" :size="15" />
-        <span>无法连接后端，正在重试…</span>
+        <span>{{ m.app_backend_reconnecting() }}</span>
       </div>
     </Transition>
     <Transition
@@ -189,14 +196,14 @@ const version = __APP_VERSION__
         class="glass fixed top-20 left-1/2 z-40 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-2.5 border-warning/30 bg-warning/12 px-4 py-2.5 text-sm font-medium text-ink shadow-[0_12px_32px_-14px_oklch(0%_0_0/0.28)] md:top-3"
         role="status"
       >
-        <span>传输加密不可用，敏感请求将以明文发送。请改用 HTTPS 或支持 Web Crypto 的浏览器。</span>
+        <span>{{ m.app_crypto_plaintext_warning() }}</span>
         <button
           type="button"
-          class="shrink-0 text-ink-soft hover:text-ink"
-          aria-label="关闭明文传输提示"
+          class="shrink-0 text-ink-soft hover:text-ink cursor-pointer"
+          :aria-label="m.app_close_warning()"
           @click="cryptoPlaintext = false"
         >
-          关闭
+          {{ m.common_close() }}
         </button>
       </div>
     </Transition>
@@ -213,15 +220,27 @@ const version = __APP_VERSION__
         />
         <span class="text-sm font-semibold text-ink">Refract</span>
       </RouterLink>
-      <button
-        type="button"
-        class="grid size-10 place-items-center rounded-[var(--radius-control)] text-ink-soft hover:bg-ink/8 hover:text-ink"
-        :aria-label="isDark ? '切换到浅色模式' : '切换到深色模式'"
-        :aria-pressed="isDark"
-        @click="applyTheme(!isDark)"
-      >
-        <AppIcon :name="isDark ? 'moon' : 'sun'" :size="18" />
-      </button>
+      <div class="flex items-center gap-1">
+        <button
+          type="button"
+          class="grid size-10 place-items-center rounded-[var(--radius-control)] text-ink-soft hover:bg-ink/8 hover:text-ink cursor-pointer"
+          :aria-label="m.app_language()"
+          @click="toggleLanguage"
+        >
+          <span class="text-xs font-semibold uppercase">{{
+            currentLocale === 'zh-Hans' ? 'EN' : '中'
+          }}</span>
+        </button>
+        <button
+          type="button"
+          class="grid size-10 place-items-center rounded-[var(--radius-control)] text-ink-soft hover:bg-ink/8 hover:text-ink cursor-pointer"
+          :aria-label="isDark ? m.app_switch_to_light() : m.app_switch_to_dark()"
+          :aria-pressed="isDark"
+          @click="applyTheme(!isDark)"
+        >
+          <AppIcon :name="isDark ? 'moon' : 'sun'" :size="18" />
+        </button>
+      </div>
     </header>
 
     <!-- 侧栏：固定宽度、满高、独立滚动。
@@ -231,7 +250,7 @@ const version = __APP_VERSION__
     >
       <nav
         class="glass-thick glass-specular flex h-full flex-col overflow-y-auto px-4 py-5"
-        aria-label="主导航"
+        :aria-label="m.nav_main_nav()"
       >
         <!-- macOS 窗口控制红黄绿按纽 -->
         <div class="mb-5 flex items-center gap-2 px-2" aria-hidden="true">
@@ -260,7 +279,7 @@ const version = __APP_VERSION__
           />
           <span class="flex flex-col leading-tight">
             <span class="text-[0.95rem] font-semibold text-ink">Refract</span>
-            <span class="text-[0.7rem] text-ink-faint">LLM 网关</span>
+            <span class="text-[0.7rem] text-ink-faint">{{ m.app_gateway_tag() }}</span>
           </span>
         </RouterLink>
 
@@ -290,8 +309,19 @@ const version = __APP_VERSION__
             <span class="grid w-4 place-items-center" aria-hidden="true">
               <AppIcon name="settings" />
             </span>
-            设置
+            {{ m.nav_settings() }}
           </RouterLink>
+
+          <button
+            type="button"
+            class="shape-nav flex w-full cursor-pointer items-center gap-3 border-0 bg-transparent px-3 py-2.5 text-left text-[0.875rem] font-medium text-ink-soft transition-all duration-150 hover:bg-black/5 hover:text-ink dark:hover:bg-white/10"
+            @click="toggleLanguage"
+          >
+            <span class="grid w-4 place-items-center" aria-hidden="true">
+              <AppIcon name="languages" />
+            </span>
+            {{ currentLocale === 'zh-Hans' ? 'English' : '简体中文' }}
+          </button>
 
           <button
             type="button"
@@ -301,7 +331,7 @@ const version = __APP_VERSION__
             <span class="grid w-4 place-items-center" aria-hidden="true">
               <AppIcon :name="isDark ? 'moon' : 'sun'" />
             </span>
-            {{ isDark ? '深色' : '浅色' }}
+            {{ isDark ? m.app_dark_mode() : m.app_light_mode() }}
           </button>
 
           <a
@@ -330,7 +360,10 @@ const version = __APP_VERSION__
       <RouterView />
     </main>
 
-    <nav class="mobile-tabbar fixed inset-x-3 bottom-3 z-30 md:hidden" aria-label="移动端主导航">
+    <nav
+      class="mobile-tabbar fixed inset-x-3 bottom-3 z-30 md:hidden"
+      :aria-label="m.nav_mobile_nav()"
+    >
       <RouterLink
         v-for="item in mobileNavItems"
         :key="item.name"
@@ -354,11 +387,11 @@ const version = __APP_VERSION__
         <DialogContent
           class="glass-thick glass-specular fixed top-1/2 left-1/2 z-50 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 p-6 outline-none"
         >
-          <DialogTitle class="text-lg font-semibold">管理端身份验证</DialogTitle>
+          <DialogTitle class="text-lg font-semibold">{{ m.auth_title() }}</DialogTitle>
           <DialogDescription class="mt-1 text-xs text-ink-faint">
-            服务端已开启管理鉴权。首次启动可在数据目录下的
+            {{ m.auth_desc_p1() }}
             <code class="font-mono text-ink-soft">.admin_token</code>
-            隐藏文件查看初始凭据（10分钟有效）。
+            {{ m.auth_desc_p2() }}
           </DialogDescription>
 
           <form class="mt-5 flex flex-col gap-4" @submit.prevent="saveTokenAndReload">
@@ -366,7 +399,9 @@ const version = __APP_VERSION__
               {{ tokenError }}
             </div>
             <div>
-              <label class="mb-1 block text-xs font-medium text-ink-soft">管理员账号</label>
+              <label class="mb-1 block text-xs font-medium text-ink-soft">{{
+                m.auth_admin_account()
+              }}</label>
               <input
                 type="text"
                 value="admin@localhost"
@@ -377,27 +412,27 @@ const version = __APP_VERSION__
             </div>
 
             <div>
-              <label class="mb-1 block text-xs font-medium text-ink-soft"
-                >管理令牌 (Admin Token)</label
-              >
+              <label class="mb-1 block text-xs font-medium text-ink-soft">{{
+                m.auth_admin_token()
+              }}</label>
               <div class="relative">
                 <input
                   v-model="tokenDraft"
                   :type="showToken ? 'text' : 'password'"
-                  placeholder="adm_... 或自定义管理令牌"
+                  :placeholder="m.auth_token_placeholder()"
                   autocomplete="current-password"
                   autofocus
-                  aria-label="管理令牌"
+                  :aria-label="m.auth_token_aria()"
                   class="glass-field w-full px-3 py-2 pr-16 font-mono text-sm outline-none"
                 />
                 <button
                   type="button"
                   class="absolute top-1/2 right-2 -translate-y-1/2 rounded-md px-2 py-1 text-xs text-ink-faint hover:text-ink"
-                  :aria-label="showToken ? '隐藏管理令牌' : '显示管理令牌'"
+                  :aria-label="showToken ? m.auth_hide_token() : m.auth_show_token()"
                   :aria-pressed="showToken"
                   @click="showToken = !showToken"
                 >
-                  {{ showToken ? '隐藏' : '显示' }}
+                  {{ showToken ? m.common_hide() : m.common_show() }}
                 </button>
               </div>
             </div>
@@ -408,24 +443,24 @@ const version = __APP_VERSION__
                 :disabled="!tokenDraft.trim() || tokenBusy"
               >
                 <AppIcon v-if="tokenBusy" name="spinner" class="animate-spin mr-1" :size="14" />
-                {{ tokenBusy ? '正在登录…' : '登录并进入系统' }}
+                {{ tokenBusy ? m.auth_logging_in() : m.auth_login_btn() }}
               </button>
               <button
                 type="button"
-                class="rounded-lg px-3 py-2.5 text-sm text-ink-soft hover:bg-ink/8 hover:text-ink"
+                class="rounded-lg px-3 py-2.5 text-sm text-ink-soft hover:bg-ink/8 hover:text-ink cursor-pointer"
                 @click="tokenDialogOpen = false"
               >
-                取消
+                {{ m.common_cancel() }}
               </button>
             </div>
 
             <div class="mt-2 rounded-lg border border-ink/8 bg-ink/5 p-3 text-xs text-ink-faint">
               <div class="font-medium text-ink-soft mb-1 flex items-center gap-1.5">
                 <AppIcon name="info" :size="13" />
-                <span>超时或丢失令牌？如何重新初始化：</span>
+                <span>{{ m.auth_reset_guide_title() }}</span>
               </div>
               <p class="leading-relaxed">
-                在服务器或 Docker 容器中执行：<br />
+                {{ m.auth_reset_guide_body() }}<br />
                 <code class="font-mono text-ink-soft select-all">refract-server --reset-admin</code>
               </p>
             </div>

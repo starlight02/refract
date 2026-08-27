@@ -556,6 +556,8 @@ fn build_http_client(
             )
         })?;
         builder = builder.proxy(configured);
+    } else {
+        builder = builder.no_proxy();
     }
 
     builder.build().map_err(|e| {

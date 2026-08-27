@@ -8,22 +8,22 @@
  */
 import { computed, onMounted, ref, toRef } from 'vue'
 import { useRouter } from 'vue-router'
-import GlassSwitch from '@/components/GlassSwitch.vue'
-import ChannelListCard from '@/components/channels/ChannelListCard.vue'
 import AppIcon from '@/components/AppIcon.vue'
-import { useChannelsStore } from '@/stores/channels'
-import { channels as channelsApi, health as healthApi, settings } from '@/api/client'
+import ChannelListCard from '@/components/channels/ChannelListCard.vue'
+import GlassSwitch from '@/components/GlassSwitch.vue'
 import { useAction } from '@/composables/useAction'
+import * as m from '@/paraglide/messages'
+import { channels as channelsApi, health as healthApi, settings } from '@/api/client'
+import { useChannelsStore } from '@/stores/channels'
 import { isSuccess, orElse, settled } from '@/utils/effect'
 import { toErrorMessage } from '@/utils/error'
 import type { Channel, ChannelTestResult, EndpointHealth, RoutingPolicy } from '@refract/contracts'
-
 const router = useRouter()
 const store = useChannelsStore()
 
 /** 「原生优先」是全局路由开关（需求 6），放在列表页顶部因为它影响整列的排序语义。 */
 const policy = ref<RoutingPolicy | null>(null)
-const savePolicy = useAction('保存路由策略失败')
+const savePolicy = useAction(m.ch_save_policy_failed())
 const policySaving = toRef(savePolicy, 'busy')
 const policyError = toRef(savePolicy, 'error')
 
@@ -121,7 +121,7 @@ async function refreshBalance(ch: Channel) {
   }
   testResults.value[ch.id] = {
     success: false,
-    message: toErrorMessage(outcome.failure, '余额查询失败'),
+    message: toErrorMessage(outcome.failure, m.ch_balance_query_failed()),
   }
 }
 
@@ -130,7 +130,7 @@ async function runTest(ch: Channel) {
   const outcome = await settled(() => store.test(ch.id))
   testResults.value[ch.id] = isSuccess(outcome)
     ? outcome.success
-    : { success: false, message: toErrorMessage(outcome.failure, '测试失败') }
+    : { success: false, message: toErrorMessage(outcome.failure, m.ch_test_failed()) }
 }
 
 /** 一键全测：并发测所有启用中的渠道，各自的结果落在各自的卡片上。 */
@@ -218,11 +218,16 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
   <div class="mx-auto max-w-6xl">
     <header class="mb-6 flex flex-wrap items-end justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold">渠道</h1>
+        <h1 class="text-2xl font-semibold">{{ m.ch_title() }}</h1>
         <p class="mt-1 text-sm text-ink-faint">
-          共 {{ store.items.length }} 条 · 启用 {{ store.items.filter((c) => c.enabled).length }} 条
+          {{
+            m.ch_stats({
+              total: store.items.length,
+              enabled: store.items.filter((c) => c.enabled).length,
+            })
+          }}
           <span v-if="suspendedCount > 0" class="text-danger">
-            · 熔断 {{ suspendedCount }} 个端点
+            {{ m.ch_suspended_stat({ count: suspendedCount }) }}
           </span>
         </p>
       </div>
@@ -233,7 +238,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
           type="button"
           class="glass-button-ghost px-3.5 py-2 text-sm font-medium"
           :disabled="testingAll"
-          title="并发测试全部启用中的渠道"
+          :title="m.ch_test_all_tip()"
           @click="runTestAll"
         >
           <AppIcon
@@ -241,7 +246,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
             :class="testingAll ? 'animate-spin' : ''"
             :size="15"
           />
-          {{ testingAll ? '测试中…' : '全部测试' }}
+          {{ testingAll ? m.common_testing() : m.ch_test_all() }}
         </button>
         <button
           v-if="store.items.length > 0"
@@ -251,7 +256,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
           @click="toggleSelectMode"
         >
           <AppIcon name="checklist" :size="15" />
-          {{ selecting ? '完成' : '批量管理' }}
+          {{ selecting ? m.ch_batch_done() : m.ch_batch_manage() }}
         </button>
         <button
           type="button"
@@ -259,7 +264,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
           @click="router.push('/channels/new')"
         >
           <AppIcon name="plus" :size="15" />
-          新建渠道
+          {{ m.ch_new_channel() }}
         </button>
       </div>
     </header>
@@ -270,17 +275,13 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
         <GlassSwitch
           :model-value="policy.native_first"
           :disabled="policySaving"
-          label="原生优先"
+          :label="m.ch_native_first()"
           @update:model-value="setNativeFirst"
         />
         <span class="text-sm">
-          <span class="font-medium">原生优先</span>
+          <span class="font-medium">{{ m.ch_native_first() }}</span>
           <span class="ml-2 text-xs text-ink-faint">
-            {{
-              policy.native_first
-                ? '原生协议端点压过高优先级的转换端点'
-                : '完全按优先级路由（new-api 语义）'
-            }}
+            {{ policy.native_first ? m.ch_native_first_on() : m.ch_native_first_off() }}
           </span>
         </span>
       </label>
@@ -288,7 +289,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
 
       <label class="flex cursor-pointer items-center gap-2 text-sm text-ink-soft">
         <input v-model="showDisabled" type="checkbox" class="accent-[var(--color-accent)]" />
-        显示已禁用
+        {{ m.ch_show_disabled() }}
       </label>
     </div>
 
@@ -304,16 +305,16 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
       <div class="shape-app-icon mx-auto grid size-14 place-items-center bg-ink/6 text-ink-faint">
         <AppIcon name="channels" :size="26" />
       </div>
-      <h2 class="mt-4 font-medium">还没有渠道</h2>
+      <h2 class="mt-4 font-medium">{{ m.ch_empty_title() }}</h2>
       <p class="mx-auto mt-2 max-w-sm text-sm text-ink-faint">
-        渠道是网关的上游。新建一个渠道，填上 base URL 和 API key，就能开始转发请求。
+        {{ m.ch_empty_desc() }}
       </p>
       <button
         type="button"
         class="glass-button-primary mt-5 px-4 py-2 text-sm font-medium"
         @click="router.push('/channels/new')"
       >
-        新建第一个渠道
+        {{ m.ch_create_first() }}
       </button>
     </div>
 
@@ -321,7 +322,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
       v-else-if="store.loading && sorted.length === 0"
       class="py-16 text-center text-sm text-ink-faint"
     >
-      加载中…
+      {{ m.common_loading() }}
     </div>
 
     <!-- 渠道卡片 -->
@@ -364,16 +365,22 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
         v-if="selecting"
         class="glass-thick glass-specular fixed bottom-24 left-1/2 z-30 flex -translate-x-1/2 flex-wrap items-center justify-center gap-2 px-4 py-2.5 md:bottom-8"
         role="toolbar"
-        aria-label="批量操作"
+        :aria-label="m.ch_batch_bar_aria()"
       >
-        <span class="tabular pr-1 text-sm font-medium">已选 {{ selected.size }} 条</span>
+        <span class="tabular pr-1 text-sm font-medium">{{
+          m.ch_selected_count({ count: selected.size })
+        }}</span>
 
         <button
           type="button"
-          class="glass-button-ghost px-2.5 py-1.5 text-xs"
+          class="glass-button-ghost px-2.5 py-1.5 text-xs cursor-pointer"
           @click="toggleSelectAll"
         >
-          {{ selected.size === sorted.length && sorted.length > 0 ? '全不选' : '全选' }}
+          {{
+            selected.size === sorted.length && sorted.length > 0
+              ? m.ch_deselect_all()
+              : m.ch_select_all()
+          }}
         </button>
 
         <span class="h-4 w-px bg-ink/15" aria-hidden="true"></span>
@@ -385,7 +392,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
           @click="runBulk('enable')"
         >
           <AppIcon v-if="bulkBusy" name="spinner" class="animate-spin" :size="12" />
-          启用
+          {{ m.common_enable() }}
         </button>
         <button
           type="button"
@@ -394,7 +401,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
           @click="runBulk('disable')"
         >
           <AppIcon v-if="bulkBusy" name="spinner" class="animate-spin" :size="12" />
-          禁用
+          {{ m.common_disable() }}
         </button>
         <button
           v-if="!bulkConfirmDelete"
@@ -403,17 +410,17 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
           :disabled="selected.size === 0 || bulkBusy"
           @click="runBulk('delete')"
         >
-          删除
+          {{ m.common_delete() }}
         </button>
         <button
           v-else
           type="button"
-          class="inline-flex items-center gap-1 rounded-lg bg-danger px-3 py-1.5 text-xs font-medium text-white hover:brightness-105 disabled:opacity-50"
+          class="inline-flex items-center gap-1 rounded-lg bg-danger px-3 py-1.5 text-xs font-medium text-white hover:brightness-105 disabled:opacity-50 cursor-pointer"
           :disabled="bulkBusy"
           @click="runBulk('delete')"
         >
           <AppIcon v-if="bulkBusy" name="spinner" class="animate-spin" :size="12" />
-          {{ bulkBusy ? '删除中…' : `确认删除 ${selected.size} 条` }}
+          {{ bulkBusy ? m.common_deleting() : m.ch_confirm_delete_count({ count: selected.size }) }}
         </button>
       </div>
     </Transition>

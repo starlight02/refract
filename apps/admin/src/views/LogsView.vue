@@ -16,6 +16,8 @@ import { useLogsStore } from '@/stores/logs'
 import { useChannelsStore } from '@/stores/channels'
 import { numOr } from '@/utils/num'
 import { useAction } from '@/composables/useAction'
+import * as m from '@/paraglide/messages'
+import { getLocale } from '@/paraglide/runtime'
 import { parseJson } from '@/utils/effect'
 import { logs as logsApi } from '@/api/client'
 import {
@@ -100,7 +102,7 @@ function toUtcStamp(local: string): string | undefined {
 const expanded = ref<Set<number>>(new Set())
 /** 清理确认与结果提示。 */
 const pruneDays = ref(30)
-const pruneLogs = reactive(useAction('清理失败', { toast: true }))
+const pruneLogs = reactive(useAction(m.logs_prune_failed(), { toast: true }))
 
 const PROTOCOLS: Protocol[] = ['chat', 'responses', 'messages', 'gemini']
 
@@ -244,12 +246,14 @@ function channelLabel(log: RequestLog): string {
 function shortTime(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
-  return d.toLocaleTimeString('zh-CN', { hour12: false })
+  return d.toLocaleTimeString(getLocale() === 'zh-Hans' ? 'zh-CN' : 'en-US', { hour12: false })
 }
 
 function fullTime(iso: string): string {
   const d = new Date(iso)
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { hour12: false })
+  return Number.isNaN(d.getTime())
+    ? iso
+    : d.toLocaleString(getLocale() === 'zh-Hans' ? 'zh-CN' : 'en-US', { hour12: false })
 }
 </script>
 
@@ -257,13 +261,13 @@ function fullTime(iso: string): string {
   <div class="flex flex-col gap-5">
     <header class="flex flex-wrap items-end justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold">请求日志</h1>
-        <p class="mt-1 text-sm text-ink-faint">点任意一行展开完整的错误与 token 明细。</p>
+        <h1 class="text-2xl font-semibold">{{ m.logs_title() }}</h1>
+        <p class="mt-1 text-sm text-ink-faint">{{ m.logs_subtitle() }}</p>
       </div>
       <div class="flex flex-wrap items-center gap-2.5">
         <label class="glass-pill h-[34px] cursor-pointer gap-2 px-3 text-xs text-ink-soft">
           <input v-model="autoRefresh" type="checkbox" class="accent-[var(--color-accent)]" />
-          <span>自动刷新</span>
+          <span>{{ m.logs_auto_refresh() }}</span>
           <span v-if="autoRefresh" class="text-ink-faint">5s</span>
         </label>
 
@@ -278,14 +282,14 @@ function fullTime(iso: string): string {
             :class="pageExported ? 'text-success' : ''"
             :size="14"
           />
-          {{ pageExported ? '已导出' : '导出本页' }}
+          {{ pageExported ? m.logs_exported() : m.logs_export_page() }}
         </button>
 
         <button
           type="button"
           class="glass-button-ghost"
           :disabled="exportAllLogs.busy"
-          title="按当前筛选导出 NDJSON（上限 5 万行）"
+          :title="m.logs_export_all_title()"
           @click="exportAll"
         >
           <AppIcon
@@ -293,18 +297,18 @@ function fullTime(iso: string): string {
             :class="exportAllLogs.busy ? 'animate-spin' : ''"
             :size="14"
           />
-          {{ exportAllLogs.busy ? '导出中…' : '导出全量' }}
+          {{ exportAllLogs.busy ? m.logs_exporting() : m.logs_export_all() }}
         </button>
 
         <div class="glass-pill glass-pill-danger h-[34px] gap-1.5 px-2.5">
-          <span class="text-xs text-ink-soft">清理</span>
+          <span class="text-xs text-ink-soft">{{ m.logs_prune_label() }}</span>
           <input
             v-model.number="pruneDays"
             type="number"
             min="1"
             class="glass-field tabular !h-[24px] !w-12 !px-1 text-center text-xs outline-none"
           />
-          <span class="text-xs text-ink-soft">天前</span>
+          <span class="text-xs text-ink-soft">{{ m.logs_prune_days() }}</span>
           <button
             type="button"
             class="inline-flex items-center gap-1 glass-button-ghost glass-button-ghost-danger !h-[24px] !px-2 text-xs font-medium"
@@ -312,7 +316,7 @@ function fullTime(iso: string): string {
             @click="prune"
           >
             <AppIcon v-if="pruneLogs.busy" name="spinner" class="animate-spin" :size="11" />
-            {{ pruneLogs.busy ? '清理中…' : '执行' }}
+            {{ pruneLogs.busy ? m.logs_pruning() : m.logs_prune_exec() }}
           </button>
         </div>
         <span v-if="pruneLogs.notice" class="text-xs text-ink-faint">{{
@@ -328,20 +332,20 @@ function fullTime(iso: string): string {
     <section class="glass glass-specular p-4">
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <label class="flex flex-col gap-1.5">
-          <span class="text-xs font-medium text-ink-soft">模型</span>
+          <span class="text-xs font-medium text-ink-soft">{{ m.logs_filter_model() }}</span>
           <input
             v-model="draftModel"
             type="text"
-            placeholder="精确匹配 / 全部模型"
+            :placeholder="m.logs_filter_model_placeholder()"
             class="glass-field w-full outline-none"
             @keydown.enter="applyFilter"
           />
         </label>
 
         <label class="flex flex-col gap-1.5">
-          <span class="text-xs font-medium text-ink-soft">渠道</span>
+          <span class="text-xs font-medium text-ink-soft">{{ m.logs_filter_channel() }}</span>
           <select v-model="draftChannel" class="glass-field w-full outline-none">
-            <option value="">全部渠道</option>
+            <option value="">{{ m.logs_filter_all_channels() }}</option>
             <option v-for="o in channelsStore.options" :key="o.id" :value="o.id">
               {{ o.name }}
             </option>
@@ -349,21 +353,21 @@ function fullTime(iso: string): string {
         </label>
 
         <label class="flex flex-col gap-1.5">
-          <span class="text-xs font-medium text-ink-soft">Request ID</span>
+          <span class="text-xs font-medium text-ink-soft">{{ m.logs_filter_request_id() }}</span>
           <input
             v-model="draftRequestId"
             type="text"
-            placeholder="按请求 ID 检索"
+            :placeholder="m.logs_filter_request_id_placeholder()"
             class="glass-field w-full font-mono text-xs outline-none"
             @keydown.enter="applyFilter"
           />
         </label>
 
         <label class="flex flex-col gap-1.5">
-          <span class="text-xs font-medium text-ink-soft">状态过滤</span>
+          <span class="text-xs font-medium text-ink-soft">{{ m.logs_filter_status() }}</span>
           <select v-model="draftFailuresOnly" class="glass-field w-full outline-none">
-            <option :value="false">全部状态（包含成功与失败）</option>
-            <option :value="true">仅看失败请求</option>
+            <option :value="false">{{ m.logs_filter_all_status() }}</option>
+            <option :value="true">{{ m.logs_filter_failures_only() }}</option>
           </select>
         </label>
       </div>
@@ -373,37 +377,37 @@ function fullTime(iso: string): string {
       >
         <div class="flex flex-wrap items-center gap-3">
           <label class="flex items-center gap-2">
-            <span class="text-xs font-medium text-ink-soft">时间范围</span>
+            <span class="text-xs font-medium text-ink-soft">{{ m.logs_filter_time_range() }}</span>
             <select
               :value="timePreset"
               class="glass-field w-36 outline-none"
               @change="onTimePresetChange(($event.target as HTMLSelectElement).value)"
             >
-              <option value="all">全部时间</option>
-              <option value="1h">最近 1 小时</option>
-              <option value="6h">最近 6 小时</option>
-              <option value="24h">最近 24 小时</option>
-              <option value="7d">最近 7 天</option>
-              <option value="custom">自定义范围…</option>
+              <option value="all">{{ m.logs_time_all() }}</option>
+              <option value="1h">{{ m.logs_time_1h() }}</option>
+              <option value="6h">{{ m.logs_time_6h() }}</option>
+              <option value="24h">{{ m.logs_time_24h() }}</option>
+              <option value="7d">{{ m.logs_time_7d() }}</option>
+              <option value="custom">{{ m.logs_time_custom() }}</option>
             </select>
           </label>
 
           <template v-if="timePreset === 'custom'">
             <div class="flex items-center gap-1.5">
-              <span class="text-xs text-ink-faint">从</span>
+              <span class="text-xs text-ink-faint">{{ m.logs_time_from() }}</span>
               <input
                 v-model="draftSince"
                 type="datetime-local"
-                aria-label="起始时间"
+                :aria-label="m.logs_time_from()"
                 class="glass-field w-48 outline-none"
               />
             </div>
             <div class="flex items-center gap-1.5">
-              <span class="text-xs text-ink-faint">到</span>
+              <span class="text-xs text-ink-faint">{{ m.logs_time_to() }}</span>
               <input
                 v-model="draftUntil"
                 type="datetime-local"
-                aria-label="截止时间"
+                :aria-label="m.logs_time_to()"
                 class="glass-field w-48 outline-none"
               />
             </div>
@@ -413,9 +417,11 @@ function fullTime(iso: string): string {
         <div class="flex items-center gap-2">
           <button type="button" class="glass-button-primary px-4 font-medium" @click="applyFilter">
             <AppIcon name="search" :size="14" />
-            应用筛选
+            {{ m.logs_apply_filter() }}
           </button>
-          <button type="button" class="glass-button-ghost px-3.5" @click="resetFilter">重置</button>
+          <button type="button" class="glass-button-ghost px-3.5" @click="resetFilter">
+            {{ m.logs_reset_filter() }}
+          </button>
         </div>
       </div>
     </section>
@@ -425,26 +431,30 @@ function fullTime(iso: string): string {
     </p>
 
     <!-- 表格 -->
-    <section class="glass glass-specular overflow-x-auto" tabindex="0" aria-label="请求日志表">
+    <section
+      class="glass glass-specular overflow-x-auto"
+      tabindex="0"
+      :aria-label="m.logs_table_aria()"
+    >
       <div v-if="store.loading && store.items.length === 0" class="py-24 text-center">
-        <GlassSpinner size="lg" label="正在拉取请求日志…" />
+        <GlassSpinner size="lg" :label="m.logs_loading()" />
       </div>
 
       <div v-else-if="store.items.length === 0" class="py-16 text-center">
-        <p class="text-sm text-ink-faint">没有匹配的日志</p>
+        <p class="text-sm text-ink-faint">{{ m.logs_no_logs() }}</p>
       </div>
 
       <table v-else class="min-w-[900px] w-full text-sm">
         <thead>
           <tr class="border-b border-ink/10 text-left text-xs text-ink-faint">
-            <th class="px-4 py-2.5 font-medium">时间</th>
-            <th class="px-4 py-2.5 font-medium">协议</th>
-            <th class="px-4 py-2.5 font-medium">模型</th>
-            <th class="px-4 py-2.5 font-medium">渠道</th>
-            <th class="px-4 py-2.5 text-right font-medium">状态</th>
-            <th class="px-4 py-2.5 text-right font-medium">首字</th>
-            <th class="px-4 py-2.5 text-right font-medium">耗时</th>
-            <th class="px-4 py-2.5 text-right font-medium">tokens</th>
+            <th class="px-4 py-2.5 font-medium">{{ m.logs_col_time() }}</th>
+            <th class="px-4 py-2.5 font-medium">{{ m.logs_col_protocol() }}</th>
+            <th class="px-4 py-2.5 font-medium">{{ m.logs_col_model() }}</th>
+            <th class="px-4 py-2.5 font-medium">{{ m.logs_col_channel() }}</th>
+            <th class="px-4 py-2.5 text-right font-medium">{{ m.logs_col_status() }}</th>
+            <th class="px-4 py-2.5 text-right font-medium">{{ m.logs_col_first_token() }}</th>
+            <th class="px-4 py-2.5 text-right font-medium">{{ m.logs_col_duration() }}</th>
+            <th class="px-4 py-2.5 text-right font-medium">{{ m.logs_col_tokens() }}</th>
           </tr>
         </thead>
         <tbody>
@@ -508,7 +518,7 @@ function fullTime(iso: string): string {
                   <span
                     v-if="log.affinity_rule"
                     class="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent"
-                    :title="`命中亲和规则：${log.affinity_rule}`"
+                    :title="m.logs_affinity_hit({ rule: log.affinity_rule })"
                   >
                     {{ log.affinity_rule }}
                   </span>
@@ -516,7 +526,7 @@ function fullTime(iso: string): string {
                 <p
                   v-if="log.credential_hint"
                   class="mt-0.5 font-mono text-[10px] text-ink-faint"
-                  title="本次请求实际使用的上游密钥（脱敏）"
+                  :title="m.logs_credential_hint_title()"
                 >
                   {{ log.credential_hint }}
                 </p>
@@ -530,7 +540,7 @@ function fullTime(iso: string): string {
                 <span
                   v-if="log.retries > 0"
                   class="ml-1 inline-flex items-center gap-0.5 align-middle text-xs text-warning"
-                  :title="`重试 ${log.retries} 次`"
+                  :title="m.logs_retried_count({ count: log.retries })"
                 >
                   <AppIcon name="refresh" :size="11" />{{ log.retries }}
                 </span>
@@ -561,53 +571,53 @@ function fullTime(iso: string): string {
                     <dd class="font-mono">{{ log.request_id }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">时间</dt>
+                    <dt class="text-ink-faint">{{ m.logs_col_time() }}</dt>
                     <dd class="tabular">{{ fullTime(log.created_at) }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">流式</dt>
-                    <dd>{{ log.stream ? '是' : '否' }}</dd>
+                    <dt class="text-ink-faint">{{ m.logs_detail_stream() }}</dt>
+                    <dd>{{ log.stream ? m.common_yes() : m.common_no() }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">协议转换</dt>
-                    <dd>{{ log.transcoded ? '是' : '原生' }}</dd>
+                    <dt class="text-ink-faint">{{ m.logs_detail_transcode() }}</dt>
+                    <dd>{{ log.transcoded ? m.common_yes() : m.logs_native() }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">缓存读 tokens</dt>
+                    <dt class="text-ink-faint">{{ m.logs_detail_cache_read() }}</dt>
                     <dd class="tabular">{{ log.cached_tokens }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">缓存写 tokens</dt>
+                    <dt class="text-ink-faint">{{ m.logs_detail_cache_write() }}</dt>
                     <dd class="tabular">{{ log.cache_write_tokens }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">推理 tokens</dt>
+                    <dt class="text-ink-faint">{{ m.logs_detail_reasoning() }}</dt>
                     <dd class="tabular">{{ log.reasoning_tokens }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">首字延迟</dt>
+                    <dt class="text-ink-faint">{{ m.logs_col_first_token() }}</dt>
                     <dd class="tabular">{{ log.ttfb_ms != null ? `${log.ttfb_ms}ms` : '—' }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">生成耗时</dt>
+                    <dt class="text-ink-faint">{{ m.logs_detail_gen_duration() }}</dt>
                     <dd class="tabular">
                       {{ log.ttfb_ms != null ? `${log.duration_ms - log.ttfb_ms}ms` : '—' }}
                     </dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">重试</dt>
+                    <dt class="text-ink-faint">{{ m.logs_detail_retries() }}</dt>
                     <dd class="tabular">{{ log.retries }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">密钥</dt>
+                    <dt class="text-ink-faint">{{ m.logs_detail_api_key() }}</dt>
                     <dd class="tabular">{{ log.api_key_id ?? '—' }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">上游密钥</dt>
+                    <dt class="text-ink-faint">{{ m.logs_detail_upstream_key() }}</dt>
                     <dd class="font-mono">{{ log.credential_hint ?? '—' }}</dd>
                   </div>
                   <div>
-                    <dt class="text-ink-faint">亲和规则</dt>
+                    <dt class="text-ink-faint">{{ m.logs_detail_affinity() }}</dt>
                     <dd>{{ log.affinity_rule ?? '—' }}</dd>
                   </div>
                 </dl>
@@ -616,7 +626,9 @@ function fullTime(iso: string): string {
                   v-if="log.error_kind || log.error_message"
                   class="mt-3 rounded-lg bg-danger/8 p-3"
                 >
-                  <p class="text-xs font-medium text-danger">{{ log.error_kind ?? '错误' }}</p>
+                  <p class="text-xs font-medium text-danger">
+                    {{ log.error_kind ?? m.common_error() }}
+                  </p>
                   <p
                     v-if="log.error_message"
                     class="mt-1 font-mono text-xs break-all text-ink-soft"
@@ -638,7 +650,9 @@ function fullTime(iso: string): string {
                       class="animate-spin mr-1"
                       :size="12"
                     />
-                    {{ detailLoadingId === log.id ? '加载中…' : '查看完整请求' }}
+                    {{
+                      detailLoadingId === log.id ? m.common_loading() : m.logs_view_full_request()
+                    }}
                   </button>
                 </div>
               </td>
@@ -651,7 +665,7 @@ function fullTime(iso: string): string {
     <!-- 翻页 -->
     <div v-if="store.items.length > 0" class="flex items-center justify-between text-sm">
       <span class="text-xs text-ink-faint">
-        第 {{ offset + 1 }}–{{ offset + store.items.length }} 条
+        {{ m.logs_page_range({ from: offset + 1, to: offset + store.items.length }) }}
       </span>
       <div class="flex items-center gap-2">
         <button
@@ -660,7 +674,7 @@ function fullTime(iso: string): string {
           :disabled="!hasPrev || store.loading"
           @click="go(-1)"
         >
-          上一页
+          {{ m.common_prev() }}
         </button>
         <button
           type="button"
@@ -668,7 +682,7 @@ function fullTime(iso: string): string {
           :disabled="!hasMore || store.loading"
           @click="go(1)"
         >
-          下一页
+          {{ m.common_next() }}
         </button>
       </div>
     </div>
@@ -682,13 +696,13 @@ function fullTime(iso: string): string {
         <DialogContent
           class="glass-thick glass-specular fixed top-1/2 left-1/2 z-50 flex max-h-[85vh] w-[calc(100%-2rem)] max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col p-6 outline-none"
         >
-          <DialogTitle class="text-lg font-semibold">完整请求</DialogTitle>
+          <DialogTitle class="text-lg font-semibold">{{ m.logs_full_request_title() }}</DialogTitle>
           <DialogDescription class="mt-1 font-mono text-xs text-ink-faint">
             {{ detail?.request_id ?? '' }}
           </DialogDescription>
 
           <div v-if="loadDetail.busy" class="py-16 text-center">
-            <GlassSpinner size="md" label="正在读取完整请求正文…" />
+            <GlassSpinner size="md" :label="m.logs_loading_body()" />
           </div>
           <p v-else-if="loadDetail.error" class="mt-4 text-sm text-danger">
             {{ loadDetail.error }}
@@ -696,31 +710,37 @@ function fullTime(iso: string): string {
 
           <div v-else-if="detail" class="mt-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
             <section>
-              <h3 class="mb-1.5 text-xs font-semibold text-ink-soft uppercase">请求</h3>
+              <h3 class="mb-1.5 text-xs font-semibold text-ink-soft uppercase">
+                {{ m.logs_request_body_title() }}
+              </h3>
               <pre
                 v-if="detail.request_body"
                 class="max-h-72 overflow-auto rounded-lg bg-ink/6 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap"
                 >{{ pretty(detail.request_body) }}</pre>
               <p v-else class="text-xs text-ink-faint">
-                未记录 —— 正文快照未开启，或该请求是二进制表单。
+                {{ m.logs_req_body_none() }}
               </p>
             </section>
 
             <section>
               <h3 class="mb-1.5 text-xs font-semibold text-ink-soft uppercase">
-                响应{{ detail.stream ? '（流式聚合文本）' : '' }}
+                {{
+                  m.logs_response_body_title({
+                    stream: detail.stream ? m.logs_stream_suffix() : '',
+                  })
+                }}
               </h3>
               <pre
                 v-if="detail.response_body"
                 class="max-h-72 overflow-auto rounded-lg bg-ink/6 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap"
                 >{{ pretty(detail.response_body) }}</pre>
-              <p v-else class="text-xs text-ink-faint">未记录。</p>
+              <p v-else class="text-xs text-ink-faint">{{ m.logs_resp_body_none() }}</p>
             </section>
           </div>
 
           <div class="mt-4 flex justify-end">
             <button type="button" class="glass-button-ghost px-4 py-2 text-sm" @click="closeDetail">
-              关闭
+              {{ m.common_close() }}
             </button>
           </div>
         </DialogContent>

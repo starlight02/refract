@@ -9,13 +9,13 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { settings as settingsApi } from '@/api/client'
 import { useChannelsStore } from '@/stores/channels'
 import { useAction } from '@/composables/useAction'
+import * as m from '@/paraglide/messages'
 import type { ModelPrice, Protocol } from '@refract/contracts'
 import ProtocolBadge from '@/components/ProtocolBadge.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
-
 const channelsStore = useChannelsStore()
 const pricing = ref<ModelPrice[]>([])
-const loadModels = reactive(useAction('加载失败'))
+const loadModels = reactive(useAction(m.models_load_failed()))
 loadModels.busy = true
 const filter = ref('')
 
@@ -89,16 +89,16 @@ function fmtPrice(value: number): string {
   <div class="flex flex-col gap-5">
     <header class="flex flex-wrap items-end justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold">模型</h1>
+        <h1 class="text-2xl font-semibold">{{ m.models_title() }}</h1>
         <p class="mt-1 text-sm text-ink-faint">
-          由启用中的渠道派生。价格在设置页维护，单位为每百万 token。
+          {{ m.models_subtitle() }}
         </p>
       </div>
       <input
         v-model="filter"
         type="search"
-        placeholder="筛选模型名…"
-        aria-label="筛选模型名"
+        :placeholder="m.models_filter_placeholder()"
+        :aria-label="m.models_filter_aria()"
         class="glass-field w-56 outline-none"
       />
     </header>
@@ -107,11 +107,11 @@ function fmtPrice(value: number): string {
       {{ loadModels.error }}
     </p>
     <div v-else-if="loadModels.busy" class="py-24 text-center">
-      <GlassSpinner size="lg" label="正在汇总模型清单与价表…" />
+      <GlassSpinner size="lg" :label="m.models_loading()" />
     </div>
     <section v-else-if="rows.length === 0" class="glass glass-specular py-16 text-center">
       <p class="text-sm text-ink-faint">
-        {{ filter ? '没有匹配的模型' : '还没有渠道提供模型 —— 先去渠道页配置' }}
+        {{ filter ? m.models_no_match() : m.models_no_channels() }}
       </p>
     </section>
 
@@ -119,11 +119,11 @@ function fmtPrice(value: number): string {
       <table class="w-full min-w-[40rem] border-collapse text-sm">
         <thead>
           <tr class="text-left text-xs text-ink-faint">
-            <th class="px-4 py-3 font-medium">模型</th>
-            <th class="px-4 py-3 font-medium">协议</th>
-            <th class="px-4 py-3 font-medium">渠道</th>
-            <th class="px-4 py-3 text-right font-medium">输入 / M</th>
-            <th class="px-4 py-3 text-right font-medium">输出 / M</th>
+            <th class="px-4 py-3 font-medium">{{ m.models_col_model() }}</th>
+            <th class="px-4 py-3 font-medium">{{ m.models_col_protocol() }}</th>
+            <th class="px-4 py-3 font-medium">{{ m.models_col_channel() }}</th>
+            <th class="px-4 py-3 text-right font-medium">{{ m.models_col_input_price() }}</th>
+            <th class="px-4 py-3 text-right font-medium">{{ m.models_col_output_price() }}</th>
           </tr>
         </thead>
         <tbody>
