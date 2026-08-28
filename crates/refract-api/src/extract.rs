@@ -13,7 +13,7 @@ use xitca_web::handler::body::Limit;
 use xitca_web::http::WebResponse;
 use xitca_web::service::Service;
 
-use crate::auth::require_admin;
+use crate::auth::{require_admin_user, require_me};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -78,15 +78,32 @@ where
     }
 }
 
-fn is_public_admin(path: &str) -> bool {
+/// `/api/auth/*` 中不需要登录的端点。
+fn is_public_auth(path: &str) -> bool {
     matches!(
         path,
-        "/api/crypto/public-key" | "/api/auth/login" | "/api/auth/logout" | "/api/auth/session"
+        "/api/auth/login"
+            | "/api/auth/logout"
+            | "/api/auth/session"
+            | "/api/auth/register"
+            | "/api/auth/verify-email"
+            | "/api/auth/resend-verification"
+            | "/api/auth/password-reset/request"
+            | "/api/auth/password-reset/confirm"
+            | "/api/auth/dev-codes"
     )
 }
 
-/// 管理面鉴权中间件。只拦 `/api`，公开登录/会话路由放行。
-pub async fn require_admin_mw<S, E>(
+/// 管理面/自助面鉴权中间件。
+///
+/// 分流规则：
+/// - `/api/auth/*`：公开（登录/注册/找回）或登录态可读（session）。
+/// - `/api/admin/*`：必须 admin 角色（`/api/admin/crypto/public-key` 除外——
+///   它只暴露服务器公钥，加密写操作前就需要它）。
+/// - `/api/me/*`：必须登录（user/admin 均可）。
+/// - 其余 `/api/*`：旧路径统一 410 Gone，不再做任何鉴权——防止旧探测
+///   流量绕过认证拿到数据。
+pub async fn require_auth_mw<S, E>(
     service: &S,
     ctx: WebContext<'_, AppState>,
 ) -> Result<WebResponse, Error>
@@ -95,9 +112,24 @@ where
     E: Into<Error>,
 {
     let path = ctx.req().uri().path();
-    if path.starts_with("/api/") && !is_public_admin(path) {
-        let peer = crate::peer_addr(*ctx.req().body().socket_addr());
-        require_admin(ctx.state(), ctx.req().headers(), peer).await?;
+    if !path.starts_with("/api/") {
+        return service.call(ctx).await.map_err(Into::into);
     }
+    let peer = crate::peer_addr(*ctx.req().body().socket_addr());
+    if path == "/api/admin/crypto/public-key" {
+        // 公开：ECDH 公钥本身不是秘密，加密写操作前必须能拿到。
+        return service.call(ctx).await.map_err(Into::into);
+    }
+    if path.starts_with("/api/auth/") {
+        if is_public_auth(path) {
+            return service.call(ctx).await.map_err(Into::into);
+        }
+        require_me(ctx.state(), ctx.req().headers(), peer).await?;
+    } else if path.starts_with("/api/admin/") {
+        require_admin_user(ctx.state(), ctx.req().headers(), peer).await?;
+    } else if path.starts_with("/api/me/") {
+        require_me(ctx.state(), ctx.req().headers(), peer).await?;
+    }
+    // 其余旧路径（如 /api/channels）不进鉴权、直达 410 兜底路由。
     service.call(ctx).await.map_err(Into::into)
 }

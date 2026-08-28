@@ -40,7 +40,7 @@ Aggregate channels can express things new-api cannot: *"My relay offers both Ope
 - **Operational probes & metrics**: public `/health/live`, `/health/ready`; Prometheus text-format `/metrics` requires the management token when one is configured.
 - **Configuration and database backup**: export/import channels, gateway keys and settings as one JSON document; restored keys keep working across instances. Merge and replace import modes. Settings also exposes database size statistics and an online SQLite backup.
 - **Single-binary deployment**: the built frontend is embedded into the binary; deploying is copying one file.
-- **Designed for one user, not hard-wired to one user**: every business table carries `owner_id`, authentication is a trait — adding multi-user later doesn't touch business logic. Out of scope on purpose: multi-user accounts, payments, vendor-specific channel enums, Redis/multi-instance coordination, OpenAI files/batches/assistants, and a public homepage login.
+- **Multi-user with a shared + private channel pool**: open registration with email verification, per-user wallets with prepaid balance and a full charge ledger, and channels that are either admin-maintained shared or user-owned private. Still out of scope on purpose: payment-gateway integration (top-ups are manual by an admin), vendor-specific channel enums, Redis/multi-instance coordination, OpenAI files/batches/assistants, and a public homepage login.
 
 ## Quick start
 
@@ -128,11 +128,14 @@ Realtime is likewise native-only: it selects a healthy Chat endpoint, applies mo
 | `proxy` | none | Outbound proxy (http/socks5) |
 | `master_key` | none | Master encryption key for credentials at rest (32-byte base64); inject via `REFRACT_MASTER_KEY` |
 | `tls_cert` / `tls_key` | none | PEM certificate and private key. Set both to enable HTTPS (HTTP/1.1+HTTP/2) and HTTP/3. Unset: cleartext HTTP/1.1 + h2c. |
+| `smtp_url` | none | SMTP submission URL (`smtp://user:pass@host:587`). `REFRACT_SMTP_URL` set at process start is persisted into settings before AppState bootstrap. Unset: verification and reset codes go to the service log. |
+| `mail_from` | none | Mail From address. `REFRACT_MAIL_FROM` is persisted the same way as `smtp_url`. |
+| `dev_mode` | `false` | Log verification codes and enable `GET /api/auth/dev-codes?email=…`. Also `REFRACT_DEV_MODE=1`. Do not enable in production. |
 
 
 Routing policy (`max_attempts`, `max_upstream_calls`, native-first, selection) is runtime-tunable in the admin UI, not a `refract.toml` key.
 
-**First boot**: the server always issues a random `adm_…` management token and writes it to `<data-dir>/.admin_token` (mode 0600, deleted after 10 minutes). The admin UI requires that token. Compose: `docker compose exec refract cat /data/.admin_token`. Lost the file? Restart with `--reset-admin`.
+**First boot**: on a fresh install the server issues a random `adm_…` management token and writes it to `<data-dir>/.admin_token` (mode 0600, deleted after 10 minutes), and creates the `admin@localhost` user. The admin UI requires that token. Compose: `docker compose exec refract cat /data/.admin_token`. Lost the file? Restart with `--reset-admin` to rotate both the token and the admin password. Upgrading a previous single-user database keeps your existing `adm_…` token (only the missing admin password is issued), creates the admin user automatically, and assigns existing channels, API keys, and logs to it; old gateway keys keep working.
 
 **Security note**: the service refuses a non-loopback listener unless a management token is present and `require_auth=true`. Never commit the plaintext token.
 

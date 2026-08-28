@@ -21,6 +21,8 @@ fn channel_at(base: &str, protocol: Protocol, models: &[&str]) -> Channel {
     Channel {
         id: 0,
         owner_id: refract_core::DEFAULT_OWNER_ID,
+        visibility: refract_core::ChannelVisibility::Shared,
+        user_id: None,
         name: format!("{protocol}-upstream"),
         kind: ChannelKind::Single(protocol),
         enabled: true,
@@ -69,6 +71,7 @@ async fn relay_stream_for_test(
         state: state.clone(),
         owner_id: refract_core::DEFAULT_OWNER_ID,
         key_id: None,
+        user_id: None,
         inbound: protocol,
         request_id: format!("stream-test-{protocol}"),
         started: std::time::Instant::now(),
@@ -965,6 +968,23 @@ async fn rate_limited_key_gets_429_with_retry_after() {
     let db = Database::open_in_memory().await.unwrap();
     refract_store::ChannelRepo::new(db.clone())
         .create(&channel_at(&server.uri(), Protocol::Chat, &["gpt-4o"]))
+        .await
+        .unwrap();
+    // 多用户化后网关鉴权要求归属用户 active + 余额为正；
+    // 这里走 bootstrap admin 并充值，避免与限流断言耦合。
+    let admin = refract_store::UserRepo::new(db.clone())
+        .create_first_admin_if_empty("admin@localhost", "argon2-placeholder")
+        .await
+        .unwrap()
+        .expect("bootstrap admin");
+    refract_store::WalletRepo::new(db.clone())
+        .apply(
+            admin.id,
+            10.0,
+            refract_store::LedgerKind::Topup,
+            None,
+            "test",
+        )
         .await
         .unwrap();
     let (_, plaintext) = refract_store::ApiKeyRepo::new(db.clone())

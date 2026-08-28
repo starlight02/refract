@@ -40,7 +40,7 @@ Refract 的模型是：**渠道类型 = 协议**。只有五种：
 - **运维探针与指标**：公开的 `/health/live`、`/health/ready`；Prometheus 文本格式的 `/metrics` 在配置管理令牌后需凭证访问。
 - **配置与数据库备份**：一个 JSON 文件导出/导入全部渠道、网关密钥与设置，跨实例迁移后原密钥继续可用；支持合并与替换。设置页还能查看数据库体积并在线生成 SQLite 备份。
 - **单二进制部署**：前端编译产物内嵌进二进制，部署只需拷贝一个文件。
-- **为单用户设计，不为单用户焊死**：所有业务表预留 `owner_id`，鉴权是 trait，将来加多用户不需要动业务逻辑。刻意不做：多用户账号、支付、按厂商枚举渠道、Redis/多实例、OpenAI files/batches/assistants、公开首页登录。
+- **多用户与混合渠道池**：开放注册（邮箱验证）、预付费钱包与完整扣费账本；渠道分为管理员维护的共享池与用户自己的私有渠。仍刻意不做：支付网关接入（充值由管理员手工完成）、按厂商枚举渠道、Redis/多实例、OpenAI files/batches/assistants、公开首页登录。
 
 ## 快速开始
 
@@ -128,11 +128,14 @@ Realtime 同样只走原生 Chat 端点：先按健康度选路由并应用模�
 | `proxy` | 无 | 出站代理（http/socks5） |
 | `master_key` | 无 | 渠道凭据静态加密主密钥（32 字节 base64）；推荐通过 `REFRACT_MASTER_KEY` 注入 |
 | `tls_cert` / `tls_key` | 无 | PEM 证书与私钥。成对配置后同一地址启用 HTTPS（HTTP/1.1+HTTP/2）和 HTTP/3；未配置时明文 HTTP/1.1 + h2c |
+| `smtp_url` | 无 | SMTP 提交地址（`smtp://user:pass@host:587`）。启动时设置的 `REFRACT_SMTP_URL` 会在装配 AppState 之前写入 settings。未配置时验证码/重置码写入服务日志 |
+| `mail_from` | 无 | 发件人地址。`REFRACT_MAIL_FROM` 与 `smtp_url` 同样在启动时持久化 |
+| `dev_mode` | `false` | 验证码走日志，并开放 `GET /api/auth/dev-codes?email=…`。也可用 `REFRACT_DEV_MODE=1`。生产环境不要开 |
 
 
 路由策略（`max_attempts`、`max_upstream_calls`、原生优先、选择算法）在管理界面运行时可调，不是 `refract.toml` 键。
 
-**首次启动**：服务端签发随机 `adm_…` 管理令牌，写入数据目录 `.admin_token`（权限 0600，10 分钟后删除）。管理界面必须用这把钥匙登录。Compose：`docker compose exec refract cat /data/.admin_token`。文件丢了就 `--reset-admin` 重启。
+**首次启动**：全新安装时服务端签发随机 `adm_…` 管理令牌，写入数据目录 `.admin_token`（权限 0600，10 分钟后删除），并创建 `admin@localhost` 用户。管理界面必须用这把钥匙登录。Compose：`docker compose exec refract cat /data/.admin_token`。文件丢了就用 `--reset-admin` 重启（同时轮换令牌与管理员密码）。从旧的单用户库升级时**保留既有 `adm_…` 令牌**（只补发缺失的管理员密码），自动创建该管理员；原有渠道、API 密钥和日志归其所有，旧网关密钥继续可用。
 
 **安全提示**：网关持有全部上游密钥。服务会拒绝在非回环地址启动，除非管理令牌已存在且 `require_auth=true`。不要把明文提交进仓库。
 

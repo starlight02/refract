@@ -17,7 +17,7 @@ pub use affinity::{
     DEFAULT_AFFINITY_TTL_SECS, MAX_AFFINITY_TTL_SECS,
 };
 pub use channel::{
-    Channel, ChannelEndpoint, ChannelError, ChannelId, ChannelKind, Credential,
+    Channel, ChannelEndpoint, ChannelError, ChannelId, ChannelKind, ChannelVisibility, Credential,
     EmptyResponseRetryOverride, EmptyResponseRetryPolicy, KeyPool, KeyStrategy, ModelEntry,
     ParamOverride, TranscodePolicy,
 };

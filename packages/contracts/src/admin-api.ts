@@ -114,6 +114,10 @@ export interface Channel {
   test_model?: string | null
   /** HTTP 200 空回复重试覆盖；null 表示继承全局值。 */
   empty_response_retry: EmptyResponseRetryOverride
+  /** 共享渠全员可用；私有渠仅属主可见。缺省为 shared。 */
+  visibility?: ChannelVisibility
+  /** 私有渠属主；共享渠为 null。 */
+  user_id?: number | null
 }
 
 // ── 渠道类型 ──
@@ -126,6 +130,7 @@ export type ChannelKind = Protocol | 'aggregate'
 export interface ApiKey {
   id: number
   owner_id: number
+  user_id?: number | null
   name: string
   key_prefix: string
   enabled: boolean
@@ -168,6 +173,7 @@ export interface RequestLog {
   request_id: string
   created_at: string
   api_key_id?: number | null
+  user_id?: number | null
   channel_id?: number | null
   channel_name?: string | null
   inbound_protocol: string
@@ -202,6 +208,7 @@ export interface LogFilter {
   model?: string
   channel_id?: number
   api_key_id?: number
+  user_id?: number
   request_id?: string
   since?: string
   until?: string
@@ -448,6 +455,74 @@ export interface ImportResult {
   keys_imported: number
   skipped_channels?: string[]
   skipped_keys?: string[]
+}
+
+// ── 多用户 ──
+
+export type ChannelVisibility = 'shared' | 'private'
+
+export type UserRole = 'user' | 'admin'
+
+export type UserStatus = 'pending_verification' | 'active' | 'disabled'
+
+export interface User {
+  id: number
+  email: string
+  display_name: string
+  role: UserRole
+  status: UserStatus
+  email_verified_at?: string | null
+  created_at?: string
+}
+
+/** 管理员用户列表项，附带钱包余额。 */
+export interface UserListItem extends User {
+  balance: number
+}
+
+export interface Wallet {
+  user_id: number
+  balance: number
+  currency: string
+  updated_at: string
+}
+
+export type LedgerKind = 'topup' | 'charge' | 'refund' | 'adjust'
+
+export interface LedgerEntry {
+  id: number
+  user_id: number
+  delta: number
+  balance_after: number
+  kind: LedgerKind
+  ref_id?: string | null
+  note: string
+  created_at: string
+}
+
+export interface SessionUser {
+  id: number
+  email: string
+  display_name: string
+  role: UserRole
+  status: UserStatus
+}
+
+export interface SessionResponse {
+  authenticated: boolean
+  configured: boolean
+  user: SessionUser | null
+}
+
+export interface LoginResponse {
+  authenticated: boolean
+  restricted?: boolean
+  user: SessionUser
+}
+
+export interface RegisterResponse {
+  user_id: number | null
+  verification_required: boolean
 }
 
 /**

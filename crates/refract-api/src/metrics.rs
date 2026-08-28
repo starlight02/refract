@@ -86,12 +86,20 @@ pub struct GatewayMetrics {
     output_tokens: AtomicU64,
     /// 上游重试累计。
     retries: AtomicU64,
+    /// 钱包扣款失败累计（记账失败不回滚请求，只计数告警）。
+    wallet_charge_failures: AtomicU64,
     /// 请求总耗时直方图。
     duration: Histogram<10>,
     /// 首字延迟直方图（仅有 TTFB 的请求）。
     ttfb: Histogram<9>,
     /// 按渠道名的 (请求, 失败) 计数。个人场景基数极低，无爆炸风险。
     by_channel: Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    /// 按用户 ID 的请求数。仅 `metrics.per_user` 开启时采集（高基数预警）。
+    per_user_requests: Mutex<std::collections::BTreeMap<i64, u64>>,
+    /// 是否采集 per-user 指标。
+    per_user_enabled: std::sync::atomic::AtomicBool,
+    /// 按用户 ID 的钱包余额。仅在 Prometheus 抓取时刷新，避免请求热路径写锁。
+    wallet_balances: Mutex<std::collections::BTreeMap<i64, f64>>,
 }
 
 impl Default for GatewayMetrics {
@@ -105,9 +113,13 @@ impl Default for GatewayMetrics {
             input_tokens: AtomicU64::new(0),
             output_tokens: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            wallet_charge_failures: AtomicU64::new(0),
             duration: Histogram::new(),
             ttfb: Histogram::new(),
             by_channel: Mutex::new(std::collections::BTreeMap::new()),
+            per_user_requests: Mutex::new(std::collections::BTreeMap::new()),
+            per_user_enabled: std::sync::atomic::AtomicBool::new(false),
+            wallet_balances: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 }
@@ -120,10 +132,45 @@ fn slot(protocol: Protocol) -> usize {
 }
 
 impl GatewayMetrics {
+    /// 钱包扣款失败计数（记账失败不影响已完成的请求，但必须可观测）。
+    pub fn note_wallet_charge_failure(&self) {
+        self.wallet_charge_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 开关 per-user 指标采集（settings `metrics.per_user`）。
+    pub fn set_per_user_enabled(&self, enabled: bool) {
+        self.per_user_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 是否已启用 per-user 指标。
+    pub fn per_user_enabled(&self) -> bool {
+        self.per_user_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 使用一次抓取时读取的钱包余额替换 gauge 快照。
+    pub fn set_wallet_balances(&self, balances: impl IntoIterator<Item = (i64, f64)>) {
+        let mut snapshot = self.wallet_balances.lock().expect("wallet metrics lock");
+        snapshot.clear();
+        snapshot.extend(balances);
+    }
+
     /// 从一条请求日志采集指标。与日志同源，两边永远一致。
     pub fn observe(&self, entry: &NewRequestLog) {
         let idx = slot(entry.inbound_protocol);
         self.requests[idx].fetch_add(1, Ordering::Relaxed);
+        if self
+            .per_user_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(uid) = entry.user_id
+        {
+            let mut map = self
+                .per_user_requests
+                .lock()
+                .expect("per-user metrics lock");
+            *map.entry(uid).or_insert(0) += 1;
+        }
         if entry.status >= 400 {
             self.failures[idx].fetch_add(1, Ordering::Relaxed);
         }
@@ -210,6 +257,11 @@ impl GatewayMetrics {
                 "Upstream retries performed by the router.",
                 self.retries.load(Ordering::Relaxed),
             ),
+            (
+                "refract_wallet_charge_failures_total",
+                "Wallet charge failures (charging never rolls back a completed request).",
+                self.wallet_charge_failures.load(Ordering::Relaxed),
+            ),
         ] {
             let _ = writeln!(
                 out,
@@ -258,6 +310,39 @@ impl GatewayMetrics {
             }
         }
 
+        if self
+            .per_user_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let map = self
+                .per_user_requests
+                .lock()
+                .expect("per-user metrics lock");
+            let _ = writeln!(
+                out,
+                "# HELP refract_user_requests_total Gateway requests per user (opt-in high cardinality).\n\
+                 # TYPE refract_user_requests_total counter"
+            );
+            for (user_id, requests) in map.iter() {
+                let _ = writeln!(
+                    out,
+                    "refract_user_requests_total{{user_id=\"{user_id}\"}} {requests}"
+                );
+            }
+            let balances = self.wallet_balances.lock().expect("wallet metrics lock");
+            let _ = writeln!(
+                out,
+                "# HELP refract_wallet_balance Current prepaid wallet balance per user (opt-in high cardinality).\n\
+                 # TYPE refract_wallet_balance gauge"
+            );
+            for (user_id, balance) in balances.iter() {
+                let _ = writeln!(
+                    out,
+                    "refract_wallet_balance{{user_id=\"{user_id}\"}} {balance}"
+                );
+            }
+        }
+
         let _ = writeln!(
             out,
             "# HELP refract_uptime_seconds Seconds since the process started.\n\
@@ -276,6 +361,7 @@ mod tests {
     fn entry(protocol: Protocol, status: u16) -> NewRequestLog {
         NewRequestLog {
             owner_id: 1,
+            user_id: None,
             request_id: "r".into(),
             api_key_id: None,
             channel_id: None,
@@ -346,5 +432,22 @@ mod tests {
         // 渠道标签计数。
         assert!(text.contains(r#"refract_channel_requests_total{channel="主力站"} 2"#));
         assert!(text.contains(r#"refract_channel_failures_total{channel="主力站"} 1"#));
+    }
+
+    #[test]
+    fn per_user_metrics_are_opt_in_and_include_wallet_gauges() {
+        let metrics = GatewayMetrics::default();
+        let mut log = entry(Protocol::Chat, 200);
+        log.user_id = Some(42);
+        metrics.observe(&log);
+        metrics.set_wallet_balances([(42, 1.25)]);
+        assert!(!metrics.render().contains("refract_user_requests_total"));
+        assert!(!metrics.render().contains("refract_wallet_balance"));
+
+        metrics.set_per_user_enabled(true);
+        metrics.observe(&log);
+        let text = metrics.render();
+        assert!(text.contains(r#"refract_user_requests_total{user_id="42"} 1"#));
+        assert!(text.contains(r#"refract_wallet_balance{user_id="42"} 1.25"#));
     }
 }

@@ -3,7 +3,7 @@ import net from 'node:net'
 
 import { expect, test } from '@playwright/test'
 
-import { loginAsAdmin, readIssuedAdminToken } from './auth.js'
+import { loginAsAdmin, loginAsUser, readIssuedAdminToken } from './auth.js'
 
 /**
  * 端到端测试：对着真实的生产形态跑。
@@ -45,6 +45,8 @@ interface SeenRequest {
 let upstream: http.Server
 let upstreamUrl = ''
 let lastSeen: SeenRequest | null = null
+/** 管理面网关测试用的 API key（require_auth=true 时必须带）。 */
+let gatewayKey = ''
 
 /** 找一个确定空闲的端口：先绑定再关闭，随即把端口让给「死上游」用。 */
 function findDeadPort(): Promise<number> {
@@ -113,6 +115,40 @@ test.beforeAll(async () => {
     throw new Error('fake upstream failed to start')
   }
   upstreamUrl = `http://127.0.0.1:${address.port}`
+
+  const token = await readIssuedAdminToken()
+  const loginRes = await fetch('http://127.0.0.1:4539/api/auth/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token }),
+  })
+  if (!loginRes.ok) {
+    throw new Error(`e2e bootstrap login failed: ${loginRes.status} ${await loginRes.text()}`)
+  }
+  const cookie = (loginRes.headers.get('set-cookie') ?? '').split(';')[0] ?? ''
+  const sessRes = await fetch('http://127.0.0.1:4539/api/auth/session', { headers: { cookie } })
+  const sessJson = (await sessRes.json()) as { data: { user: { id: number } } }
+  const topupRes = await fetch(
+    `http://127.0.0.1:4539/api/admin/users/${sessJson.data.user.id}/wallet/topup`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ amount: 1000, note: 'e2e-admin' }),
+    },
+  )
+  if (!topupRes.ok) {
+    throw new Error(`e2e bootstrap topup failed: ${topupRes.status} ${await topupRes.text()}`)
+  }
+  const keyRes = await fetch('http://127.0.0.1:4539/api/me/keys', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ name: 'e2e-gateway' }),
+  })
+  if (!keyRes.ok) {
+    throw new Error(`e2e bootstrap key failed: ${keyRes.status} ${await keyRes.text()}`)
+  }
+  const keyJson = (await keyRes.json()) as { data: { plaintext: string } }
+  gatewayKey = keyJson.data.plaintext
 })
 
 test.afterAll(async () => {
@@ -134,10 +170,12 @@ async function gatewayFetch(
     await page.goto('/')
   }
   return page.evaluate(
-    async ([url, b]) => {
+    async ([url, b, key]) => {
+      const headers: Record<string, string> = { 'content-type': 'application/json' }
+      if (key) headers.authorization = `Bearer ${key}`
       const response = await fetch(url as string, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers,
         body: JSON.stringify(b),
       })
       const text = await response.text()
@@ -149,7 +187,7 @@ async function gatewayFetch(
       }
       return { status: response.status, body: parsed }
     },
-    [`${base}${path}`, body] as const,
+    [`${base}${path}`, body, gatewayKey] as const,
   )
 }
 
@@ -161,7 +199,7 @@ test('仪表盘能打开并展示指标卡', async ({ page }) => {
 })
 
 test('通过编辑器创建渠道', async ({ page }) => {
-  await page.goto('/channels')
+  await page.goto('/admin/channels')
   await page.getByRole('button', { name: '新建渠道' }).click()
   await expect(page.getByRole('heading', { name: '新建渠道' })).toBeVisible()
 
@@ -201,18 +239,18 @@ test('网关把原生 chat 请求路由到上游并落日志', async ({ page, ba
   expect(lastSeen?.body.model).toBe('gpt-4o')
 
   // 日志落库是异步的：先轮询 API 等行出现，再打开日志页验证展示。
-  await page.goto('/channels')
+  await page.goto('/admin/channels')
   await expect
     .poll(async () =>
       page.evaluate(async () => {
-        const response = await fetch('/api/logs')
+        const response = await fetch('/api/admin/logs')
         const envelope = (await response.json()) as { data: unknown[] }
         return envelope.data.length
       }),
     )
     .toBeGreaterThan(0)
 
-  await page.goto('/logs')
+  await page.goto('/admin/logs')
   await expect(page.locator('table')).toContainText('gpt-4o')
   await expect(page.locator('table')).toContainText('E2E 主渠道')
 })
@@ -268,7 +306,7 @@ test('未授权的协议转换被明确拒绝', async ({ page, baseURL }) => {
 })
 
 test('开启协议转换后 Messages 客户端能打到 Chat 上游', async ({ page, baseURL }) => {
-  await page.goto('/channels')
+  await page.goto('/admin/channels')
   await page.getByRole('button', { name: '编辑' }).click()
   await expect(page.getByRole('heading', { name: '编辑渠道' })).toBeVisible()
 
@@ -303,7 +341,7 @@ test('开启协议转换后 Messages 客户端能打到 Chat 上游', async ({ p
 })
 
 test('模型映射可原地编辑，保存后上游名被改写', async ({ page, baseURL }) => {
-  await page.goto('/channels')
+  await page.goto('/admin/channels')
   await page.getByRole('button', { name: '编辑' }).click()
   await expect(page.getByRole('heading', { name: '编辑渠道' })).toBeVisible()
 
@@ -356,7 +394,7 @@ test('模型映射可原地编辑，保存后上游名被改写', async ({ page,
 })
 
 test('复制渠道产生禁用副本，批量操作可以删掉它', async ({ page }) => {
-  await page.goto('/channels')
+  await page.goto('/admin/channels')
   await page.getByRole('button', { name: '复制' }).click()
 
   // 复制后直接进入副本的编辑页。
@@ -383,7 +421,7 @@ test('复制渠道产生禁用副本，批量操作可以删掉它', async ({ pa
 })
 
 test('编辑渠道不碰密钥时，掩码不会毁掉已保存的凭据', async ({ page, baseURL }) => {
-  await page.goto('/channels')
+  await page.goto('/admin/channels')
   await page.getByRole('button', { name: '编辑' }).click()
   await expect(page.getByRole('heading', { name: '编辑渠道' })).toBeVisible()
 
@@ -425,7 +463,7 @@ test('API 密钥明文只出现一次', async ({ page }) => {
 })
 
 test('路由策略修改后持久化', async ({ page }) => {
-  await page.goto('/settings')
+  await page.goto('/admin/settings')
   const nativeFirst = page.getByRole('switch', { name: '原生优先' })
   await expect(nativeFirst).toBeChecked()
 
@@ -443,7 +481,7 @@ test('路由策略修改后持久化', async ({ page }) => {
 })
 
 test('200 空回复策略使用默认值、可持久化并热更新严格模式', async ({ page, baseURL }) => {
-  await page.goto('/settings')
+  await page.goto('/admin/settings')
   const window = page.getByRole('spinbutton', { name: '判定窗口（秒）' })
   const retries = page.getByRole('spinbutton', { name: '最大重试次数' }).last()
   const strict200 = page.getByRole('switch', { name: '非标准 200 转为 500' })
@@ -479,7 +517,7 @@ test('200 空回复策略使用默认值、可持久化并热更新严格模式'
 })
 
 test('日志保留设置经过 API 持久化并守住输入范围', async ({ page }) => {
-  await page.goto('/settings')
+  await page.goto('/admin/settings')
   const retention = page.getByRole('spinbutton', { name: '保留天数' })
   await expect(retention).toHaveValue('30')
 
@@ -499,7 +537,7 @@ test('日志保留设置经过 API 持久化并守住输入范围', async ({ pag
 })
 
 test('熔断参数可调、持久化并拒绝非法组合', async ({ page }) => {
-  await page.goto('/settings')
+  await page.goto('/admin/settings')
   const threshold = page.getByRole('spinbutton', { name: '熔断失败阈值' })
   const base = page.getByRole('spinbutton', { name: '熔断起始冷却秒数' })
   const max = page.getByRole('spinbutton', { name: '熔断冷却上限秒数' })
@@ -544,8 +582,9 @@ test('未登录时管理界面被挡住，正确令牌可进入', async ({ page,
   await page.goto('/')
   await expect(page.getByRole('heading', { name: '管理端身份验证' })).toBeVisible()
 
+  await page.locator('summary').click()
   const tokenInput = page.getByPlaceholder('adm_... 或自定义管理令牌')
-  const submit = page.locator('form button[type="submit"]')
+  const submit = page.locator('form button[type="submit"]').first()
   await tokenInput.fill('wrong-token')
   await expect(submit).toBeEnabled()
   await submit.click()
@@ -561,10 +600,10 @@ test('连续失败触发熔断，界面可见且可手动解除', async ({ page,
   const deadPort = await findDeadPort()
 
   // 用管理 API 建一个指向死端口的渠道（UI 流程已在创建用例里覆盖过）。
-  await page.goto('/channels')
+  await page.goto('/admin/channels')
   const created = await page.evaluate(
     async ([port]) => {
-      const response = await fetch('/api/channels', {
+      const response = await fetch('/api/admin/channels', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -626,7 +665,7 @@ test('连续失败触发熔断，界面可见且可手动解除', async ({ page,
   await expect
     .poll(async () =>
       page.evaluate(async () => {
-        const response = await fetch('/api/health/channels')
+        const response = await fetch('/api/admin/health/channels')
         const envelope = (await response.json()) as {
           data: Array<{ suspended_until: string | null }>
         }
@@ -655,7 +694,7 @@ test('仪表盘汇总了全部流量', async ({ page }) => {
 })
 
 test('设置页可导出备份，导回时同名渠道被跳过', async ({ page }) => {
-  await page.goto('/settings')
+  await page.goto('/admin/settings')
 
   // 导出触发浏览器下载，内容是完整的备份文档。
   const downloadPromise = page.waitForEvent('download')
@@ -671,7 +710,7 @@ test('设置页可导出备份，导回时同名渠道被跳过', async ({ page 
     keys: Array<{ key_hash: string }>
     settings: { log_retention_days: number }
   }
-  expect(document_.version).toBe(1)
+  expect(document_.version).toBe(2)
   expect(document_.channels.map((c) => c.name)).toContain('E2E 主渠道')
   // 备份必须可恢复：渠道凭据是明文（统一存钥匙池），密钥带哈希。
   expect(document_.channels.find((c) => c.name === 'E2E 主渠道')?.credentials).toEqual([
@@ -680,11 +719,11 @@ test('设置页可导出备份，导回时同名渠道被跳过', async ({ page 
 
   // merge 导回：所有内容同名/同哈希，必须全部跳过而不产生重复。
   const before = await page.evaluate(async () => {
-    const response = await fetch('/api/channels')
+    const response = await fetch('/api/admin/channels')
     return ((await response.json()) as { data: unknown[] }).data.length
   })
   const result = await page.evaluate(async (doc) => {
-    const response = await fetch('/api/import', {
+    const response = await fetch('/api/admin/import', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ mode: 'merge', data: doc }),
@@ -693,18 +732,18 @@ test('设置页可导出备份，导回时同名渠道被跳过', async ({ page 
   }, document_)
   expect(result.data.channels_imported).toBe(0)
   const after = await page.evaluate(async () => {
-    const response = await fetch('/api/channels')
+    const response = await fetch('/api/admin/channels')
     return ((await response.json()) as { data: unknown[] }).data.length
   })
   expect(after).toBe(before)
 })
 
 test('替换导入需要二次确认，取消则不动数据', async ({ page }) => {
-  await page.goto('/settings')
+  await page.goto('/admin/settings')
 
   // 直接从 API 拿备份文档，UI 下载路径上一条已经验过。
   const document_ = await page.evaluate(async () => {
-    const response = await fetch('/api/export')
+    const response = await fetch('/api/admin/export')
     return ((await response.json()) as { data: unknown }).data
   })
 
@@ -717,7 +756,7 @@ test('替换导入需要二次确认，取消则不动数据', async ({ page }) 
   }
 
   const before = await page.evaluate(async () => {
-    const response = await fetch('/api/channels')
+    const response = await fetch('/api/admin/channels')
     return ((await response.json()) as { data: Array<{ id: number }> }).data.length
   })
 
@@ -728,7 +767,7 @@ test('替换导入需要二次确认，取消则不动数据', async ({ page }) 
   await dialog.getByRole('button', { name: '取消' }).click()
   await expect(dialog).toBeHidden()
   const afterCancel = await page.evaluate(async () => {
-    const response = await fetch('/api/channels')
+    const response = await fetch('/api/admin/channels')
     return ((await response.json()) as { data: Array<{ id: number }> }).data.length
   })
   expect(afterCancel).toBe(before)
@@ -738,14 +777,14 @@ test('替换导入需要二次确认，取消则不动数据', async ({ page }) 
   await dialog.getByRole('button', { name: '确认替换' }).click()
   await expect(page.getByRole('status')).toContainText('导入完成')
   const afterReplace = await page.evaluate(async () => {
-    const response = await fetch('/api/channels')
+    const response = await fetch('/api/admin/channels')
     return ((await response.json()) as { data: Array<{ id: number }> }).data.length
   })
   expect(afterReplace).toBe(before)
 })
 
 test('调试台走完整网关管线并流式渲染回复', async ({ page }) => {
-  await page.goto('/playground')
+  await page.goto('/admin/playground')
   await expect(page.getByRole('heading', { name: '调试台' })).toBeVisible()
 
   // 模型下拉由 /api/models 派生；显式选中目标模型（列表里可能还有
@@ -763,7 +802,7 @@ test('调试台走完整网关管线并流式渲染回复', async ({ page }) => 
 
 test('日志详情弹窗展示完整请求与响应正文', async ({ page }) => {
   // serial 前序用例刚发过调试台流式请求：最新一条日志就是它。
-  await page.goto('/logs')
+  await page.goto('/admin/logs')
   await page.locator('tbody tr').first().click()
   await page.getByRole('button', { name: '查看完整请求' }).click()
 
@@ -778,7 +817,7 @@ test('日志详情弹窗展示完整请求与响应正文', async ({ page }) => 
 })
 
 test('价表在设置页维护，模型页汇总渠道与价格', async ({ page }) => {
-  await page.goto('/settings')
+  await page.goto('/admin/settings')
   await page.getByRole('button', { name: '添加规则' }).click()
   await page.getByLabel('价表第 1 行模式').fill('gpt-4o')
   await page.getByLabel('价表第 1 行输入单价').fill('2.5')
@@ -786,7 +825,7 @@ test('价表在设置页维护，模型页汇总渠道与价格', async ({ page 
   await page.getByRole('button', { name: '保存设置' }).click()
   await expect(page.getByText('已保存')).toBeVisible()
 
-  await page.goto('/models')
+  await page.goto('/admin/models')
   const table = page.locator('table')
   await expect(table).toContainText('gpt-4o')
   await expect(table).toContainText('E2E 主渠道')
@@ -795,7 +834,7 @@ test('价表在设置页维护，模型页汇总渠道与价格', async ({ page 
 })
 
 test('渠道编辑器支持批量粘贴并按多种分隔符自动切分模型标签', async ({ page }) => {
-  await page.goto('/channels/new')
+  await page.goto('/admin/channels/new')
   const input = page.getByRole('textbox', { name: 'Chat 模型输入' })
   await input.focus()
 
@@ -818,7 +857,7 @@ test('渠道编辑器支持批量粘贴并按多种分隔符自动切分模型�
 })
 
 test('表单未保存修改在路由切换时触发确认拦截', async ({ page }) => {
-  await page.goto('/channels/new')
+  await page.goto('/admin/channels/new')
   await page.getByPlaceholder('例如：中转站-主力').fill('草稿渠道')
 
   let dialogMessage = ''
@@ -835,7 +874,7 @@ test('表单未保存修改在路由切换时触发确认拦截', async ({ page 
 })
 
 test('请求日志行支持键盘 Enter/Space 展开折叠与 ARIA 状态更新', async ({ page }) => {
-  await page.goto('/logs')
+  await page.goto('/admin/logs')
   const row = page.locator('tbody tr[role="button"]').first()
   await expect(row).toBeVisible()
   await expect(row).toHaveAttribute('aria-expanded', 'false')
@@ -850,4 +889,113 @@ test('请求日志行支持键盘 Enter/Space 展开折叠与 ARIA 状态更新'
   await row.press('Space')
   await expect(row).toHaveAttribute('aria-expanded', 'false')
   await expect(detailRow).toBeHidden()
+})
+
+test('新用户注册验证后可建密钥、调模型并扣减钱包', async ({ page, baseURL }) => {
+  const email = `e2e-${Date.now()}@example.com`
+  const password = 'Passw0rd1234'
+  const register = await page.request.post('/api/auth/register', {
+    data: { email, password, display_name: 'E2E User' },
+  })
+  expect(register.ok(), await register.text()).toBeTruthy()
+  const registered = (await register.json()) as { data: { user_id: number | null } }
+  expect(registered.data.user_id).toBeTruthy()
+  const userId = registered.data.user_id as number
+
+  const codes = await page.request.get(`/api/auth/dev-codes?email=${encodeURIComponent(email)}`)
+  expect(codes.ok(), await codes.text()).toBeTruthy()
+  const codeBody = (await codes.json()) as { data: { code: string | null } }
+  expect(codeBody.data.code).toBeTruthy()
+
+  const verify = await page.request.post('/api/auth/verify-email', {
+    data: { email, code: codeBody.data.code },
+  })
+  expect(verify.ok(), await verify.text()).toBeTruthy()
+
+  const topup = await page.request.post(`/api/admin/users/${userId}/wallet/topup`, {
+    data: { amount: 10, note: 'e2e' },
+  })
+  expect(topup.ok(), await topup.text()).toBeTruthy()
+
+  await loginAsUser(page, email, password)
+
+  await page.goto('/keys')
+  await page.getByRole('button', { name: '新建密钥' }).click()
+  await page.getByPlaceholder('例如：本地开发').fill('E2E 用户钥')
+  await page.getByRole('button', { name: '创建' }).click()
+  const plaintext = (await page.getByRole('dialog').locator('code').innerText()).trim()
+  expect(plaintext.length).toBeGreaterThan(8)
+  await page.getByRole('button', { name: '我已保存，关闭' }).click()
+
+  const result = await page.evaluate(
+    async ([url, key]) => {
+      const response = await fetch(url as string, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${key as string}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o',
+          messages: [{ role: 'user', content: 'ping wallet' }],
+        }),
+      })
+      const text = await response.text()
+      return { status: response.status, text }
+    },
+    [`${baseURL}/v1/chat/completions`, plaintext] as const,
+  )
+  expect(result.status).toBe(200)
+
+  await expect
+    .poll(async () => {
+      const wallet = await page.request.get('/api/me/wallet')
+      const body = (await wallet.json()) as { data: { balance: number } }
+      return body.data.balance
+    })
+    .toBeLessThan(10)
+
+  const exported = await page.request.get('/api/me/wallet/ledger/export?format=csv')
+  expect(exported.ok(), await exported.text()).toBeTruthy()
+  const csv = await exported.text()
+  expect(csv).toMatch(/topup|charge/)
+})
+
+test('管理员建用户充值后禁用，其密钥调网关 403', async ({ page, baseURL }) => {
+  const email = `e2e-dis-${Date.now()}@example.com`
+  const password = 'Passw0rd1234'
+  const created = await page.request.post('/api/admin/users', {
+    data: { email, password, display_name: 'Disabled User', initial_balance: 5 },
+  })
+  expect(created.ok(), await created.text()).toBeTruthy()
+  const user = (await created.json()) as { data: { id: number } }
+
+  await loginAsUser(page, email, password)
+  const keyRes = await page.request.post('/api/me/keys', { data: { name: 'doomed' } })
+  expect(keyRes.ok(), await keyRes.text()).toBeTruthy()
+  const createdKey = (await keyRes.json()) as { data: { plaintext: string } }
+  const key = createdKey.data.plaintext
+
+  await loginAsAdmin(page)
+  const disabled = await page.request.post(`/api/admin/users/${user.data.id}/disable`)
+  expect(disabled.ok(), await disabled.text()).toBeTruthy()
+
+  const result = await page.evaluate(
+    async ([url, token]) => {
+      const response = await fetch(url as string, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${token as string}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o',
+          messages: [{ role: 'user', content: 'should fail' }],
+        }),
+      })
+      return response.status
+    },
+    [`${baseURL}/v1/chat/completions`, key] as const,
+  )
+  expect(result).toBe(403)
 })

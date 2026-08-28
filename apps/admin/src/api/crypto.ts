@@ -72,7 +72,7 @@ export async function getServerPublicKey(): Promise<ServerPublicKeyCache> {
   // 否则一次失败会把后续所有调用永久钉在这个已拒绝的 promise 上。
   pendingFetch = runPromise(
     gen(function* () {
-      const res = yield* promise(() => fetch('/api/crypto/public-key'))
+      const res = yield* promise(() => fetch('/api/admin/crypto/public-key'))
       if (!res.ok) {
         return yield* fail(new Error(`Failed to fetch server public key: HTTP ${res.status}`))
       }

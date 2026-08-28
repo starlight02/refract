@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
-import { logs } from '@/api/client'
+import { type ApiScope, scopedLogs } from '@/api/client'
 import type { RequestLog, LogFilter } from '@refract/contracts'
 import { isSuccess, settled } from '@/utils/effect'
 import { toErrorMessage, withStoreError } from './shared'
@@ -12,40 +12,34 @@ const DEFAULT_LIMIT = 100
  * 请求日志。筛选条件存在 store 里而非视图里，
  * 这样「清理旧日志」之后能用同一套条件自动重查，不必让视图重新拼参数。
  */
-export const useLogsStore = defineStore('logs', () => {
-  const items = ref<RequestLog[]>([])
-  const loading = ref(false)
-  const error = ref<string | null>(null)
-  /** 最近一次生效的筛选条件。 */
-  const filter = ref<LogFilter>({ limit: DEFAULT_LIMIT, offset: 0 })
+export function useLogsStore(scope: ApiScope = 'admin') {
+  return defineStore(`logs:${scope}`, () => {
+    const api = scopedLogs(scope)
+    const items = ref<RequestLog[]>([])
+    const loading = ref(false)
+    const error = ref<string | null>(null)
+    const filter = ref<LogFilter>({ limit: DEFAULT_LIMIT, offset: 0 })
 
-  /**
-   * 请求序号。用户连续切换筛选/翻页时会有多个查询在飞，
-   * 只有最新一次的结果允许落地 —— 否则先发慢回的旧结果会覆盖新结果。
-   */
-  let fetchSeq = 0
+    let fetchSeq = 0
 
-  /** 传 filter 则替换当前条件；不传则沿用上次条件重查。 */
-  async function fetch(next?: LogFilter) {
-    if (next !== undefined) filter.value = { limit: DEFAULT_LIMIT, offset: 0, ...next }
-    const seq = ++fetchSeq
-    loading.value = true
-    error.value = null
-    const outcome = await settled(() => logs.query(filter.value))
-    // 陈旧响应直接丢弃：连点筛选时，先发慢回的旧结果既不该覆盖列表，
-    // 也不该把已经过期的失败写成当前错误。
-    if (seq !== fetchSeq) return
-    loading.value = false
-    if (isSuccess(outcome)) items.value = outcome.success
-    else error.value = toErrorMessage(outcome.failure)
-  }
+    async function fetch(next?: LogFilter) {
+      if (next !== undefined) filter.value = { limit: DEFAULT_LIMIT, offset: 0, ...next }
+      const seq = ++fetchSeq
+      loading.value = true
+      error.value = null
+      const outcome = await settled(() => api.query(filter.value))
+      if (seq !== fetchSeq) return
+      loading.value = false
+      if (isSuccess(outcome)) items.value = outcome.success
+      else error.value = toErrorMessage(outcome.failure)
+    }
 
-  /** 清理 N 天前的日志，返回删除条数，并按当前条件刷新列表。 */
-  async function prune(days: number): Promise<number> {
-    const { removed } = await withStoreError(error, () => logs.prune(days))
-    await fetch()
-    return removed
-  }
+    async function prune(days: number): Promise<number> {
+      const { removed } = await withStoreError(error, () => api.prune(days))
+      await fetch()
+      return removed
+    }
 
-  return { items, loading, error, filter, fetch, prune }
-})
+    return { items, loading, error, filter, fetch, prune }
+  })()
+}

@@ -12,7 +12,7 @@ use base64::Engine as _;
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use refract_api::AppState;
-use refract_store::Database;
+use refract_store::{Database, SettingsRepo};
 use refract_upstream::{UpstreamClient, UpstreamClientConfig};
 use tracing_subscriber::EnvFilter;
 
@@ -48,6 +48,12 @@ struct Config {
     master_key: Option<String>,
     /// 是否强制重置管理员账号并重新生成初始凭据文件。
     reset_admin: bool,
+    /// 开发模式（REFRACT_DEV_MODE=1）：验证码走 log，开 dev-codes 钩子。
+    dev_mode: bool,
+    /// SMTP submission URL。显式配置时启动时覆盖数据库 mail.smtp_url。
+    smtp_url: Option<String>,
+    /// 验证邮件发件人。显式配置时启动时覆盖数据库 mail.from。
+    mail_from: Option<String>,
     /// TLS 证书 PEM。与 `tls_key` 成对出现时启用 HTTPS（HTTP/1.1+HTTP/2）和 HTTP/3。
     tls_cert: Option<String>,
     /// TLS 私钥 PEM。与 `tls_cert` 成对出现时启用 HTTPS 和 HTTP/3。
@@ -66,6 +72,9 @@ impl Default for Config {
             proxy: None,
             master_key: None,
             reset_admin: false,
+            dev_mode: false,
+            smtp_url: None,
+            mail_from: None,
             tls_cert: None,
             tls_key: None,
         }
@@ -137,6 +146,24 @@ fn main() -> Result<()> {
             .await
             .with_context(|| format!("failed to open database at `{}`", config.database))?;
 
+        // SMTP 是全局管理级配置。仅显式给出任一启动配置时才写库，避免每次
+        // 启动把管理面已保存的另一半配置清空。
+        if config.smtp_url.is_some() || config.mail_from.is_some() {
+            let settings = SettingsRepo::new(db.clone());
+            let smtp_url = match &config.smtp_url {
+                Some(url) => Some(url.clone()),
+                None => settings.smtp_url().await?,
+            };
+            let mail_from = match &config.mail_from {
+                Some(from) => Some(from.clone()),
+                None => settings.mail_from().await?,
+            };
+            settings
+                .set_mail(smtp_url.as_deref(), mail_from.as_deref())
+                .await
+                .context("failed to persist SMTP configuration")?;
+        }
+
         let client = UpstreamClient::new(config.upstream())
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("failed to build the upstream HTTP client")?;
@@ -156,6 +183,12 @@ fn main() -> Result<()> {
         )
         .await
         .context("failed to load configuration from the database")?;
+        if config.dev_mode {
+            state.set_dev_mode(true);
+            tracing::warn!(
+                "REFRACT_DEV_MODE=1: verification codes logged, dev-codes endpoint enabled"
+            );
+        }
 
         if explicit_master_key.is_none() {
             if state.master_key().is_some() {
@@ -394,41 +427,104 @@ async fn apply_bootstrap_admin_token(config: &Config, state: &AppState) -> Resul
         .await
         .unwrap_or(None)
         .unwrap_or(false);
+    let user_repo = state.user_repo();
+    let existing_admin = user_repo.find_by_email("admin@localhost").await?;
 
-    if is_initialized && !config.reset_admin {
+    // 管理令牌与登录密码是两条独立恢复路径：
+    // - 初始安装或 --reset-admin 才轮换 adm_ token；升级绝不让旧脚本失效。
+    // - 缺失/空密码哈希的旧单用户库补发初始密码，避免迁移后无法邮箱登录。
+    let rotate_token = !is_initialized || config.reset_admin;
+    let initialize_password = config.reset_admin
+        || existing_admin
+            .as_ref()
+            .is_none_or(|user| user.password_hash.trim().is_empty());
+    let token_bytes: [u8; 32] = {
+        use rand::RngExt as _;
+        rand::rng().random()
+    };
+    let password_bytes: [u8; 18] = {
+        use rand::RngExt as _;
+        rand::rng().random()
+    };
+    let generated_token = format!(
+        "adm_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
+    );
+    let generated_password =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password_bytes);
+
+    if rotate_token {
+        let hash = refract_store::ApiKeyRepo::hash(&generated_token);
+        settings
+            .bootstrap_admin(&hash, "admin@localhost")
+            .await
+            .context("failed to persist bootstrap admin credentials")?;
+    }
+
+    let password_hash = if initialize_password {
+        Some(
+            refract_api::mail::hash_password(&generated_password)
+                .map_err(|e| anyhow::anyhow!("failed to hash bootstrap admin password: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    // 多用户 bootstrap：创建/补全 admin 用户，并把所有历史数据归属到它。
+    let admin_user = match existing_admin {
+        Some(existing) => {
+            user_repo.set_role_admin(existing.id).await?;
+            if let Some(hash) = password_hash.as_deref() {
+                user_repo.set_password_hash(existing.id, hash).await?;
+                user_repo.mark_email_verified(existing.id).await?;
+            }
+            existing.id
+        }
+        None => {
+            let hash = password_hash.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("new bootstrap admin requires an initial password")
+            })?;
+            user_repo
+                .create_first_admin_if_empty("admin@localhost", hash)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("bootstrap admin race: user table not empty"))?
+                .id
+        }
+    };
+    state.set_bootstrap_admin_id(admin_user);
+    user_repo
+        .backfill_owner_columns(admin_user)
+        .await
+        .context("failed to backfill legacy rows to bootstrap admin")?;
+
+    if !rotate_token && !initialize_password {
         if token_file_path.exists() {
             let _ = tokio::fs::remove_file(&token_file_path).await;
         }
         return Ok(());
     }
 
-    let random_bytes: [u8; 32] = {
-        use rand::RngExt as _;
-        rand::rng().random()
-    };
-    let admin_token = format!(
-        "adm_{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes)
-    );
-
-    let hash = refract_store::ApiKeyRepo::hash(&admin_token);
-    settings
-        .bootstrap_admin(&hash, "admin@localhost")
-        .await
-        .context("failed to persist bootstrap admin credentials")?;
-
     let now = chrono::Utc::now();
     let expires_at = now + chrono::Duration::minutes(10);
+    let token_line = if rotate_token {
+        format!("admin_token={generated_token}\n")
+    } else {
+        "# Existing admin token was retained; use your previous adm_ token.\n".to_owned()
+    };
+    let password_line = if initialize_password {
+        format!("admin_password={generated_password}\n")
+    } else {
+        String::new()
+    };
     let content = format!(
-        "# Refract Initial Bootstrap Admin Credentials\n\
+        "# Refract Bootstrap Admin Credentials\n\
          # Generated at: {}\n\
          # Expires at:   {}\n\
          # NOTICE: This file is restricted to 0600 permissions and will be automatically deleted in 10 minutes (TTL).\n\n\
          username=admin@localhost\n\
-         admin_token={}\n",
+         {token_line}{password_line}",
         now.to_rfc3339(),
         expires_at.to_rfc3339(),
-        admin_token
     );
 
     write_owner_only_file(&token_file_path, &content).with_context(|| {
@@ -441,7 +537,7 @@ async fn apply_bootstrap_admin_token(config: &Config, state: &AppState) -> Resul
     println!(
         "\n\
         ╔══════════════════════════════════════════════════════════════════════════════════════╗\n\
-        ║ Refract Initial Bootstrap Admin Credentials Generated                                ║\n\
+        ║ Refract Bootstrap Admin Credentials Generated                                        ║\n\
         ║                                                                                      ║\n\
         ║   Default Account: admin@localhost                                                   ║\n\
         ║   Token File:      {:<69} ║\n\
@@ -454,7 +550,9 @@ async fn apply_bootstrap_admin_token(config: &Config, state: &AppState) -> Resul
         account = "admin@localhost",
         path = %token_file_path.display(),
         ttl_minutes = 10,
-        "bootstrap admin credentials generated and written to hidden file (0600 permissions)"
+        rotated_token = rotate_token,
+        initialized_password = initialize_password,
+        "bootstrap admin credentials written to hidden file (0600 permissions)"
     );
 
     let cleanup_path = token_file_path.clone();

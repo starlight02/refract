@@ -12,6 +12,9 @@ pub mod health_repo;
 pub mod key_repo;
 pub mod log_repo;
 pub mod settings_repo;
+pub mod user_repo;
+pub mod verification_repo;
+pub mod wallet_repo;
 
 pub use channel_repo::ChannelRepo;
 pub use crypto::{
@@ -27,6 +30,9 @@ pub use settings_repo::{
     BackupSettings, GlobalLimits, IpLimits, ModelPrice, SettingsRepo, default_backup_keep,
     price_for,
 };
+pub use user_repo::{NewUser, User, UserRepo, UserRole, UserStatus};
+pub use verification_repo::{CodePurpose, CodeVerifyOutcome, VerificationCode, VerificationRepo};
+pub use wallet_repo::{LedgerEntry, LedgerKind, Wallet, WalletRepo};
 
 /// 确保影响行数大于 0，否则返回 EntityNotFound 错误。
 #[inline]

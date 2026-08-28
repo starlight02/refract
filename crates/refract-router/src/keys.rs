@@ -278,6 +278,8 @@ mod tests {
             extra_headers: Vec::new(),
             test_model: None,
             empty_response_retry: Default::default(),
+            visibility: Default::default(),
+            user_id: None,
         }
     }
 

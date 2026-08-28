@@ -100,17 +100,21 @@ struct BridgeTarget {
     channel_id: refract_core::ChannelId,
     channel_name: String,
     api_key_id: Option<i64>,
+    user_id: Option<i64>,
     upstream_model: String,
     extra_headers: Vec<(String, String)>,
 }
 
 /// 从渠道快照解析 Realtime 的上游地址与凭据。
+///
+/// `resolve_target` 在鉴权之后调用，能拿到 principal，因此渠道池走
+/// [`AppState::channels_for`]（共享 + 本用户私有）。
 fn resolve_target(
     state: &AppState,
     principal: &Principal,
     model: &str,
 ) -> Result<BridgeTarget, AppError> {
-    let channels = state.channels();
+    let channels = state.channels_for(principal.gateway_user_id());
     let allowed: Vec<_> = channels
         .iter()
         .filter(|channel| principal.allows_channel(channel))
@@ -145,6 +149,7 @@ fn resolve_target(
         channel_id: candidate.channel_id(),
         channel_name: candidate.channel.name.clone(),
         api_key_id: principal.key_id(),
+        user_id: principal.user_id,
         upstream_model: upstream_model.to_owned(),
         extra_headers: candidate.channel.extra_headers.clone(),
     })
@@ -405,6 +410,7 @@ async fn log_session(
 ) {
     let entry = refract_store::NewRequestLog {
         owner_id: refract_core::DEFAULT_OWNER_ID,
+        user_id: target.user_id,
         request_id: request_id.to_owned(),
         api_key_id: target.api_key_id,
         channel_id: Some(target.channel_id),
@@ -488,6 +494,8 @@ mod tests {
         let channel = Channel {
             id: 0,
             owner_id: refract_core::DEFAULT_OWNER_ID,
+            visibility: refract_core::ChannelVisibility::Shared,
+            user_id: None,
             name: "realtime".into(),
             kind: ChannelKind::Single(Protocol::Chat),
             enabled: true,

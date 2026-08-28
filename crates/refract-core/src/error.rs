@@ -176,6 +176,9 @@ pub struct GatewayError {
     pub retry_after: Option<std::time::Duration>,
     /// 最后一次尝试使用的密钥脱敏形式（失败日志定位坏 key 用）。
     pub credential_hint: Option<String>,
+    /// 结构化附加字段，原样并入协议错误体（如余额不足的 `balance`）。
+    /// 仅用于客户端可读的诊断信息；不放敏感数据。
+    pub details: Option<serde_json::Value>,
 }
 
 impl GatewayError {
@@ -193,6 +196,7 @@ impl GatewayError {
             upstream_status: None,
             retry_after: None,
             credential_hint: None,
+            details: None,
         }
     }
 
@@ -267,6 +271,12 @@ impl GatewayError {
     /// 附加上游声明的重试等待时长。
     pub fn with_retry_after(mut self, wait: std::time::Duration) -> Self {
         self.retry_after = Some(wait);
+        self
+    }
+
+    /// 附加结构化诊断字段（并入协议错误体）。
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
         self
     }
 

@@ -183,7 +183,7 @@ enum FailureAction {
     /// 轮转到下一把 key：重试同一端点（错误不外抛、不记健康）。
     RotateKey,
     /// 渠道级失败：带上注解后的错误，尝试下一个候选。
-    MoveOn(GatewayError),
+    MoveOn(Box<GatewayError>),
 }
 
 /// 路由执行器。
@@ -359,7 +359,7 @@ impl RouteExecutor {
         match self.handle_failure(candidate, final_error, attempts).await {
             Ok(mut annotated) => {
                 annotated.credential_hint = Some(hint);
-                Ok(FailureAction::MoveOn(annotated))
+                Ok(FailureAction::MoveOn(Box::new(annotated)))
             }
             Err(mut annotated) => {
                 annotated.credential_hint = Some(hint);
@@ -480,7 +480,7 @@ impl RouteExecutor {
                                     Err(e) => return Err(e),
                                     Ok(FailureAction::RotateKey) => continue,
                                     Ok(FailureAction::MoveOn(err)) => {
-                                        last_error = err;
+                                        last_error = *err;
                                         break;
                                     }
                                 }
@@ -497,7 +497,7 @@ impl RouteExecutor {
                             Err(e) => return Err(e),
                             Ok(FailureAction::RotateKey) => continue,
                             Ok(FailureAction::MoveOn(err)) => {
-                                last_error = err;
+                                last_error = *err;
                                 break;
                             }
                         }
@@ -651,7 +651,7 @@ impl RouteExecutor {
                                             continue;
                                         }
                                         Ok(FailureAction::MoveOn(err)) => {
-                                            last_error = err;
+                                            last_error = *err;
                                             break;
                                         }
                                     }
@@ -674,7 +674,7 @@ impl RouteExecutor {
                                     continue;
                                 }
                                 Ok(FailureAction::MoveOn(err)) => {
-                                    last_error = err;
+                                    last_error = *err;
                                     break;
                                 }
                             }
@@ -723,7 +723,7 @@ impl RouteExecutor {
                                         continue;
                                     }
                                     Ok(FailureAction::MoveOn(err)) => {
-                                        last_error = err;
+                                        last_error = *err;
                                         break;
                                     }
                                 }
@@ -781,7 +781,7 @@ impl RouteExecutor {
                                 continue;
                             }
                             Ok(FailureAction::MoveOn(err)) => {
-                                last_error = err;
+                                last_error = *err;
                                 break;
                             }
                         }
@@ -869,7 +869,7 @@ impl RouteExecutor {
                                 continue;
                             }
                             Ok(FailureAction::MoveOn(err)) => {
-                                last_error = err;
+                                last_error = *err;
                                 break;
                             }
                         }
@@ -988,7 +988,7 @@ impl RouteExecutor {
                             Err(e) => return Err(e),
                             Ok(FailureAction::RotateKey) => continue,
                             Ok(FailureAction::MoveOn(err)) => {
-                                last_error = err;
+                                last_error = *err;
                                 break;
                             }
                         },
@@ -997,7 +997,7 @@ impl RouteExecutor {
                         Err(e) => return Err(e),
                         Ok(FailureAction::RotateKey) => continue,
                         Ok(FailureAction::MoveOn(err)) => {
-                            last_error = err;
+                            last_error = *err;
                             break;
                         }
                     },
@@ -1123,7 +1123,7 @@ impl RouteExecutor {
                                         continue;
                                     }
                                     Ok(FailureAction::MoveOn(err)) => {
-                                        last_error = err;
+                                        last_error = *err;
                                         break;
                                     }
                                 }
@@ -1140,7 +1140,7 @@ impl RouteExecutor {
                                     continue;
                                 }
                                 Ok(FailureAction::MoveOn(err)) => {
-                                    last_error = err;
+                                    last_error = *err;
                                     break;
                                 }
                             }
@@ -1217,7 +1217,7 @@ impl RouteExecutor {
                                         continue;
                                     }
                                     Ok(FailureAction::MoveOn(err)) => {
-                                        last_error = err;
+                                        last_error = *err;
                                         break;
                                     }
                                 }
@@ -1235,7 +1235,7 @@ impl RouteExecutor {
                                 continue;
                             }
                             Ok(FailureAction::MoveOn(err)) => {
-                                last_error = err;
+                                last_error = *err;
                                 break;
                             }
                         }

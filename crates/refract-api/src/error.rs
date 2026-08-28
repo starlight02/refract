@@ -69,7 +69,7 @@ pub fn store_to_gateway(err: refract_store::StoreError) -> GatewayError {
 /// 这是四家错误格式的唯一真相来源。
 pub fn error_body(err: &GatewayError, protocol: Protocol) -> Value {
     let message = &err.message;
-    match protocol {
+    let mut body = match protocol {
         // OpenAI Chat / Responses 共用同一形状。
         Protocol::Chat | Protocol::Responses => json!({
             "error": {
@@ -93,7 +93,20 @@ pub fn error_body(err: &GatewayError, protocol: Protocol) -> Value {
                 "status": err.kind.google_status(),
             }
         }),
+    };
+    // 结构化 details（如余额不足的 balance/type）并入 error 对象，
+    // 让 SDK 直接读到机器可判的字段，而不是解析 message 字符串。
+    if let Some(details) = &err.details
+        && let (Some(error_obj), Some(detail_obj)) = (
+            body.get_mut("error").and_then(Value::as_object_mut),
+            details.as_object(),
+        )
+    {
+        for (key, value) in detail_obj {
+            error_obj.insert(key.clone(), value.clone());
+        }
     }
+    body
 }
 
 /// 构造 JSON 响应。
@@ -447,6 +460,17 @@ mod tests {
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "rate_limit_error");
         assert_eq!(body["error"]["message"], "slow down");
+    }
+
+    #[test]
+    fn insufficient_balance_details_merge_into_openai_error() {
+        let err = GatewayError::new(ErrorKind::PermissionDenied, "insufficient balance: 0.0000")
+            .with_details(serde_json::json!({"type": "insufficient_balance", "balance": 0.0}));
+        let body = error_body(&err, Protocol::Chat);
+        assert_eq!(body["error"]["type"], "insufficient_balance");
+        assert_eq!(body["error"]["balance"], 0.0);
+        // message 仍然保留人类可读描述。
+        assert_eq!(body["error"]["message"], "insufficient balance: 0.0000");
     }
 
     #[test]

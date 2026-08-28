@@ -477,7 +477,9 @@ async fn passthrough_response(
     enforce_rate_limit(&state, &principal, inbound, &request_id)?;
     let _concurrency_permit = enforce_global_limits(&state, inbound, &request_id)?;
 
-    let channels = state.channels();
+    // 可见性由 channels_for 保证（共享 + 本用户私有）；allows_channel 只做
+    // tenant owner_id 与密钥标签过滤，owner_id 不是 user_id。
+    let channels = state.channels_for(principal.gateway_user_id());
     let allowed_channels: Vec<_> = channels
         .iter()
         .filter(|channel| principal.allows_channel(channel))
@@ -598,7 +600,14 @@ async fn passthrough_response(
     entry.input_tokens = usage;
     entry.status = response.status().as_u16();
     entry.retries = u32::from(outcome.attempts.saturating_sub(1));
-    record(&context.state, entry, key_id, usage);
+    entry.user_id = context.principal.user_id;
+    record(
+        &context.state,
+        entry,
+        key_id,
+        usage,
+        context.principal.user_id,
+    );
 
     Ok(response)
 }
@@ -657,7 +666,7 @@ fn multipart_model(raw: &[u8]) -> Option<String> {
 }
 
 fn visible_model_names(state: &AppState, principal: &Principal) -> Vec<String> {
-    let channels = state.channels();
+    let channels = state.channels_for(principal.gateway_user_id());
     let allowed_channels: Vec<_> = channels
         .iter()
         .filter(|channel| principal.allows_channel(channel))
@@ -894,7 +903,7 @@ async fn dispatch(
     enforce_rate_limit(&state, &principal, inbound, &request_id)?;
     let concurrency_permit = enforce_global_limits(&state, inbound, &request_id)?;
 
-    let channels = state.channels();
+    let channels = state.channels_for(principal.gateway_user_id());
     let allowed_channels: Vec<_> = channels
         .iter()
         .filter(|channel| principal.allows_channel(channel))
@@ -1024,6 +1033,7 @@ async fn unary_response(
     } = context;
     let owner_id = principal.owner_id;
     let key_id = principal.key_id();
+    let user_id = principal.user_id;
     // 成功 → 写入/刷新亲和绑定（switch_on_success 决定失败后兜底是否改绑）。
     if let Some(decision) = &affinity {
         state.affinity().record(decision, outcome.channel_id);
@@ -1080,7 +1090,8 @@ async fn unary_response(
         .with_routing_context(outcome.credential_hint.clone(), affinity_rule);
     entry.status = response_status;
     entry.retries = u32::from(outcome.attempts.saturating_sub(1));
-    record(&state, entry, key_id, usage.total());
+    entry.user_id = user_id;
+    record(&state, entry, key_id, usage.total(), user_id);
 
     Ok(response)
 }
@@ -1163,6 +1174,7 @@ async fn stream_response(
         state,
         owner_id: principal.owner_id,
         key_id: principal.key_id(),
+        user_id: principal.user_id,
         inbound,
         request_id: request_id.clone(),
         started,
@@ -1191,6 +1203,7 @@ struct StreamContext {
     state: AppState,
     owner_id: i64,
     key_id: Option<i64>,
+    user_id: Option<i64>,
     inbound: Protocol,
     request_id: String,
     started: std::time::Instant,
@@ -1494,6 +1507,7 @@ fn transcoded_stream_response(
         entry.retries = u32::from(context.attempts.saturating_sub(1));
         entry.error_kind = error_kind;
         entry.error_message = error_message;
+        entry.user_id = context.user_id;
         // 上游中途出错（非客户端断开）→ 钉住的渠道失约，按策略解绑；
         // 只解指向本渠道的绑定，避免误伤 switch_on_success=false 下
         // 仍然指向旧渠道的绑定。
@@ -1506,7 +1520,13 @@ fn transcoded_stream_response(
                 .affinity()
                 .forget_if_bound_to(&decision.cache_key, context.channel_id);
         }
-        record(&context.state, entry, context.key_id, usage.total());
+        record(
+            &context.state,
+            entry,
+            context.key_id,
+            usage.total(),
+            context.user_id,
+        );
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
@@ -1694,6 +1714,7 @@ async fn relay_native_stream(
     entry.retries = u32::from(context.attempts.saturating_sub(1));
     entry.error_kind = error_kind;
     entry.error_message = error_message;
+    entry.user_id = context.user_id;
     // 与转码流一致的亲和收尾：只对仍指向本渠道的绑定生效。
     if stream_error.is_some()
         && let Some(decision) = context.affinity.as_ref()
@@ -1704,7 +1725,13 @@ async fn relay_native_stream(
             .affinity()
             .forget_if_bound_to(&decision.cache_key, context.channel_id);
     }
-    record(&context.state, entry, context.key_id, usage.total());
+    record(
+        &context.state,
+        entry,
+        context.key_id,
+        usage.total(),
+        context.user_id,
+    );
 }
 
 /// 复制端到端响应头；逐连接 headers 不能跨代理边界继续传播。
@@ -1827,7 +1854,8 @@ fn log_failure(context: &DispatchContext, err: &GatewayError) {
     entry.retries = u32::from(err.attempts.saturating_sub(1));
     entry.error_kind = Some(err.kind.openai_type().to_owned());
     entry.error_message = Some(err.message.clone());
-    record(&context.state, entry, key_id, 0);
+    entry.user_id = context.principal.user_id;
+    record(&context.state, entry, key_id, 0, context.principal.user_id);
 }
 
 /// 网关级全局准入：RPM / TPM 窗口 + 并发 permit。
@@ -1962,7 +1990,13 @@ pub(crate) fn enforce_ip_limit(
 /// 日志写失败**不能**影响响应 —— 请求已经成功了，因为记账问题给客户端报错
 /// 是本末倒置。落库在后台任务里完成，不占用响应路径：SQLite 写入通常在
 /// 亚毫秒级，但 checkpoint 或磁盘抖动时会到几十毫秒，没理由让客户端等它。
-fn record(state: &AppState, mut entry: NewRequestLog, key_id: Option<i64>, tokens: u64) {
+fn record(
+    state: &AppState,
+    mut entry: NewRequestLog,
+    key_id: Option<i64>,
+    tokens: u64,
+    user_id: Option<i64>,
+) {
     // 成本按落库当时的价表固化进日志：单价会变，历史账单不应跟着变。
     entry.cost = state.cost_for(
         &entry.model,
@@ -1998,6 +2032,35 @@ fn record(state: &AppState, mut entry: NewRequestLog, key_id: Option<i64>, token
                 .await
         {
             tracing::warn!(error = %e, "failed to record api key usage");
+        }
+        // 钱包扣款：幂等键 = request_id，重试不会双扣（store 层唯一索引兜底）。
+        // 扣款失败不回滚已完成的请求 —— 余额由下次请求的预检兜底，失败只计数告警。
+        if let Some(uid) = user_id
+            && entry.cost > 0.0
+        {
+            match state
+                .wallet_repo()
+                .apply(
+                    uid,
+                    -entry.cost,
+                    refract_store::LedgerKind::Charge,
+                    Some(&entry.request_id),
+                    &entry.model,
+                )
+                .await
+            {
+                // 扣款成功后同步预检缓存，让余额耗尽的下一请求立刻被挡，
+                // 而不是等 60 秒 TTL 自然过期。
+                Ok(_) => {
+                    if let Ok(balance) = state.wallet_repo().balance(uid).await {
+                        state.prime_balance_cache(uid, balance);
+                    }
+                }
+                Err(e) => {
+                    state.metrics().note_wallet_charge_failure();
+                    tracing::error!(error = %e, user_id = uid, "failed to charge wallet");
+                }
+            }
         }
     });
 }

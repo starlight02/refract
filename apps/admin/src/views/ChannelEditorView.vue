@@ -19,7 +19,7 @@ import ProbeModelsDialog, {
 import UpstreamAddressFields from '@/components/channel-editor/UpstreamAddressFields.vue'
 import { useAction } from '@/composables/useAction'
 import * as m from '@/paraglide/messages'
-import { channels as channelsApi } from '@/api/client'
+import { type ApiScope, scopedChannels } from '@/api/client'
 import { useChannelsStore } from '@/stores/channels'
 import { numOr, numOrNull } from '@/utils/num'
 import { withoutProtocol, PROTOCOL_ORDER } from '@/components/protocol'
@@ -38,9 +38,16 @@ import {
 import { blankChannel, looksMasked, newEndpoint, poolCredentials } from '@/utils/channel-form'
 import { validateChannel } from '@/utils/channel-validation'
 import type { Channel, ChannelEndpoint, ModelEntry } from '@refract/contracts'
+
+const props = withDefaults(defineProps<{ scope?: ApiScope }>(), { scope: 'admin' })
 const route = useRoute()
 const router = useRouter()
-const store = useChannelsStore()
+const store = useChannelsStore(props.scope)
+const channelsApi = scopedChannels(props.scope)
+
+function listPath(): string {
+  return props.scope === 'admin' ? '/admin/channels' : '/channels'
+}
 const pristineSnapshot = ref('')
 const isSubmitting = ref(false)
 
@@ -104,12 +111,14 @@ const headersError = computed(() => headerRowsError(headerRows.value))
 onMounted(async () => {
   window.addEventListener('beforeunload', onBeforeUnload)
   if (!isEdit.value) {
+    if (props.scope === 'me') form.value.visibility = 'private'
     pristineSnapshot.value = getSnapshot()
     return
   }
   await loadChannel.run(async () => {
     const ch = await channelsApi.get(editingId.value as number)
     ch.empty_response_retry ??= { window_secs: null, max_retries: null }
+    ch.visibility ??= 'shared'
     form.value = ch
     tagsText.value = (ch.tags ?? []).join(', ')
     overrideDraft.value = draftFromOverride(ch.param_override)
@@ -283,13 +292,14 @@ async function save() {
         proxy: form.value.proxy?.trim() || null,
         note: form.value.note?.trim() || null,
         test_model: form.value.test_model?.trim() || null,
+        visibility: props.scope === 'me' ? 'private' : (form.value.visibility ?? 'shared'),
       }
 
       if (isEdit.value) await store.update(payload)
       else await store.create(payload)
     },
     () => {
-      router.push('/channels')
+      router.push(listPath())
       return m.ch_edit_saved_msg()
     },
   )
@@ -304,7 +314,7 @@ async function destroy() {
   const removed = await destroyChannel.run(
     () => store.remove(editingId.value as number),
     () => {
-      router.push('/channels')
+      router.push(listPath())
       return m.ch_edit_deleted_msg()
     },
   )
@@ -326,7 +336,7 @@ async function destroy() {
       <button
         type="button"
         class="glass-button-ghost px-3.5 py-2 text-sm"
-        @click="router.push('/channels')"
+        @click="router.push(listPath())"
       >
         {{ m.common_back() }}
       </button>
@@ -337,7 +347,11 @@ async function destroy() {
     </div>
 
     <form v-else class="flex flex-col gap-4" @submit.prevent="save">
-      <ChannelBasicsSection v-model="form" v-model:tags-text="tagsText" />
+      <ChannelBasicsSection
+        v-model="form"
+        v-model:tags-text="tagsText"
+        :hide-visibility="props.scope === 'me'"
+      />
 
       <section class="glass glass-specular p-5">
         <h2 class="mb-1 text-sm font-semibold text-ink-soft uppercase">
@@ -421,7 +435,7 @@ async function destroy() {
           type="button"
           class="glass-button-ghost px-4 py-2.5 text-sm"
           :disabled="saving || destroying"
-          @click="router.push('/channels')"
+          @click="router.push(listPath())"
         >
           {{ m.common_cancel() }}
         </button>

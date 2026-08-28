@@ -509,9 +509,51 @@ impl<'de> Deserialize<'de> for ParamOverride {
                 })
                 .map_err(serde::de::Error::custom);
         }
+
         Ok(Self::from_legacy(map))
     }
 }
+
+/// 渠道可见性。
+///
+/// `shared`：管理员维护的全局池，全员可路由到。
+/// `private`：仅 `user_id` 对应用户可见。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelVisibility {
+    /// 共享：全员可见。
+    #[default]
+    Shared,
+    /// 私有：仅属主可见。
+    Private,
+}
+
+impl ChannelVisibility {
+    /// 数据库与 API 中的字符串形式。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Private => "private",
+        }
+    }
+}
+
+impl std::str::FromStr for ChannelVisibility {
+    type Err = ParseChannelVisibilityError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "shared" => Ok(Self::Shared),
+            "private" => Ok(Self::Private),
+            other => Err(ParseChannelVisibilityError(other.to_owned())),
+        }
+    }
+}
+
+/// 解析 [`ChannelVisibility`] 失败。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown channel visibility: {0}")]
+pub struct ParseChannelVisibilityError(pub String);
 
 /// 上游渠道。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -589,6 +631,12 @@ pub struct Channel {
     /// HTTP 200 空回复重试覆盖。两项都为空时完全继承全局设置。
     #[serde(default)]
     pub empty_response_retry: EmptyResponseRetryOverride,
+    /// 可见性。缺省为共享，旧 JSON 无此字段时按共享解析。
+    #[serde(default)]
+    pub visibility: ChannelVisibility,
+    /// 私有渠属主；共享渠为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
 }
 
 /// 渠道校验失败。
@@ -816,6 +864,13 @@ impl Channel {
         }
         out
     }
+
+    /// 该用户是否可见此渠道。
+    ///
+    /// 共享渠对所有人可见；私有渠仅当 `user_id` 匹配时可见。
+    pub fn visible_to(&self, user_id: i64) -> bool {
+        self.visibility == ChannelVisibility::Shared || self.user_id == Some(user_id)
+    }
 }
 
 /// 非官方地址缺可用 base_url：未填或只有空白。
@@ -878,6 +933,8 @@ mod tests {
             extra_headers: Vec::new(),
             test_model: None,
             empty_response_retry: EmptyResponseRetryOverride::default(),
+            visibility: ChannelVisibility::Shared,
+            user_id: None,
         }
     }
 
@@ -1210,6 +1267,49 @@ mod tests {
             serde_json::from_str::<ChannelKind>(r#""aggregate""#).unwrap(),
             ChannelKind::Aggregate
         );
+    }
+
+    #[test]
+    fn channel_visibility_as_str_and_parse() {
+        assert_eq!(ChannelVisibility::Shared.as_str(), "shared");
+        assert_eq!(ChannelVisibility::Private.as_str(), "private");
+        assert_eq!(ChannelVisibility::default(), ChannelVisibility::Shared);
+        assert_eq!(
+            "shared".parse::<ChannelVisibility>().unwrap(),
+            ChannelVisibility::Shared
+        );
+        assert_eq!(
+            "private".parse::<ChannelVisibility>().unwrap(),
+            ChannelVisibility::Private
+        );
+        assert!("other".parse::<ChannelVisibility>().is_err());
+    }
+
+    #[test]
+    fn channel_deserializes_without_visibility_and_user_id() {
+        let ch = single(Protocol::Chat);
+        let mut value = serde_json::to_value(&ch).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("visibility");
+        obj.remove("user_id");
+        let parsed: Channel = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.visibility, ChannelVisibility::Shared);
+        assert_eq!(parsed.user_id, None);
+    }
+
+    #[test]
+    fn channel_visible_to_shared_and_private() {
+        let mut ch = single(Protocol::Chat);
+        assert!(ch.visible_to(1));
+        assert!(ch.visible_to(7));
+
+        ch.visibility = ChannelVisibility::Private;
+        ch.user_id = Some(7);
+        assert!(ch.visible_to(7));
+        assert!(!ch.visible_to(8));
+
+        ch.user_id = None;
+        assert!(!ch.visible_to(7));
     }
 
     fn override_from_json(json: &str) -> ParamOverride {

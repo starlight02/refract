@@ -4,8 +4,8 @@
 //! 否则会出现「渠道已存在但端点还没写完」的中间态被路由层读到。
 
 use refract_core::{
-    Channel, ChannelEndpoint, ChannelId, ChannelKind, Credential, KeyStrategy, ModelEntry,
-    Protocol, TranscodePolicy, UpstreamAddress,
+    Channel, ChannelEndpoint, ChannelId, ChannelKind, ChannelVisibility, Credential, KeyStrategy,
+    ModelEntry, Protocol, TranscodePolicy, UpstreamAddress,
 };
 use sqlx::Row;
 
@@ -45,6 +45,8 @@ struct ChannelRow {
     extra_headers: Option<String>,
     test_model: Option<String>,
     empty_response_retry: Option<String>,
+    visibility: String,
+    user_id: Option<i64>,
 }
 
 macro_rules! channel_cols {
@@ -52,7 +54,7 @@ macro_rules! channel_cols {
         "id, owner_id, name, kind, enabled, priority, weight, credential, credentials, \
          key_strategy, address, tags, timeout_secs, proxy, param_override, note, \
          auto_disabled, balance, balance_updated_at, extra_headers, test_model, \
-         empty_response_retry"
+         empty_response_retry, visibility, user_id"
     };
 }
 
@@ -67,6 +69,25 @@ const SELECT_CHANNEL_BY_ID: &str = concat!(
     channel_cols!(),
     " FROM channels WHERE owner_id = ? AND id = ?"
 );
+
+const SELECT_CHANNELS_ALL: &str = concat!(
+    "SELECT ",
+    channel_cols!(),
+    " FROM channels ORDER BY priority DESC, id ASC"
+);
+
+const SELECT_CHANNELS_VISIBLE: &str = concat!(
+    "SELECT ",
+    channel_cols!(),
+    " FROM channels WHERE owner_id = ? AND (visibility = 'shared' OR user_id = ?) \
+     ORDER BY priority DESC, id ASC"
+);
+
+/// 用户是否可见该渠道：共享渠全员可见，私有渠仅属主。
+pub fn channel_visible_to(channel: &Channel, user_id: i64) -> bool {
+    channel.visible_to(user_id)
+}
+
 impl ChannelRepo {
     /// 绑定到一个数据库。
     pub fn new(db: Database) -> Self {
@@ -149,7 +170,35 @@ impl ChannelRepo {
             .bind(owner_id)
             .fetch_all(self.db.pool())
             .await?;
+        self.assemble_rows(rows).await
+    }
 
+    /// 列出全部渠道，不过滤 owner 与 visibility。
+    pub async fn list_all(&self) -> Result<Vec<Channel>, StoreError> {
+        let rows = sqlx::query(SELECT_CHANNELS_ALL)
+            .fetch_all(self.db.pool())
+            .await?;
+        self.assemble_rows(rows).await
+    }
+
+    /// 列出该所有者下对指定用户可见的渠道（共享 + 其私有渠）。
+    pub async fn list_visible_for(
+        &self,
+        owner_id: i64,
+        user_id: i64,
+    ) -> Result<Vec<Channel>, StoreError> {
+        let rows = sqlx::query(SELECT_CHANNELS_VISIBLE)
+            .bind(owner_id)
+            .bind(user_id)
+            .fetch_all(self.db.pool())
+            .await?;
+        self.assemble_rows(rows).await
+    }
+
+    async fn assemble_rows(
+        &self,
+        rows: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> Result<Vec<Channel>, StoreError> {
         let mut channels = Vec::with_capacity(rows.len());
         for row in rows {
             let parsed = Self::row_to_parts(&row)?;
@@ -199,8 +248,8 @@ impl ChannelRepo {
             "INSERT INTO channels \
              (owner_id, name, kind, enabled, priority, weight, credential, credentials, \
               key_strategy, address, tags, timeout_secs, proxy, param_override, note, \
-              extra_headers, test_model, empty_response_retry) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              extra_headers, test_model, empty_response_retry, visibility, user_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(channel.owner_id)
         .bind(&channel.name)
@@ -231,6 +280,8 @@ impl ChannelRepo {
             serde_json::to_string(&channel.empty_response_retry)
                 .expect("empty response retry override serializes")
         }))
+        .bind(channel.visibility.as_str())
+        .bind(channel.user_id)
         .fetch_one(&mut *tx)
         .await?
         .get(0);
@@ -331,7 +382,7 @@ impl ChannelRepo {
             "UPDATE channels SET name = ?, kind = ?, enabled = ?, priority = ?, weight = ?, \
              credential = ?, credentials = ?, key_strategy = ?, address = ?, tags = ?, \
              timeout_secs = ?, proxy = ?, param_override = ?, note = ?, extra_headers = ?, \
-             test_model = ?, empty_response_retry = ?, \
+             test_model = ?, empty_response_retry = ?, visibility = ?, user_id = ?, \
              updated_at = datetime('now') \
              WHERE id = ? AND owner_id = ?",
         )
@@ -363,6 +414,8 @@ impl ChannelRepo {
             serde_json::to_string(&channel.empty_response_retry)
                 .expect("empty response retry override serializes")
         }))
+        .bind(channel.visibility.as_str())
+        .bind(channel.user_id)
         .bind(channel.id)
         .bind(channel.owner_id)
         .execute(&mut *tx)
@@ -575,6 +628,8 @@ impl ChannelRepo {
             extra_headers: row.get("extra_headers"),
             test_model: row.get("test_model"),
             empty_response_retry: row.get("empty_response_retry"),
+            visibility: row.get("visibility"),
+            user_id: row.get("user_id"),
         })
     }
 
@@ -630,6 +685,10 @@ impl ChannelRepo {
                 .transpose()
                 .map_err(StoreError::json("channels.empty_response_retry"))?
                 .unwrap_or_default(),
+            visibility: row.visibility.parse::<ChannelVisibility>().map_err(|_| {
+                StoreError::Invalid(format!("unknown channel visibility `{}`", row.visibility))
+            })?,
+            user_id: row.user_id,
         })
     }
 }
@@ -678,6 +737,8 @@ mod tests {
                 window_secs: Some(6),
                 max_retries: Some(2),
             },
+            visibility: ChannelVisibility::Shared,
+            user_id: None,
         }
     }
 

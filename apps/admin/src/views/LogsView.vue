@@ -19,7 +19,7 @@ import { useAction } from '@/composables/useAction'
 import * as m from '@/paraglide/messages'
 import { getLocale } from '@/paraglide/runtime'
 import { parseJson } from '@/utils/effect'
-import { logs as logsApi } from '@/api/client'
+import { type ApiScope, scopedLogs } from '@/api/client'
 import {
   DialogContent,
   DialogDescription,
@@ -30,8 +30,10 @@ import {
 } from 'reka-ui'
 import type { Protocol, RequestLog } from '@refract/contracts'
 
-const store = useLogsStore()
-const channelsStore = useChannelsStore()
+const props = withDefaults(defineProps<{ scope?: ApiScope }>(), { scope: 'admin' })
+const store = useLogsStore(props.scope)
+const channelsStore = useChannelsStore(props.scope)
+const logsApi = scopedLogs(props.scope)
 
 // ── 自动刷新 ──
 // 排障时最常见的动作是「重发请求 → 切回来看日志」，自动刷新省掉手动刷新。
@@ -286,6 +288,7 @@ function fullTime(iso: string): string {
         </button>
 
         <button
+          v-if="scope === 'admin'"
           type="button"
           class="glass-button-ghost"
           :disabled="exportAllLogs.busy"
@@ -300,7 +303,7 @@ function fullTime(iso: string): string {
           {{ exportAllLogs.busy ? m.logs_exporting() : m.logs_export_all() }}
         </button>
 
-        <div class="glass-pill glass-pill-danger h-[34px] gap-1.5 px-2.5">
+        <div v-if="scope === 'admin'" class="glass-pill glass-pill-danger h-[34px] gap-1.5 px-2.5">
           <span class="text-xs text-ink-soft">{{ m.logs_prune_label() }}</span>
           <input
             v-model.number="pruneDays"

@@ -19,7 +19,7 @@ import {
   DialogTitle,
 } from 'reka-ui'
 import { useKeysStore } from '@/stores/keys'
-import { logs as logsApi } from '@/api/client'
+import { type ApiScope, scopedLogs } from '@/api/client'
 import { useAction } from '@/composables/useAction'
 import * as m from '@/paraglide/messages'
 import { getLocale } from '@/paraglide/runtime'
@@ -27,12 +27,15 @@ import { orElse } from '@/utils/effect'
 import { numOr } from '@/utils/num'
 import type { ApiKey, KeyUsageStat, NewApiKey } from '@refract/contracts'
 
-const store = useKeysStore()
+const props = withDefaults(defineProps<{ scope?: ApiScope }>(), { scope: 'me' })
+const store = useKeysStore(props.scope)
+const logsApi = scopedLogs(props.scope)
 
 /** 每把密钥最近 24 小时的用量。读不到就不显示 —— 这是辅助信息。 */
 const usageByKey = ref<Map<number, KeyUsageStat>>(new Map())
 
 async function refreshUsage() {
+  if (props.scope !== 'admin') return
   const stats = await orElse(() => logsApi.byKey(24), [])
   usageByKey.value = new Map(stats.map((s) => [s.api_key_id, s]))
 }

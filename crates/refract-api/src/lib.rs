@@ -8,6 +8,7 @@
 //! 两者分开的理由不只是整洁：网关路由的鉴权用「网关 API 密钥」，管理路由用
 //! 「管理令牌」。混在一起意味着一个泄漏的推理密钥能改配置。
 
+pub mod accounts;
 pub mod admin;
 pub mod auth;
 pub mod backup;
@@ -15,6 +16,8 @@ pub mod crypto;
 pub mod error;
 pub mod extract;
 pub mod gateway;
+pub mod mail;
+pub mod me;
 pub mod metrics;
 pub mod notify;
 pub mod ops;
@@ -22,6 +25,7 @@ pub mod rate;
 pub mod realtime;
 pub mod state;
 pub mod statics;
+pub mod users_admin;
 
 #[cfg(test)]
 pub mod http_test;
@@ -111,11 +115,21 @@ macro_rules! assembled_app {
                     .post(handler_service(gateway::gemini_action)),
             )
             .at("/v1/realtime", get(fn_service(realtime::realtime)))
-            .at("/api", admin::nest())
+            .at("/api/auth", accounts::nest())
+            .at("/api/me", me::nest())
+            .at("/api/admin", admin::nest())
             .at("/", get(handler_service(statics::root)))
+            // 旧管理路径（/api/channels 等）已迁到 /api/admin/*，统一 410。
+            // 这条 catch-all 必须排在 SPA fallback 之前。
+            .at(
+                "/api/{*legacy}",
+                get(handler_service(ops::legacy_gone))
+                    .post(handler_service(ops::legacy_gone))
+                    .put(handler_service(ops::legacy_gone)),
+            )
             .at("/{*path}", handler_service(statics::asset))
             .with_state($state)
-            .enclosed_fn(crate::extract::require_admin_mw)
+            .enclosed_fn(crate::extract::require_auth_mw)
             .enclosed_fn(options_and_cors)
     };
 }
@@ -463,7 +477,7 @@ mod tests {
         // 暴露给任意网页。GET + 无自定义头是「简单请求」，不经预检直达，
         // 所以防线只能是响应头缺失 —— 断言它确实缺失。
         let state = test_state().await;
-        for path in ["/api/channels", "/api/export"] {
+        for path in ["/api/admin/channels", "/api/admin/export"] {
             let response = TestRequest::get(path)
                 .header("origin", "https://evil.example")
                 .send(state.clone())
@@ -477,7 +491,7 @@ mod tests {
         }
 
         // 预检同样不该为管理面放行。
-        let response = TestRequest::get("/api/channels")
+        let response = TestRequest::get("/api/admin/channels")
             .method(Method::OPTIONS)
             .header("origin", "https://evil.example")
             .header("access-control-request-method", "GET")
@@ -534,19 +548,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmatched_admin_path_keeps_admin_envelope() {
+    async fn unmatched_legacy_admin_path_is_410_gone() {
         let response = TestRequest::get("/api/does-not-exist")
             .send(test_state().await)
             .await;
+        assert_eq!(response.status(), 410);
         let body = response.json();
+        assert_eq!(body["error"]["type"], "gone");
         assert!(
-            body.get("code").is_some(),
-            "admin fallback must keep {{code,message}}, got {body}"
-        );
-        assert!(
-            body.get("error")
-                .and_then(|error| error.get("message"))
-                .is_none()
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("/api/admin/")),
+            "410 body must point at the new admin prefix, got {body}"
         );
     }
 
@@ -567,8 +580,8 @@ mod tests {
         assert_eq!(gemini.json()["error"]["status"], "NOT_FOUND");
 
         let admin = TestRequest::post("/api/does-not-exist").send(state).await;
-        assert!(admin.json().get("code").is_some());
-        assert_eq!(admin.status(), 404);
+        assert_eq!(admin.status(), 410);
+        assert_eq!(admin.json()["error"]["type"], "gone");
     }
 
     fn write_self_signed(dir: &std::path::Path) -> (PathBuf, PathBuf, rcgen::Certificate) {
@@ -811,6 +824,8 @@ mod tests {
         let channel = refract_core::Channel {
             id: 0,
             owner_id: refract_core::DEFAULT_OWNER_ID,
+            visibility: refract_core::ChannelVisibility::Shared,
+            user_id: None,
             name: "sse-upstream".into(),
             kind: refract_core::ChannelKind::Single(refract_core::Protocol::Chat),
             enabled: true,

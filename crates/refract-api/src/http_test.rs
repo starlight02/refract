@@ -10,6 +10,15 @@ use xitca_web::http::{
 
 use crate::state::AppState;
 
+/// 内存库 bootstrap，并打开 dev_mode（验证码钩子）。
+pub async fn bootstrap_state(require_auth: bool) -> AppState {
+    let db = refract_store::Database::open_in_memory().await.unwrap();
+    let client = refract_upstream::UpstreamClient::new(Default::default()).unwrap();
+    let state = AppState::bootstrap(db, client, require_auth).await.unwrap();
+    state.set_dev_mode(true);
+    state
+}
+
 /// 一次进程内请求。
 pub struct TestRequest {
     method: Method,
@@ -129,6 +138,12 @@ impl TestResponse {
             )
         })
     }
+
+    /// 取出 `Set-Cookie` 的 `name=value` 段，便于后续请求回带。
+    pub fn session_cookie(&self) -> Option<String> {
+        let raw = self.headers.get(header::SET_COOKIE)?.to_str().ok()?;
+        Some(raw.split(';').next().unwrap_or(raw).trim().to_owned())
+    }
 }
 
 /// 接受 `&str` / `HeaderName`。
@@ -164,6 +179,12 @@ impl IntoHeaderValue for HeaderValue {
 impl IntoHeaderValue for &str {
     fn into_header_value(self) -> HeaderValue {
         HeaderValue::try_from(self).expect("invalid test header value")
+    }
+}
+
+impl IntoHeaderValue for &String {
+    fn into_header_value(self) -> HeaderValue {
+        HeaderValue::try_from(self.as_str()).expect("invalid test header value")
     }
 }
 

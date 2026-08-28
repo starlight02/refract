@@ -12,6 +12,8 @@ fn sample() -> Channel {
     Channel {
         id: 0,
         owner_id: refract_core::DEFAULT_OWNER_ID,
+        visibility: refract_core::ChannelVisibility::Shared,
+        user_id: None,
         name: "openai".into(),
         kind: ChannelKind::Single(Protocol::Chat),
         enabled: true,
@@ -83,7 +85,7 @@ async fn creating_a_channel_refreshes_the_routing_snapshot() {
     let state = test_state().await;
     assert_eq!(state.channels().len(), 0);
 
-    let response = crate::http_test::TestRequest::post("/api/channels")
+    let response = crate::http_test::TestRequest::post("/api/admin/channels")
         .json(&sample())
         .send(state.clone())
         .await;
@@ -103,9 +105,10 @@ async fn deleting_a_channel_refreshes_the_routing_snapshot() {
     state.reload_channels().await.unwrap();
     assert_eq!(state.channels().len(), 1);
 
-    let response = crate::http_test::TestRequest::delete(&format!("/api/channels/{}", created.id))
-        .send(state.clone())
-        .await;
+    let response =
+        crate::http_test::TestRequest::delete(&format!("/api/admin/channels/{}", created.id))
+            .send(state.clone())
+            .await;
 
     assert_eq!(response.status(), 200);
     assert_eq!(state.channels().len(), 0);
@@ -124,7 +127,7 @@ async fn path_id_wins_over_body_id_on_update() {
     payload.id = second.id;
     payload.name = "hijacked".into();
 
-    let response = crate::http_test::TestRequest::put(&format!("/api/channels/{}", first.id))
+    let response = crate::http_test::TestRequest::put(&format!("/api/admin/channels/{}", first.id))
         .json(&payload)
         .send(state.clone())
         .await;
@@ -144,7 +147,7 @@ async fn owner_id_from_the_client_is_ignored() {
     let mut payload = sample();
     payload.owner_id = 9999;
 
-    let response = crate::http_test::TestRequest::post("/api/channels")
+    let response = crate::http_test::TestRequest::post("/api/admin/channels")
         .json(&payload)
         .send(state.clone())
         .await;
@@ -166,7 +169,7 @@ async fn channel_credentials_are_masked_in_every_admin_response() {
     payload.credential = Credential::new("sk-default-super-secret");
     payload.endpoints[0].credential = Some(Credential::new("sk-endpoint-super-secret"));
 
-    let created = crate::http_test::TestRequest::post("/api/channels")
+    let created = crate::http_test::TestRequest::post("/api/admin/channels")
         .json(&payload)
         .send(state.clone())
         .await;
@@ -177,7 +180,7 @@ async fn channel_credentials_are_masked_in_every_admin_response() {
     assert!(created_text.contains("sk-d…cret"));
     assert!(created_text.contains("sk-e…cret"));
 
-    for path in ["/api/channels", "/api/channels/1"] {
+    for path in ["/api/admin/channels", "/api/admin/channels/1"] {
         let response = crate::http_test::TestRequest::get(path)
             .send(state.clone())
             .await;
@@ -198,17 +201,19 @@ async fn updating_a_redacted_channel_preserves_unchanged_credentials() {
     original.endpoints[0].credential = Some(Credential::new("sk-endpoint-super-secret"));
     let created = state.channel_repo().create(&original).await.unwrap();
 
-    let response = crate::http_test::TestRequest::get(&format!("/api/channels/{}", created.id))
-        .send(state.clone())
-        .await;
+    let response =
+        crate::http_test::TestRequest::get(&format!("/api/admin/channels/{}", created.id))
+            .send(state.clone())
+            .await;
     let envelope: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
     let mut redacted: Channel = serde_json::from_value(envelope["data"].clone()).unwrap();
     redacted.name = "renamed".into();
 
-    let updated = crate::http_test::TestRequest::put(&format!("/api/channels/{}", created.id))
-        .json(&redacted)
-        .send(state.clone())
-        .await;
+    let updated =
+        crate::http_test::TestRequest::put(&format!("/api/admin/channels/{}", created.id))
+            .json(&redacted)
+            .send(state.clone())
+            .await;
     assert_eq!(updated.status(), 200);
     let saved = state
         .channel_repo()
@@ -232,15 +237,16 @@ async fn masked_credential_that_cannot_be_restored_is_rejected_not_saved() {
 
     // 管理端取回脱敏后的渠道，把端点协议从 chat 改成 messages ——
     // 掩码找不到原端点，还原逻辑无能为力，必须拒绝而不是存掩码。
-    let response = crate::http_test::TestRequest::get(&format!("/api/channels/{}", created.id))
-        .send(state.clone())
-        .await;
+    let response =
+        crate::http_test::TestRequest::get(&format!("/api/admin/channels/{}", created.id))
+            .send(state.clone())
+            .await;
     let envelope: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
     let mut redacted: Channel = serde_json::from_value(envelope["data"].clone()).unwrap();
     redacted.kind = ChannelKind::Single(Protocol::Messages);
     redacted.endpoints[0].protocol = Protocol::Messages;
 
-    let update = crate::http_test::TestRequest::put(&format!("/api/channels/{}", created.id))
+    let update = crate::http_test::TestRequest::put(&format!("/api/admin/channels/{}", created.id))
         .json(&redacted)
         .send(state.clone())
         .await;
@@ -281,7 +287,7 @@ async fn importing_a_redacted_admin_response_is_rejected_before_touching_data() 
         "settings": {}
     });
 
-    let response = crate::http_test::TestRequest::post("/api/import")
+    let response = crate::http_test::TestRequest::post("/api/admin/import")
         .json(&serde_json::json!({ "mode": "replace", "data": document }))
         .send(state.clone())
         .await;
@@ -309,10 +315,12 @@ async fn duplicating_a_channel_creates_a_disabled_copy_with_full_config() {
     original.credential = Credential::new("sk-copy-me");
     let created = state.channel_repo().create(&original).await.unwrap();
 
-    let response =
-        crate::http_test::TestRequest::post(&format!("/api/channels/{}/duplicate", created.id))
-            .send(state.clone())
-            .await;
+    let response = crate::http_test::TestRequest::post(&format!(
+        "/api/admin/channels/{}/duplicate",
+        created.id
+    ))
+    .send(state.clone())
+    .await;
     assert_eq!(response.status(), 200);
 
     let listed = state
@@ -339,7 +347,7 @@ async fn bulk_action_applies_to_every_listed_channel() {
         ids.push(state.channel_repo().create(&channel).await.unwrap().id);
     }
 
-    let disable = crate::http_test::TestRequest::post("/api/channels/bulk")
+    let disable = crate::http_test::TestRequest::post("/api/admin/channels/bulk")
         .json(&serde_json::json!({ "ids": ids, "action": "disable" }))
         .send(state.clone())
         .await;
@@ -354,7 +362,7 @@ async fn bulk_action_applies_to_every_listed_channel() {
     assert!(state.channels().iter().all(|c| !c.enabled));
 
     // 删除时包含一个不存在的 id：批量操作必须宽容缺席者。
-    let delete = crate::http_test::TestRequest::post("/api/channels/bulk")
+    let delete = crate::http_test::TestRequest::post("/api/admin/channels/bulk")
         .json(&serde_json::json!({ "ids": [ids[0], ids[1], 424242], "action": "delete" }))
         .send(state.clone())
         .await;
@@ -399,12 +407,22 @@ async fn export_import_roundtrip_restores_channels_keys_and_settings() {
         .unwrap();
     source.reload_policy().await.unwrap();
 
-    let exported = crate::http_test::TestRequest::get("/api/export")
+    let exported = crate::http_test::TestRequest::get("/api/admin/export")
         .send(source.clone())
         .await;
     assert_eq!(exported.status(), 200);
     let envelope: serde_json::Value = serde_json::from_slice(exported.body()).unwrap();
     let document = envelope["data"].clone();
+    assert_eq!(document["version"], 2);
+    assert!(document["users"].is_array());
+    assert!(
+        document["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|user| user.get("password_hash").is_none()),
+        "users export must never include password hashes"
+    );
     // 导出必须携带可恢复的凭据明文与密钥哈希。
     assert_eq!(
         document["channels"][0]["credential"], "sk-export-secret",
@@ -414,7 +432,7 @@ async fn export_import_roundtrip_restores_channels_keys_and_settings() {
 
     // 在全新实例导入。
     let target = test_state().await;
-    let imported = crate::http_test::TestRequest::post("/api/import")
+    let imported = crate::http_test::TestRequest::post("/api/admin/import")
         .json(&serde_json::json!({ "mode": "replace", "data": document }))
         .send(target.clone())
         .await;
@@ -439,7 +457,7 @@ async fn export_import_roundtrip_restores_channels_keys_and_settings() {
     assert_eq!(target.policy().max_attempts, 5);
 
     // 再次以 merge 导入：全部跳过，不产生重复。
-    let merged = crate::http_test::TestRequest::post("/api/import")
+    let merged = crate::http_test::TestRequest::post("/api/admin/import")
         .json(&serde_json::json!({ "mode": "merge", "data": envelope["data"] }))
         .send(target.clone())
         .await;
@@ -456,7 +474,7 @@ async fn export_import_roundtrip_restores_channels_keys_and_settings() {
 async fn import_rejects_unknown_versions_and_invalid_channels() {
     let state = test_state().await;
 
-    let wrong_version = crate::http_test::TestRequest::post("/api/import")
+    let wrong_version = crate::http_test::TestRequest::post("/api/admin/import")
         .json(&serde_json::json!({
             "data": {
                 "version": 99,
@@ -470,7 +488,7 @@ async fn import_rejects_unknown_versions_and_invalid_channels() {
     // 无端点的渠道非法，导入必须整体拒绝且不落任何数据。
     let mut invalid = sample();
     invalid.endpoints.clear();
-    let response = crate::http_test::TestRequest::post("/api/import")
+    let response = crate::http_test::TestRequest::post("/api/admin/import")
         .json(&serde_json::json!({
             "data": {
                 "version": 1,
@@ -485,6 +503,281 @@ async fn import_rejects_unknown_versions_and_invalid_channels() {
 }
 
 #[tokio::test]
+async fn import_v1_maps_channels_to_shared_and_keys_to_admin() {
+    let source = test_state().await;
+    let mut channel = sample();
+    channel.credential = Credential::new("sk-v1-secret");
+    source.channel_repo().create(&channel).await.unwrap();
+    let (_, plaintext) = source
+        .key_repo()
+        .create(
+            refract_core::DEFAULT_OWNER_ID,
+            refract_store::NewApiKey {
+                name: "v1-key".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let exported = crate::http_test::TestRequest::get("/api/admin/export")
+        .send(source)
+        .await;
+    let mut document =
+        serde_json::from_slice::<serde_json::Value>(exported.body()).unwrap()["data"].clone();
+    document["version"] = serde_json::json!(1);
+    document.as_object_mut().unwrap().remove("users");
+    if let Some(channels) = document["channels"].as_array_mut() {
+        for channel in channels {
+            if let Some(obj) = channel.as_object_mut() {
+                obj.remove("user_email");
+                obj.remove("visibility");
+                obj.remove("user_id");
+            }
+        }
+    }
+    if let Some(keys) = document["keys"].as_array_mut() {
+        for key in keys {
+            if let Some(obj) = key.as_object_mut() {
+                obj.remove("user_email");
+                obj.remove("user_id");
+            }
+        }
+    }
+
+    let target = test_state().await;
+    let imported = crate::http_test::TestRequest::post("/api/admin/import")
+        .json(&serde_json::json!({ "mode": "replace", "data": document }))
+        .send(target.clone())
+        .await;
+    assert_eq!(
+        imported.status(),
+        200,
+        "{}",
+        String::from_utf8_lossy(imported.body())
+    );
+
+    let channels = target
+        .channel_repo()
+        .list(refract_core::DEFAULT_OWNER_ID)
+        .await
+        .unwrap();
+    assert_eq!(channels.len(), 1);
+    assert_eq!(
+        channels[0].visibility,
+        refract_core::ChannelVisibility::Shared
+    );
+    assert_eq!(channels[0].user_id, None);
+    assert_eq!(channels[0].credential.expose(), "sk-v1-secret");
+
+    let restored = target
+        .key_repo()
+        .find_by_plaintext(&plaintext)
+        .await
+        .unwrap()
+        .expect("v1 key hash must restore");
+    assert_eq!(restored.user_id, Some(target.bootstrap_admin_id()));
+}
+
+#[tokio::test]
+async fn export_import_v2_roundtrip_associates_ownership_by_email() {
+    let source = test_state().await;
+    let created = crate::http_test::TestRequest::post("/api/admin/users")
+        .json(&serde_json::json!({
+            "email": "Alice@example.com",
+            "password": "Passw0rd1234",
+            "display_name": "Alice",
+            "role": "user",
+            "initial_balance": 3.5
+        }))
+        .send(source.clone())
+        .await;
+    assert_eq!(created.status(), 200, "{}", created.json());
+    let alice_id = created.json()["data"]["id"].as_i64().unwrap();
+
+    let mut private = sample();
+    private.name = "alice-private".into();
+    private.visibility = refract_core::ChannelVisibility::Private;
+    private.user_id = Some(alice_id);
+    private.credential = Credential::new("sk-alice-secret");
+    source.channel_repo().create(&private).await.unwrap();
+    let (_, plaintext) = source
+        .key_repo()
+        .create_for_user(
+            refract_core::DEFAULT_OWNER_ID,
+            alice_id,
+            refract_store::NewApiKey {
+                name: "alice-key".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let exported = crate::http_test::TestRequest::get("/api/admin/export")
+        .send(source)
+        .await;
+    assert_eq!(exported.status(), 200);
+    let document =
+        serde_json::from_slice::<serde_json::Value>(exported.body()).unwrap()["data"].clone();
+    assert_eq!(document["version"], 2);
+    let alice_user = document["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| {
+            user["email"]
+                .as_str()
+                .is_some_and(|email| email.eq_ignore_ascii_case("alice@example.com"))
+        })
+        .expect("alice must be in users export");
+    assert!(alice_user.get("password_hash").is_none());
+    assert!((alice_user["wallet_balance"].as_f64().unwrap() - 3.5).abs() < 1e-9);
+    let private_export = document["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|channel| channel["name"] == "alice-private")
+        .unwrap();
+    assert_eq!(private_export["visibility"], "private");
+    assert_eq!(
+        private_export["user_email"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase(),
+        "alice@example.com"
+    );
+    assert!(private_export.get("user_id").is_none());
+    let key_export = document["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["name"] == "alice-key")
+        .unwrap();
+    assert_eq!(
+        key_export["user_email"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase(),
+        "alice@example.com"
+    );
+
+    let target = test_state().await;
+    let spacer = crate::http_test::TestRequest::post("/api/admin/users")
+        .json(&serde_json::json!({
+            "email": "spacer@example.com",
+            "password": "Passw0rd1234",
+            "display_name": "Spacer",
+            "role": "user"
+        }))
+        .send(target.clone())
+        .await;
+    assert_eq!(spacer.status(), 200, "{}", spacer.json());
+    let target_user = crate::http_test::TestRequest::post("/api/admin/users")
+        .json(&serde_json::json!({
+            "email": "alice@example.com",
+            "password": "Passw0rd1234",
+            "display_name": "Alice",
+            "role": "user"
+        }))
+        .send(target.clone())
+        .await;
+    assert_eq!(target_user.status(), 200, "{}", target_user.json());
+    let target_alice = target_user.json()["data"]["id"].as_i64().unwrap();
+    assert_ne!(target_alice, alice_id);
+
+    let imported = crate::http_test::TestRequest::post("/api/admin/import")
+        .json(&serde_json::json!({ "mode": "replace", "data": document }))
+        .send(target.clone())
+        .await;
+    assert_eq!(
+        imported.status(),
+        200,
+        "{}",
+        String::from_utf8_lossy(imported.body())
+    );
+
+    let channels = target
+        .channel_repo()
+        .list(refract_core::DEFAULT_OWNER_ID)
+        .await
+        .unwrap();
+    let restored = channels
+        .iter()
+        .find(|channel| channel.name == "alice-private")
+        .unwrap();
+    assert_eq!(
+        restored.visibility,
+        refract_core::ChannelVisibility::Private
+    );
+    assert_eq!(restored.user_id, Some(target_alice));
+    assert_eq!(restored.credential.expose(), "sk-alice-secret");
+
+    let key = target
+        .key_repo()
+        .find_by_plaintext(&plaintext)
+        .await
+        .unwrap()
+        .expect("alice key must restore");
+    assert_eq!(key.user_id, Some(target_alice));
+}
+
+#[tokio::test]
+async fn import_v2_unknown_email_falls_back_to_bootstrap_admin() {
+    let source = test_state().await;
+    let mut channel = sample();
+    channel.name = "ghost-private".into();
+    channel.visibility = refract_core::ChannelVisibility::Private;
+    channel.user_id = Some(source.bootstrap_admin_id());
+    channel.credential = Credential::new("sk-ghost");
+    source.channel_repo().create(&channel).await.unwrap();
+    let exported = crate::http_test::TestRequest::get("/api/admin/export")
+        .send(source)
+        .await;
+    let mut document =
+        serde_json::from_slice::<serde_json::Value>(exported.body()).unwrap()["data"].clone();
+    if let Some(channels) = document["channels"].as_array_mut() {
+        for channel in channels {
+            if channel["name"] == "ghost-private" {
+                channel["user_email"] = serde_json::json!("ghost@example.com");
+            }
+        }
+    }
+    if let Some(keys) = document["keys"].as_array_mut() {
+        for key in keys {
+            key["user_email"] = serde_json::json!("Ghost@example.com");
+        }
+    }
+
+    let target = test_state().await;
+    let admin_id = target.bootstrap_admin_id();
+    let imported = crate::http_test::TestRequest::post("/api/admin/import")
+        .json(&serde_json::json!({ "mode": "replace", "data": document }))
+        .send(target.clone())
+        .await;
+    assert_eq!(
+        imported.status(),
+        200,
+        "{}",
+        String::from_utf8_lossy(imported.body())
+    );
+
+    let channels = target
+        .channel_repo()
+        .list(refract_core::DEFAULT_OWNER_ID)
+        .await
+        .unwrap();
+    let restored = channels
+        .iter()
+        .find(|channel| channel.name == "ghost-private")
+        .unwrap();
+    assert_eq!(
+        restored.visibility,
+        refract_core::ChannelVisibility::Private
+    );
+    assert_eq!(restored.user_id, Some(admin_id));
+}
+
+#[tokio::test]
 async fn duplicate_protocol_endpoints_are_rejected() {
     let state = test_state().await;
     let mut payload = sample();
@@ -494,7 +787,7 @@ async fn duplicate_protocol_endpoints_are_rejected() {
         ..ChannelEndpoint::new(Protocol::Chat)
     });
 
-    let response = crate::http_test::TestRequest::post("/api/channels")
+    let response = crate::http_test::TestRequest::post("/api/admin/channels")
         .json(&payload)
         .send(state.clone())
         .await;
@@ -510,7 +803,7 @@ async fn a_channel_without_endpoints_is_rejected() {
     let mut payload = sample();
     payload.endpoints.clear();
 
-    let response = crate::http_test::TestRequest::post("/api/channels")
+    let response = crate::http_test::TestRequest::post("/api/admin/channels")
         .json(&payload)
         .send(state.clone())
         .await;
@@ -525,7 +818,7 @@ async fn single_kind_must_match_its_endpoint() {
     // 声明是 Messages 渠道，但端点只有 Chat —— UI 会显示错误的类型。
     payload.kind = ChannelKind::Single(Protocol::Messages);
 
-    let response = crate::http_test::TestRequest::post("/api/channels")
+    let response = crate::http_test::TestRequest::post("/api/admin/channels")
         .json(&payload)
         .send(state.clone())
         .await;
@@ -540,7 +833,7 @@ async fn enabled_toggle_is_not_shadowed_by_the_id_route() {
     let created = state.channel_repo().create(&sample()).await.unwrap();
 
     let response =
-        crate::http_test::TestRequest::post(&format!("/api/channels/{}/enabled", created.id))
+        crate::http_test::TestRequest::post(&format!("/api/admin/channels/{}/enabled", created.id))
             .json(&serde_json::json!({ "enabled": false }))
             .send(state.clone())
             .await;
@@ -560,7 +853,7 @@ async fn enabled_toggle_is_not_shadowed_by_the_id_route() {
 async fn api_key_plaintext_is_returned_exactly_once() {
     let state = test_state().await;
 
-    let response = crate::http_test::TestRequest::post("/api/keys")
+    let response = crate::http_test::TestRequest::post("/api/admin/keys")
         .json(&serde_json::json!({ "name": "laptop" }))
         .send(state.clone())
         .await;
@@ -571,7 +864,7 @@ async fn api_key_plaintext_is_returned_exactly_once() {
     assert!(plaintext.starts_with("rk-"));
 
     // 列表接口不能再带出明文。
-    let listed = crate::http_test::TestRequest::get("/api/keys")
+    let listed = crate::http_test::TestRequest::get("/api/admin/keys")
         .send(state.clone())
         .await;
     let text = String::from_utf8_lossy(listed.body()).into_owned();
@@ -617,9 +910,10 @@ async fn balance_probe_uses_the_billing_endpoints_and_caches_the_result() {
     state.reload_channels().await.unwrap();
     let id = state.channels()[0].id;
 
-    let response = crate::http_test::TestRequest::post(&format!("/api/channels/{id}/balance"))
-        .send(state.clone())
-        .await;
+    let response =
+        crate::http_test::TestRequest::post(&format!("/api/admin/channels/{id}/balance"))
+            .send(state.clone())
+            .await;
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
     // 120 − 25.50 = 94.50
@@ -674,9 +968,10 @@ async fn balance_probe_honors_a_path_prefixed_base() {
     state.reload_channels().await.unwrap();
     let id = state.channels()[0].id;
 
-    let response = crate::http_test::TestRequest::post(&format!("/api/channels/{id}/balance"))
-        .send(state.clone())
-        .await;
+    let response =
+        crate::http_test::TestRequest::post(&format!("/api/admin/channels/{id}/balance"))
+            .send(state.clone())
+            .await;
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
     assert!((body["data"]["balance"].as_f64().unwrap() - 10.0).abs() < 1e-9);
@@ -704,7 +999,7 @@ async fn key_update_and_usage_reset_keep_the_key_itself() {
         .unwrap();
 
     // 编辑治理属性：名字、限速、备注全改，密钥本体不动。
-    let response = crate::http_test::TestRequest::put(&format!("/api/keys/{}", created.id))
+    let response = crate::http_test::TestRequest::put(&format!("/api/admin/keys/{}", created.id))
         .json(&serde_json::json!({
             "name": "after",
             "quota": 500,
@@ -733,7 +1028,7 @@ async fn key_update_and_usage_reset_keep_the_key_itself() {
 
     // 重置用量。
     let response =
-        crate::http_test::TestRequest::post(&format!("/api/keys/{}/reset-usage", created.id))
+        crate::http_test::TestRequest::post(&format!("/api/admin/keys/{}/reset-usage", created.id))
             .send(state.clone())
             .await;
     assert_eq!(response.status(), 200);
@@ -777,7 +1072,7 @@ async fn playground_chat_goes_through_the_full_gateway_pipeline() {
     state.channel_repo().create(&channel).await.unwrap();
     state.reload_channels().await.unwrap();
 
-    let response = crate::http_test::TestRequest::post("/api/playground/chat")
+    let response = crate::http_test::TestRequest::post("/api/admin/playground/chat")
         .json(&serde_json::json!({
             "model": "gpt-4o",
             "messages": [{ "role": "user", "content": "ping" }]
@@ -802,7 +1097,7 @@ async fn models_endpoint_derives_from_enabled_channels_only() {
     state.channel_repo().create(&disabled).await.unwrap();
     state.reload_channels().await.unwrap();
 
-    let response = crate::http_test::TestRequest::get("/api/models")
+    let response = crate::http_test::TestRequest::get("/api/admin/models")
         .send(state.clone())
         .await;
 
@@ -822,7 +1117,7 @@ async fn routing_policy_roundtrips_and_updates_the_snapshot() {
     let mut policy = state.policy();
     policy.native_first = !policy.native_first;
 
-    let response = crate::http_test::TestRequest::put("/api/settings/routing")
+    let response = crate::http_test::TestRequest::put("/api/admin/settings/routing")
         .json(&policy)
         .send(state.clone())
         .await;
@@ -835,7 +1130,7 @@ async fn routing_policy_roundtrips_and_updates_the_snapshot() {
 async fn log_retention_roundtrips_and_rejects_out_of_range_values() {
     let state = test_state().await;
 
-    let initial = crate::http_test::TestRequest::get("/api/settings/log-retention")
+    let initial = crate::http_test::TestRequest::get("/api/admin/settings/log-retention")
         .send(state.clone())
         .await;
     assert_eq!(initial.status(), 200);
@@ -845,7 +1140,7 @@ async fn log_retention_roundtrips_and_rejects_out_of_range_values() {
         refract_store::settings_repo::DEFAULT_LOG_RETENTION_DAYS
     );
 
-    let updated = crate::http_test::TestRequest::put("/api/settings/log-retention")
+    let updated = crate::http_test::TestRequest::put("/api/admin/settings/log-retention")
         .json(&serde_json::json!({ "days": 90 }))
         .send(state.clone())
         .await;
@@ -853,7 +1148,7 @@ async fn log_retention_roundtrips_and_rejects_out_of_range_values() {
     assert_eq!(state.settings_repo().log_retention_days().await, 90);
 
     for days in [0, refract_store::settings_repo::MAX_LOG_RETENTION_DAYS + 1] {
-        let rejected = crate::http_test::TestRequest::put("/api/settings/log-retention")
+        let rejected = crate::http_test::TestRequest::put("/api/admin/settings/log-retention")
             .json(&serde_json::json!({ "days": days }))
             .send(state.clone())
             .await;
@@ -867,7 +1162,7 @@ async fn breaker_policy_roundtrips_hot_updates_and_rejects_bad_values() {
     let state = test_state().await;
 
     // 默认值可读。
-    let initial = crate::http_test::TestRequest::get("/api/settings/breaker")
+    let initial = crate::http_test::TestRequest::get("/api/admin/settings/breaker")
         .send(state.clone())
         .await;
     assert_eq!(initial.status(), 200);
@@ -875,7 +1170,7 @@ async fn breaker_policy_roundtrips_hot_updates_and_rejects_bad_values() {
     assert_eq!(body["data"]["failure_threshold"], 5);
 
     // 更新后：持久化 + 共享健康仓储热更新（不用重启）。
-    let updated = crate::http_test::TestRequest::put("/api/settings/breaker")
+    let updated = crate::http_test::TestRequest::put("/api/admin/settings/breaker")
         .json(&serde_json::json!({
             "failure_threshold": 3,
             "base_cooldown_secs": 10,
@@ -893,7 +1188,7 @@ async fn breaker_policy_roundtrips_hot_updates_and_rejects_bad_values() {
         serde_json::json!({ "failure_threshold": 3, "base_cooldown_secs": 600, "max_cooldown_secs": 300 }),
         serde_json::json!({ "failure_threshold": 1_000_000, "base_cooldown_secs": 10, "max_cooldown_secs": 300 }),
     ] {
-        let rejected = crate::http_test::TestRequest::put("/api/settings/breaker")
+        let rejected = crate::http_test::TestRequest::put("/api/admin/settings/breaker")
             .json(&bad)
             .send(state.clone())
             .await;
@@ -907,7 +1202,7 @@ async fn global_limits_roundtrip_hot_updates_and_rejects_bad_values() {
     let state = test_state().await;
 
     // 默认全 0（不限）。
-    let initial = crate::http_test::TestRequest::get("/api/settings/limits")
+    let initial = crate::http_test::TestRequest::get("/api/admin/settings/limits")
         .send(state.clone())
         .await;
     assert_eq!(initial.status(), 200);
@@ -917,7 +1212,7 @@ async fn global_limits_roundtrip_hot_updates_and_rejects_bad_values() {
     assert_eq!(body["data"]["max_concurrency"], 0);
 
     // 更新后：持久化 + AppState 快照热更新（不用重启）。
-    let updated = crate::http_test::TestRequest::put("/api/settings/limits")
+    let updated = crate::http_test::TestRequest::put("/api/admin/settings/limits")
         .json(&serde_json::json!({
             "rpm": 600,
             "tpm": 2_000_000,
@@ -931,7 +1226,7 @@ async fn global_limits_roundtrip_hot_updates_and_rejects_bad_values() {
     assert_eq!(state.global_limits().max_concurrency, 16);
 
     // 省略 tpm 的旧前端请求体仍可接受，缺省为 0（不限）。
-    let legacy = crate::http_test::TestRequest::put("/api/settings/limits")
+    let legacy = crate::http_test::TestRequest::put("/api/admin/settings/limits")
         .json(&serde_json::json!({ "rpm": 60, "max_concurrency": 8 }))
         .send(state.clone())
         .await;
@@ -944,7 +1239,7 @@ async fn global_limits_roundtrip_hot_updates_and_rejects_bad_values() {
         serde_json::json!({ "tpm": 1_000_000_001u64 }),
         serde_json::json!({ "max_concurrency": 100_001 }),
     ] {
-        let rejected = crate::http_test::TestRequest::put("/api/settings/limits")
+        let rejected = crate::http_test::TestRequest::put("/api/admin/settings/limits")
             .json(&bad)
             .send(state.clone())
             .await;
@@ -958,27 +1253,27 @@ async fn global_limits_roundtrip_hot_updates_and_rejects_bad_values() {
 async fn admin_token_can_be_set_and_cleared_but_never_read() {
     let state = test_state().await;
 
-    let set = crate::http_test::TestRequest::put("/api/settings/admin-token")
+    let set = crate::http_test::TestRequest::put("/api/admin/settings/admin-token")
         .json(&serde_json::json!({ "token": "s3cret" }))
         .send(state.clone())
         .await;
     assert_eq!(set.status(), 200);
 
     // 设置之后，无令牌的请求必须被拒。
-    let denied = crate::http_test::TestRequest::get("/api/channels")
+    let denied = crate::http_test::TestRequest::get("/api/admin/channels")
         .send(state.clone())
         .await;
     assert_eq!(denied.status(), 401);
 
     // 带上正确令牌可以通过，并能清除。
-    let cleared = crate::http_test::TestRequest::put("/api/settings/admin-token")
+    let cleared = crate::http_test::TestRequest::put("/api/admin/settings/admin-token")
         .header("x-admin-token", "s3cret")
         .json(&serde_json::json!({ "token": null }))
         .send(state.clone())
         .await;
     assert_eq!(cleared.status(), 200);
 
-    let open = crate::http_test::TestRequest::get("/api/channels")
+    let open = crate::http_test::TestRequest::get("/api/admin/channels")
         .send(state.clone())
         .await;
     assert_eq!(open.status(), 200);
@@ -987,7 +1282,7 @@ async fn admin_token_can_be_set_and_cleared_but_never_read() {
 #[tokio::test]
 async fn unknown_channel_yields_404_not_500() {
     let state = test_state().await;
-    let response = crate::http_test::TestRequest::get("/api/channels/424242")
+    let response = crate::http_test::TestRequest::get("/api/admin/channels/424242")
         .send(state.clone())
         .await;
     assert_eq!(response.status(), 404);
@@ -1007,7 +1302,7 @@ async fn public_key_endpoint_is_public_and_enables_e2e_envelope_decryption() {
     let state = test_state().await;
 
     // 1. GET /api/crypto/public-key 无需鉴权即可访问
-    let pk_res = crate::http_test::TestRequest::get("/api/crypto/public-key")
+    let pk_res = crate::http_test::TestRequest::get("/api/admin/crypto/public-key")
         .send(state.clone())
         .await;
     assert_eq!(pk_res.status(), 200);
@@ -1066,7 +1361,7 @@ async fn public_key_endpoint_is_public_and_enables_e2e_envelope_decryption() {
     });
 
     // 4. POST /api/channels 发送加密信封
-    let create_res = crate::http_test::TestRequest::post("/api/channels")
+    let create_res = crate::http_test::TestRequest::post("/api/admin/channels")
         .json(&envelope)
         .send(state.clone())
         .await;
@@ -1111,7 +1406,7 @@ async fn auth_session_and_cookie_login_logout_flow() {
     assert_eq!(val["data"]["authenticated"], true);
 
     // 2. 配置管理令牌
-    let set_res = crate::http_test::TestRequest::put("/api/settings/admin-token")
+    let set_res = crate::http_test::TestRequest::put("/api/admin/settings/admin-token")
         .json(&serde_json::json!({ "token": "admin-secret-pwd" }))
         .send(state.clone())
         .await;
@@ -1127,14 +1422,14 @@ async fn auth_session_and_cookie_login_logout_flow() {
     assert!(cookie_header.contains("SameSite=Strict"));
 
     // 3. 无 Cookie 访问受保护接口返回 401
-    let blocked = crate::http_test::TestRequest::get("/api/settings/ip-limits")
+    let blocked = crate::http_test::TestRequest::get("/api/admin/settings/ip-limits")
         .send(state.clone())
         .await;
     assert_eq!(blocked.status(), 401);
 
     // 4. 携带生成的 Cookie 访问受保护接口成功
     let session_val = cookie_header.split(';').next().unwrap();
-    let authed = crate::http_test::TestRequest::get("/api/settings/ip-limits")
+    let authed = crate::http_test::TestRequest::get("/api/admin/settings/ip-limits")
         .header("cookie", session_val)
         .send(state.clone())
         .await;
@@ -1179,7 +1474,7 @@ async fn auth_session_and_cookie_login_logout_flow() {
 #[tokio::test]
 async fn https_forwarded_proto_sets_secure_session_cookie() {
     let state = test_state().await;
-    crate::http_test::TestRequest::put("/api/settings/admin-token")
+    crate::http_test::TestRequest::put("/api/admin/settings/admin-token")
         .json(&serde_json::json!({ "token": "admin-secret-pwd" }))
         .send(state.clone())
         .await;
@@ -1204,7 +1499,7 @@ async fn https_forwarded_proto_sets_secure_session_cookie() {
 #[tokio::test]
 async fn failed_logins_lock_out_with_retry_after() {
     let state = test_state().await;
-    crate::http_test::TestRequest::put("/api/settings/admin-token")
+    crate::http_test::TestRequest::put("/api/admin/settings/admin-token")
         .json(&serde_json::json!({ "token": "admin-secret-pwd" }))
         .send(state.clone())
         .await;
@@ -1221,4 +1516,54 @@ async fn failed_logins_lock_out_with_retry_after() {
             assert!(denied.headers().get("retry-after").is_some());
         }
     }
+}
+
+#[tokio::test]
+async fn admin_topup_adjust_refund_write_ledger() {
+    let state = test_state().await;
+    let created = crate::http_test::TestRequest::post("/api/admin/users")
+        .json(&serde_json::json!({
+            "email": "wallet-user@example.com",
+            "password": "Passw0rd1234",
+            "display_name": "Wallet",
+            "role": "user",
+            "initial_balance": 0.0
+        }))
+        .send(state.clone())
+        .await;
+    assert_eq!(created.status(), 200, "{}", created.json());
+    let user_id = created.json()["data"]["id"].as_i64().unwrap();
+
+    let topup =
+        crate::http_test::TestRequest::post(&format!("/api/admin/users/{user_id}/wallet/topup"))
+            .json(&serde_json::json!({ "amount": 5.0, "note": "top" }))
+            .send(state.clone())
+            .await;
+    assert_eq!(topup.status(), 200, "{}", topup.json());
+    assert!((topup.json()["data"]["balance"].as_f64().unwrap() - 5.0).abs() < 1e-9);
+
+    let adjust =
+        crate::http_test::TestRequest::post(&format!("/api/admin/users/{user_id}/wallet/adjust"))
+            .json(&serde_json::json!({ "delta": -1.5, "note": "adj" }))
+            .send(state.clone())
+            .await;
+    assert_eq!(adjust.status(), 200, "{}", adjust.json());
+    assert!((adjust.json()["data"]["balance"].as_f64().unwrap() - 3.5).abs() < 1e-9);
+
+    let refund =
+        crate::http_test::TestRequest::post(&format!("/api/admin/users/{user_id}/wallet/refund"))
+            .json(&serde_json::json!({ "amount": 0.5, "note": "ref" }))
+            .send(state.clone())
+            .await;
+    assert_eq!(refund.status(), 200, "{}", refund.json());
+    assert!((refund.json()["data"]["balance"].as_f64().unwrap() - 4.0).abs() < 1e-9);
+
+    let ledger =
+        crate::http_test::TestRequest::get(&format!("/api/admin/users/{user_id}/wallet/ledger"))
+            .send(state)
+            .await;
+    assert_eq!(ledger.status(), 200, "{}", ledger.json());
+    let payload = ledger.json();
+    let rows = payload["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
 }

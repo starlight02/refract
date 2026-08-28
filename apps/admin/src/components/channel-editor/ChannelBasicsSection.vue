@@ -15,6 +15,7 @@ const KIND_OPTIONS: { value: ChannelKind; label: () => string }[] = [
 ]
 const form = defineModel<Channel>({ required: true })
 const tagsText = defineModel<string>('tagsText', { required: true })
+defineProps<{ hideVisibility?: boolean }>()
 </script>
 
 <template>
@@ -90,6 +91,13 @@ const tagsText = defineModel<string>('tagsText', { required: true })
           :placeholder="m.ch_basics_tags_placeholder()"
           class="glass-field px-3 py-2 text-sm outline-none"
         />
+      </label>
+      <label v-if="!hideVisibility" class="flex flex-col gap-1.5">
+        <span class="text-xs font-medium text-ink-soft">{{ m.ch_visibility() }}</span>
+        <select v-model="form.visibility" class="glass-field px-3 py-2 text-sm outline-none">
+          <option value="shared">{{ m.ch_visibility_shared() }}</option>
+          <option value="private">{{ m.ch_visibility_private() }}</option>
+        </select>
       </label>
     </div>
 

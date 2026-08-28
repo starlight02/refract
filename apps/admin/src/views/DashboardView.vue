@@ -10,8 +10,10 @@ import AppIcon from '@/components/AppIcon.vue'
 import GlassSpinner from '@/components/GlassSpinner.vue'
 import * as m from '@/paraglide/messages'
 import { useDashboardStore } from '@/stores/dashboard'
+import type { ApiScope } from '@/api/client'
 
-const store = useDashboardStore()
+const props = withDefaults(defineProps<{ scope?: ApiScope }>(), { scope: 'admin' })
+const store = useDashboardStore(props.scope)
 
 /** 仪表盘是常开的监控页，静默轮询保持数字新鲜；30s 对统计类数据足够。 */
 const POLL_MS = 30_000
@@ -320,7 +322,10 @@ const sortedModels = computed(() => [...store.byModel].sort((a, b) => b.requests
     </section>
 
     <!-- 按渠道 -->
-    <section v-if="store.byChannel.length > 0" class="glass glass-specular mt-6 p-5">
+    <section
+      v-if="scope === 'admin' && store.byChannel.length > 0"
+      class="glass glass-specular mt-6 p-5"
+    >
       <h2 class="mb-4 text-sm font-semibold text-ink-soft uppercase">{{ m.dash_by_channel() }}</h2>
       <div class="overflow-x-auto" tabindex="0" :aria-label="m.dash_by_channel_aria()">
         <table class="w-full min-w-[560px] text-sm">

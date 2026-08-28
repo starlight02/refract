@@ -34,6 +34,22 @@ pub async fn ready(StateRef(state): StateRef<'_, AppState>) -> Result<WebRespons
     Ok(json_response(status, &body))
 }
 
+/// 旧版管理路径（`/api/*`，无 `admin`/`me`/`auth` 前缀）一律 410。
+///
+/// 多用户化把管理面迁到 `/api/admin/*`；旧路径若静默 404，外部脚本会误以为是
+/// 配置损坏。410 明确告诉调用方「路径已死」，响应里给出迁移指引。
+pub async fn legacy_gone() -> Result<WebResponse, AppError> {
+    Ok(json_response(
+        StatusCode::GONE,
+        &json!({
+            "error": {
+                "type": "gone",
+                "message": "this endpoint moved to /api/admin/* (self-service: /api/me/*); see the v0.6 upgrade notes",
+            }
+        }),
+    ))
+}
+
 /// `GET /metrics`
 pub async fn metrics(
     StateRef(state): StateRef<'_, AppState>,
@@ -41,6 +57,19 @@ pub async fn metrics(
     addr: SocketAddr,
 ) -> Result<WebResponse, AppError> {
     require_admin(state, headers, crate::peer_addr(addr)).await?;
+    if state.metrics().per_user_enabled() {
+        match state.wallet_repo().all_wallets().await {
+            Ok(wallets) => state.metrics().set_wallet_balances(
+                wallets
+                    .into_iter()
+                    .map(|wallet| (wallet.user_id, wallet.balance)),
+            ),
+            Err(error) => {
+                state.metrics().set_wallet_balances([]);
+                tracing::warn!(%error, "failed to refresh per-user wallet metrics");
+            }
+        }
+    }
     let body = state.metrics().render();
     let mut response = WebResponse::new(ResponseBody::bytes(body));
     *response.status_mut() = StatusCode::OK;

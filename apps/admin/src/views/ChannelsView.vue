@@ -13,13 +13,26 @@ import ChannelListCard from '@/components/channels/ChannelListCard.vue'
 import GlassSwitch from '@/components/GlassSwitch.vue'
 import { useAction } from '@/composables/useAction'
 import * as m from '@/paraglide/messages'
-import { channels as channelsApi, health as healthApi, settings } from '@/api/client'
+import { type ApiScope, channels as channelsApi, health as healthApi, settings } from '@/api/client'
 import { useChannelsStore } from '@/stores/channels'
 import { isSuccess, orElse, settled } from '@/utils/effect'
 import { toErrorMessage } from '@/utils/error'
 import type { Channel, ChannelTestResult, EndpointHealth, RoutingPolicy } from '@refract/contracts'
+
+const props = withDefaults(defineProps<{ scope?: ApiScope }>(), { scope: 'admin' })
+const isAdminScope = computed(() => props.scope === 'admin')
 const router = useRouter()
-const store = useChannelsStore()
+const store = useChannelsStore(props.scope)
+
+function listPath(): string {
+  return props.scope === 'admin' ? '/admin/channels' : '/channels'
+}
+function newPath(): string {
+  return `${listPath()}/new`
+}
+function editPath(id: number): string {
+  return `${listPath()}/${id}/edit`
+}
 
 /** 「原生优先」是全局路由开关（需求 6），放在列表页顶部因为它影响整列的排序语义。 */
 const policy = ref<RoutingPolicy | null>(null)
@@ -60,9 +73,13 @@ const sorted = computed(() =>
 )
 
 onMounted(async () => {
-  await Promise.all([store.fetch(), refreshHealth()])
-  const loaded = await orElse(() => settings.routingPolicy())
-  if (loaded) policy.value = loaded
+  const tasks: Promise<unknown>[] = [store.fetch()]
+  if (isAdminScope.value) {
+    tasks.push(refreshHealth())
+    const loaded = await orElse(() => settings.routingPolicy())
+    if (loaded) policy.value = loaded
+  }
+  await Promise.all(tasks)
 })
 
 /** 拉取全量端点健康快照。失败静默 —— 健康是辅助信息，不该挡住渠道列表。 */
@@ -160,7 +177,7 @@ async function duplicateChannel(id: number) {
   if (copyingId.value !== null) return
   copyingId.value = id
   const copy = await orElse(() => store.duplicate(id))
-  if (copy) router.push(`/channels/${copy.id}/edit`)
+  if (copy) router.push(editPath(copy.id))
   copyingId.value = null
 }
 
@@ -226,7 +243,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
               enabled: store.items.filter((c) => c.enabled).length,
             })
           }}
-          <span v-if="suspendedCount > 0" class="text-danger">
+          <span v-if="isAdminScope && suspendedCount > 0" class="text-danger">
             {{ m.ch_suspended_stat({ count: suspendedCount }) }}
           </span>
         </p>
@@ -234,7 +251,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
 
       <div class="flex items-center gap-2">
         <button
-          v-if="store.items.length > 0"
+          v-if="isAdminScope && store.items.length > 0"
           type="button"
           class="glass-button-ghost px-3.5 py-2 text-sm font-medium"
           :disabled="testingAll"
@@ -249,7 +266,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
           {{ testingAll ? m.common_testing() : m.ch_test_all() }}
         </button>
         <button
-          v-if="store.items.length > 0"
+          v-if="isAdminScope && store.items.length > 0"
           type="button"
           class="glass-button-ghost px-3.5 py-2 text-sm font-medium"
           :class="selecting ? '!bg-accent/12 !text-accent' : ''"
@@ -261,7 +278,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
         <button
           type="button"
           class="glass-button-primary flex items-center gap-1.5 px-4 py-2 text-sm font-medium"
-          @click="router.push('/channels/new')"
+          @click="router.push(newPath())"
         >
           <AppIcon name="plus" :size="15" />
           {{ m.ch_new_channel() }}
@@ -271,7 +288,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
 
     <!-- 全局开关 + 过滤 -->
     <div class="glass glass-specular mb-5 flex flex-wrap items-center justify-between gap-4 p-4">
-      <label v-if="policy" class="flex cursor-pointer items-center gap-3">
+      <label v-if="isAdminScope && policy" class="flex cursor-pointer items-center gap-3">
         <GlassSwitch
           :model-value="policy.native_first"
           :disabled="policySaving"
@@ -312,7 +329,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
       <button
         type="button"
         class="glass-button-primary mt-5 px-4 py-2 text-sm font-medium"
-        @click="router.push('/channels/new')"
+        @click="router.push(newPath())"
       >
         {{ m.ch_create_first() }}
       </button>
@@ -331,6 +348,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
         v-for="ch in sorted"
         :key="ch.id"
         :channel="ch"
+        :admin-tools="isAdminScope"
         :selecting="selecting"
         :selected="selected.has(ch.id)"
         :test-result="testResults[ch.id]"
@@ -346,7 +364,7 @@ const suspendedCount = computed(() => healthItems.value.filter(isSuspended).leng
         @test="runTest(ch)"
         @balance="refreshBalance(ch)"
         @duplicate="duplicateChannel(ch.id)"
-        @edit="router.push(`/channels/${ch.id}/edit`)"
+        @edit="router.push(editPath(ch.id))"
         @ask-delete="pendingDelete = ch.id"
         @confirm-delete="confirmDelete(ch.id)"
         @cancel-delete="pendingDelete = null"

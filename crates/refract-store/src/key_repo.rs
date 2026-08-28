@@ -21,6 +21,9 @@ pub struct ApiKey {
     pub id: i64,
     /// 所有者。
     pub owner_id: i64,
+    /// 所属用户。历史密钥可能为空。
+    #[serde(default)]
+    pub user_id: Option<i64>,
     /// 展示名。
     pub name: String,
     /// 明文密钥的前若干位，用于 UI 辨识。
@@ -122,6 +125,9 @@ pub struct ExportedApiKey {
     /// 过期时间。
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
+    /// 所属用户。旧备份没有此字段；导入时由 API 层按 email 解析后填入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
 }
 
 /// 新建密钥的参数。
@@ -129,6 +135,9 @@ pub struct ExportedApiKey {
 pub struct NewApiKey {
     /// 展示名。
     pub name: String,
+    /// 所属用户。
+    #[serde(default)]
+    pub user_id: Option<i64>,
     /// 允许访问的模型。
     #[serde(default)]
     pub allowed_models: Vec<String>,
@@ -189,7 +198,7 @@ impl ApiKeyRepo {
 
 macro_rules! api_key_cols {
     () => {
-        "id, owner_id, name, key_prefix, enabled, allowed_models, allowed_tags, \
+        "id, owner_id, user_id, name, key_prefix, enabled, allowed_models, allowed_tags, \
          quota, used_quota, rpm_limit, tpm_limit, budget, used_budget, note, expires_at, \
          last_used_at, created_at"
     };
@@ -210,6 +219,16 @@ const SELECT_API_KEYS_LIST: &str = concat!(
     api_key_cols!(),
     " FROM api_keys WHERE owner_id = ? ORDER BY id DESC"
 );
+const SELECT_API_KEY_BY_ID_FOR_USER: &str = concat!(
+    "SELECT ",
+    api_key_cols!(),
+    " FROM api_keys WHERE owner_id = ? AND id = ? AND user_id = ?"
+);
+const SELECT_API_KEYS_LIST_FOR_USER: &str = concat!(
+    "SELECT ",
+    api_key_cols!(),
+    " FROM api_keys WHERE owner_id = ? AND user_id = ? ORDER BY id DESC"
+);
 
 impl ApiKeyRepo {
     /// 创建密钥，返回 `(记录, 明文)`。明文此后无法再取回。
@@ -228,11 +247,12 @@ impl ApiKeyRepo {
 
         let id: i64 = sqlx::query(
             "INSERT INTO api_keys \
-             (owner_id, name, key_hash, key_prefix, allowed_models, allowed_tags, quota, \
+             (owner_id, user_id, name, key_hash, key_prefix, allowed_models, allowed_tags, quota, \
               rpm_limit, tpm_limit, budget, note, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(owner_id)
+        .bind(spec.user_id)
         .bind(spec.name.trim())
         .bind(&hash)
         .bind(&prefix)
@@ -250,6 +270,145 @@ impl ApiKeyRepo {
 
         let key = self.get(owner_id, id).await?;
         Ok((key, plaintext))
+    }
+
+    /// 为指定用户创建密钥，强制写入 `user_id`。
+    pub async fn create_for_user(
+        &self,
+        owner_id: i64,
+        user_id: i64,
+        mut spec: NewApiKey,
+    ) -> Result<(ApiKey, String), StoreError> {
+        spec.user_id = Some(user_id);
+        self.create(owner_id, spec).await
+    }
+
+    /// 列出某用户的密钥。
+    pub async fn list_for_user(
+        &self,
+        owner_id: i64,
+        user_id: i64,
+    ) -> Result<Vec<ApiKey>, StoreError> {
+        let rows = sqlx::query(SELECT_API_KEYS_LIST_FOR_USER)
+            .bind(owner_id)
+            .bind(user_id)
+            .fetch_all(self.db.pool())
+            .await?;
+        rows.iter().map(Self::from_row).collect()
+    }
+
+    /// 取某用户的一把密钥；不属于该用户则 NotFound。
+    pub async fn get_for_user(
+        &self,
+        owner_id: i64,
+        user_id: i64,
+        id: i64,
+    ) -> Result<ApiKey, StoreError> {
+        let row = sqlx::query(SELECT_API_KEY_BY_ID_FOR_USER)
+            .bind(owner_id)
+            .bind(id)
+            .bind(user_id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| StoreError::not_found("api key", id))?;
+        Self::from_row(&row)
+    }
+
+    /// 更新某用户的密钥治理属性。
+    pub async fn update_for_user(
+        &self,
+        owner_id: i64,
+        user_id: i64,
+        id: i64,
+        spec: &NewApiKey,
+    ) -> Result<ApiKey, StoreError> {
+        if spec.name.trim().is_empty() {
+            return Err(StoreError::Invalid("api key name must not be empty".into()));
+        }
+        let affected = sqlx::query(
+            "UPDATE api_keys SET name = ?, allowed_models = ?, allowed_tags = ?, quota = ?, \
+             rpm_limit = ?, tpm_limit = ?, budget = ?, note = ?, expires_at = ? \
+             WHERE id = ? AND owner_id = ? AND user_id = ?",
+        )
+        .bind(spec.name.trim())
+        .bind(serde_json::to_string(&spec.allowed_models).expect("models serialize"))
+        .bind(serde_json::to_string(&spec.allowed_tags).expect("tags serialize"))
+        .bind(spec.quota.max(0))
+        .bind(spec.rpm_limit.max(0))
+        .bind(spec.tpm_limit.max(0))
+        .bind(spec.budget.max(0.0))
+        .bind(spec.note.as_deref())
+        .bind(spec.expires_at.map(|d| d.to_rfc3339()))
+        .bind(id)
+        .bind(owner_id)
+        .bind(user_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        crate::ensure_affected(affected, "api key", id)?;
+        self.get_for_user(owner_id, user_id, id).await
+    }
+
+    /// 清零某用户密钥的已用配额。
+    pub async fn reset_usage_for_user(
+        &self,
+        owner_id: i64,
+        user_id: i64,
+        id: i64,
+    ) -> Result<(), StoreError> {
+        let affected = sqlx::query(
+            "UPDATE api_keys SET used_quota = 0, used_budget = 0 \
+             WHERE id = ? AND owner_id = ? AND user_id = ?",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .bind(user_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        crate::ensure_affected(affected, "api key", id)?;
+        Ok(())
+    }
+
+    /// 启用/停用某用户的密钥。
+    pub async fn set_enabled_for_user(
+        &self,
+        owner_id: i64,
+        user_id: i64,
+        id: i64,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let affected = sqlx::query(
+            "UPDATE api_keys SET enabled = ? WHERE id = ? AND owner_id = ? AND user_id = ?",
+        )
+        .bind(enabled)
+        .bind(id)
+        .bind(owner_id)
+        .bind(user_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        crate::ensure_affected(affected, "api key", id)?;
+        Ok(())
+    }
+
+    /// 删除某用户的密钥。
+    pub async fn delete_for_user(
+        &self,
+        owner_id: i64,
+        user_id: i64,
+        id: i64,
+    ) -> Result<(), StoreError> {
+        let affected =
+            sqlx::query("DELETE FROM api_keys WHERE id = ? AND owner_id = ? AND user_id = ?")
+                .bind(id)
+                .bind(owner_id)
+                .bind(user_id)
+                .execute(self.db.pool())
+                .await?
+                .rows_affected();
+        crate::ensure_affected(affected, "api key", id)?;
+        Ok(())
     }
 
     /// 按明文查密钥。鉴权热路径。
@@ -365,7 +524,8 @@ impl ApiKeyRepo {
     pub async fn export(&self, owner_id: i64) -> Result<Vec<ExportedApiKey>, StoreError> {
         let rows = sqlx::query(
             "SELECT name, key_hash, key_prefix, enabled, allowed_models, allowed_tags, \
-             quota, used_quota, rpm_limit, tpm_limit, budget, used_budget, note, expires_at \
+             quota, used_quota, rpm_limit, tpm_limit, budget, used_budget, note, expires_at, \
+             user_id \
              FROM api_keys WHERE owner_id = ? ORDER BY id",
         )
         .bind(owner_id)
@@ -392,6 +552,7 @@ impl ApiKeyRepo {
                     used_budget: row.get("used_budget"),
                     note: row.get("note"),
                     expires_at: parse_ts(row.get::<Option<String>, _>("expires_at")),
+                    user_id: row.get("user_id"),
                 })
             })
             .collect()
@@ -442,12 +603,13 @@ impl ApiKeyRepo {
         }
         let affected = sqlx::query(
             "INSERT INTO api_keys \
-             (owner_id, name, key_hash, key_prefix, enabled, allowed_models, allowed_tags, \
+             (owner_id, user_id, name, key_hash, key_prefix, enabled, allowed_models, allowed_tags, \
               quota, used_quota, rpm_limit, tpm_limit, budget, used_budget, note, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (key_hash) DO NOTHING",
         )
         .bind(owner_id)
+        .bind(key.user_id)
         .bind(key.name.trim())
         .bind(&key.key_hash)
         .bind(&key.key_prefix)
@@ -498,6 +660,7 @@ impl ApiKeyRepo {
         Ok(ApiKey {
             id: row.get("id"),
             owner_id: row.get("owner_id"),
+            user_id: row.get("user_id"),
             name: row.get("name"),
             key_prefix: row.get("key_prefix"),
             enabled: row.get("enabled"),
@@ -616,6 +779,7 @@ mod tests {
                 used_budget: 0.0,
                 note: None,
                 expires_at: None,
+                user_id: None,
             },
             // 与第一把 key_hash 相同：应被去重跳过，而不是报错。
             ExportedApiKey {
@@ -633,6 +797,7 @@ mod tests {
                 used_budget: 0.0,
                 note: None,
                 expires_at: None,
+                user_id: None,
             },
         ];
         let (imported, skipped) = repo.replace_all(DEFAULT_OWNER_ID, &incoming).await.unwrap();
@@ -672,6 +837,7 @@ mod tests {
             used_budget: 0.0,
             note: None,
             expires_at: None,
+            user_id: None,
         };
         let err = repo
             .replace_all(DEFAULT_OWNER_ID, &[bad])
@@ -790,6 +956,7 @@ mod tests {
         let base = ApiKey {
             id: 1,
             owner_id: 1,
+            user_id: None,
             name: "k".into(),
             key_prefix: "rk-abc".into(),
             enabled: true,
@@ -848,6 +1015,7 @@ mod tests {
             owner_id: 1,
             name: "k".into(),
             key_prefix: String::new(),
+            user_id: None,
             enabled: true,
             allowed_models: vec![],
             allowed_tags: vec![],
@@ -911,6 +1079,7 @@ mod tests {
                     budget: 0.0,
                     note: None,
                     expires_at: None,
+                    user_id: None,
                 },
             )
             .await
@@ -966,5 +1135,89 @@ mod tests {
         assert!(parse_ts(Some("2026-08-10T12:34:56+00:00".into())).is_some());
         assert!(parse_ts(None).is_none());
         assert!(parse_ts(Some("garbage".into())).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_for_user_scopes_key_to_that_user() {
+        let db = Database::open_in_memory().await.unwrap();
+        let users = crate::user_repo::UserRepo::new(db.clone());
+        let repo = ApiKeyRepo::new(db);
+        let alice = users
+            .create(
+                "alice@x.test",
+                "h",
+                "alice",
+                crate::user_repo::UserRole::User,
+            )
+            .await
+            .unwrap();
+        let bob = users
+            .create("bob@x.test", "h", "bob", crate::user_repo::UserRole::User)
+            .await
+            .unwrap();
+
+        let (key, _) = repo
+            .create_for_user(
+                DEFAULT_OWNER_ID,
+                alice.id,
+                NewApiKey {
+                    name: "alice-key".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(key.user_id, Some(alice.id));
+
+        let listed = repo
+            .list_for_user(DEFAULT_OWNER_ID, alice.id)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, key.id);
+        assert!(
+            repo.list_for_user(DEFAULT_OWNER_ID, bob.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            repo.get_for_user(DEFAULT_OWNER_ID, alice.id, key.id)
+                .await
+                .unwrap()
+                .id,
+            key.id
+        );
+        assert!(
+            repo.get_for_user(DEFAULT_OWNER_ID, bob.id, key.id)
+                .await
+                .is_err()
+        );
+
+        repo.set_enabled_for_user(DEFAULT_OWNER_ID, alice.id, key.id, false)
+            .await
+            .unwrap();
+        assert!(
+            repo.set_enabled_for_user(DEFAULT_OWNER_ID, bob.id, key.id, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            !repo
+                .get_for_user(DEFAULT_OWNER_ID, alice.id, key.id)
+                .await
+                .unwrap()
+                .enabled
+        );
+
+        repo.delete_for_user(DEFAULT_OWNER_ID, alice.id, key.id)
+            .await
+            .unwrap();
+        assert!(
+            repo.get_for_user(DEFAULT_OWNER_ID, alice.id, key.id)
+                .await
+                .is_err()
+        );
     }
 }

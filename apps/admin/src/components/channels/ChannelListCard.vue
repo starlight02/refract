@@ -9,19 +9,23 @@ import AppIcon from '@/components/AppIcon.vue'
 import * as m from '@/paraglide/messages'
 import type { Channel, ChannelTestResult, EndpointHealth, Protocol } from '@refract/contracts'
 
-const props = defineProps<{
-  channel: Channel
-  selecting: boolean
-  selected: boolean
-  testResult?: ChannelTestResult | 'pending'
-  suspended: EndpointHealth[]
-  resetting: ReadonlySet<string>
-  testingAll: boolean
-  balanceBusy: boolean
-  copying: boolean
-  pendingDelete: boolean
-  deleting: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    channel: Channel
+    selecting: boolean
+    selected: boolean
+    testResult?: ChannelTestResult | 'pending'
+    suspended: EndpointHealth[]
+    resetting: ReadonlySet<string>
+    testingAll: boolean
+    balanceBusy: boolean
+    copying: boolean
+    pendingDelete: boolean
+    deleting: boolean
+    adminTools?: boolean
+  }>(),
+  { adminTools: true },
+)
 
 const emit = defineEmits<{
   select: []
@@ -144,6 +148,17 @@ function resetKey(h: EndpointHealth): string {
           >
             {{ m.ch_card_auto_disabled_tag() }}
           </span>
+          <span
+            v-if="adminTools && ch.visibility"
+            class="proto-badge"
+            :style="
+              ch.visibility === 'private'
+                ? 'color: var(--color-warning)'
+                : 'color: var(--color-accent)'
+            "
+          >
+            {{ ch.visibility === 'private' ? m.ch_visibility_private() : m.ch_visibility_shared() }}
+          </span>
         </div>
 
         <div class="mt-1.5 truncate font-mono text-xs text-ink-faint">
@@ -255,6 +270,7 @@ function resetKey(h: EndpointHealth): string {
         />
 
         <button
+          v-if="adminTools"
           type="button"
           class="glass-button-ghost px-2.5 py-1.5 text-xs"
           :disabled="testResult === 'pending' || testingAll"
@@ -269,7 +285,7 @@ function resetKey(h: EndpointHealth): string {
         </button>
 
         <button
-          v-if="canProbeBalance(ch)"
+          v-if="adminTools && canProbeBalance(ch)"
           type="button"
           class="glass-button-ghost px-2.5 py-1.5 text-xs"
           :disabled="balanceBusy"
@@ -285,6 +301,7 @@ function resetKey(h: EndpointHealth): string {
         </button>
 
         <button
+          v-if="adminTools"
           type="button"
           class="glass-button-ghost px-2.5 py-1.5 text-xs"
           :disabled="copying"

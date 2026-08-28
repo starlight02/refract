@@ -284,16 +284,18 @@ refract-server    二进制：配置加载、装配、嵌入前端、优雅关�
 
 依赖方向严格单向，无循环。`refract-protocol` 不依赖 store/upstream，可以脱离 IO 做纯单元测试 —— 这是协议转换正确性的保证。
 
-## 6. 多用户可扩展性（需求 7）
+## 6. 多用户（需求 7）
 
-个人自用不做用户系统，但**不能把"单用户"焊死在数据模型里**。做法：
+已实现开放注册 + 混合渠道归属 + 预付费计费账本。租户边界（`owner_id`）与早期预留一致，多用户在其上叠加了用户维度：
 
-- 所有业务表**预留 `owner_id INTEGER NOT NULL DEFAULT 1`** 列，当前恒为 1。
-- 网关鉴权抽象为 `Authenticator`，产出 `Principal { owner_id, scopes, api_key }`。当前 `SingleUserAuthenticator` 校验网关 API key；管理令牌是独立的管理面凭据，避免推理密钥获得配置权限。未来可替换认证器而不改 Warp 路由与授权判断。
-- 仓储层所有查询方法**都带 `owner_id` 参数**，当前传常量。
-- 配额字段在 schema 中就位（`quota`, `used_quota`），鉴权时强制检查，成功请求按实际用量累计。`auth.admin_username` 会在 bootstrap 写入，当前会话响应仍硬编码 `admin@localhost`，该键尚未参与鉴权。
+- **账号**：`users` 表存邮箱 + Argon2id 密码哈希（m=19MiB/t=2/p=1）、`role`（user/admin）、`status`（pending_verification/active/disabled）、`session_revoked_at`。注册即发 6 位邮箱验证码（10 分钟过期、5 次尝试上限）；SMTP 未配置时验证码走日志（dev mode）。
+- **会话**：HttpOnly Cookie 携带四段签名 ticket（`iat.exp.user_id.sig`），改密码/禁用后旧会话即时失效；用户状态/角色走 30 秒内存缓存。
+- **渠道归属**：`Channel.visibility` 区分 `shared`（管理员维护的全局池）与 `private`（`user_id` 指向属主）。路由渠道池 = 全部 shared + 本用户 private，由 `AppState::channels_for(user_id)` 过滤。
+- **计费**：预付费钱包（`wallets`）+ 账本（`wallet_ledger`，种类 topup/charge/refund/adjust）。网关按请求实际 `cost` 扣款，幂等键为 `request_id`（重试不双扣）；余额预检走 60 秒共享 TTL 缓存，余额不足返回 403 与结构化 `insufficient_balance` 错误体。扣款失败不回滚已完成的请求，只计数告警。
+- **认证器**：`SingleUserAuthenticator` 校验链 = API key 可用 → 归属用户 active → 余额为正，产出带 `user_id` 的 `Principal`。管理令牌仍是独立紧急通道。
+- **API 面拆分**：`/api/auth/*`（注册/登录/找回，公开）、`/api/me/*`（自助，强制 `user_id = self`）、`/api/admin/*`（管理，要求 admin 角色）。旧 `/api/*` 一律 410 Gone。
 
-这样加多用户 = 加一张 users 表 + 换一个 Authenticator 实现 + 放开 owner_id 来源，不动业务逻辑。
+租户级 `owner_id` 当前恒为 1；用户级隔离由 `user_id` 与 `visibility` 承载，业务表结构不变。
 
 ## 6.1 安全与凭据治理
 
@@ -317,7 +319,7 @@ packages/contracts
 
 边界原则：
 
-- `admin` 是管理面客户端，与 `/api/*` 同源部署；它使用管理令牌，不承载公开站点会话。
+- `admin` 是管理面客户端，与 `/api/*` 同源部署；它承载两类用户——管理员（管理令牌或邮箱登录）与普通注册用户（邮箱登录 + 自助面），按角色渲染路由。
 - `homepage` 是公开展示面，独立发布到静态托管/CDN；它不进入网关二进制，也不直接依赖管理 API。
 - `contracts` 只保存线上的 JSON 类型和稳定协议元数据，不放 UI 组件、状态管理或 HTTP transport。
 - 两个应用可以使用不同 UI 框架；共享发生在协议和设计 token 层，不做跨 React/Vue 组件封装。

@@ -291,4 +291,177 @@ mod tests {
         limiter.admit_at(i64::MAX, 1, 0, 120).unwrap();
         assert!(limiter.window_count() <= MAX_WINDOWS);
     }
+
+    #[test]
+    fn ttl_cache_expires_and_invalidates() {
+        let cache = TtlCache::new(std::time::Duration::from_millis(50));
+        cache.insert(1, 10);
+        assert_eq!(cache.get(&1), Some(10));
+        cache.invalidate(&1);
+        assert_eq!(cache.get(&1), None);
+        cache.insert(2, 20);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(cache.get(&2), None);
+    }
+
+    #[test]
+    fn auth_rate_limiter_enforces_hourly_attempts_and_daily_successes() {
+        let limiter = AuthRateLimiter::new();
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        for _ in 0..5 {
+            assert!(limiter.check_register(ip).is_none());
+            limiter.record_register_attempt(ip);
+        }
+        // 第 6 次尝试撞每小时窗口。
+        assert!(limiter.check_register(ip).is_some());
+
+        let ip2 = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
+        for _ in 0..3 {
+            limiter.record_register_attempt(ip2);
+            limiter.record_register_success(ip2);
+        }
+        assert!(limiter.check_register(ip2).is_some());
+    }
+}
+
+/// 极简 TTL 缓存：读时惰性过期，写时全量覆盖。
+///
+/// 用于用户状态（30 秒）与余额（60 秒）这类「允许秒级延迟、但每次请求打库太贵」
+/// 的读多写少数据。主动失效由写路径负责（见 `AppState`）。
+#[derive(Debug)]
+pub struct TtlCache<K, V> {
+    entries: std::sync::Arc<Mutex<HashMap<K, (V, std::time::Instant)>>>,
+    ttl: std::time::Duration,
+}
+
+impl<K, V> Clone for TtlCache<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: std::sync::Arc::clone(&self.entries),
+            ttl: self.ttl,
+        }
+    }
+}
+
+impl<K, V> TtlCache<K, V>
+where
+    K: std::hash::Hash + Eq,
+    V: Clone,
+{
+    /// 创建缓存。
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            entries: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            ttl,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<K, (V, std::time::Instant)>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 读。过期即视为未命中并顺手清掉。
+    pub fn get(&self, key: &K) -> Option<V> {
+        let mut guard = self.lock();
+        let (value, at) = guard.get(key)?;
+        if at.elapsed() >= self.ttl {
+            guard.remove(key);
+            return None;
+        }
+        Some(value.clone())
+    }
+
+    /// 写。
+    pub fn insert(&self, key: K, value: V) {
+        self.lock().insert(key, (value, std::time::Instant::now()));
+    }
+
+    /// 主动失效。
+    pub fn invalidate(&self, key: &K) {
+        self.lock().remove(key);
+    }
+}
+
+/// 注册/认证限流：每 IP 每小时最多 5 次注册尝试 + 每 IP 每天最多 3 个成功账号。
+///
+/// 纯内存实现，重启清零 —— 防刷是保护措施而非精确计费，与 `RateLimiter` 同哲学。
+#[derive(Debug, Default)]
+pub struct AuthRateLimiter {
+    /// 每小时注册尝试窗口。
+    hourly: Mutex<HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+    /// 每天注册成功窗口。
+    daily: Mutex<HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+}
+
+impl AuthRateLimiter {
+    /// 创建限流器。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 该 IP 当前是否被注册限流。返回剩余等待秒数。
+    pub fn check_register(&self, ip: std::net::IpAddr) -> Option<u64> {
+        let now = std::time::Instant::now();
+        {
+            let mut hourly = self
+                .hourly
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((count, at)) = hourly.get(&ip).copied() {
+                if now.duration_since(at) >= std::time::Duration::from_secs(3600) {
+                    hourly.remove(&ip);
+                } else if count >= 5 {
+                    return Some(
+                        3600_u64
+                            .saturating_sub(now.duration_since(at).as_secs())
+                            .max(1),
+                    );
+                }
+            }
+        }
+        let mut daily = self
+            .daily
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((count, at)) = daily.get(&ip).copied() {
+            if now.duration_since(at) >= std::time::Duration::from_secs(86_400) {
+                daily.remove(&ip);
+            } else if count >= 3 {
+                return Some(
+                    86_400_u64
+                        .saturating_sub(now.duration_since(at).as_secs())
+                        .max(1),
+                );
+            }
+        }
+        None
+    }
+
+    /// 记录一次注册尝试。
+    pub fn record_register_attempt(&self, ip: std::net::IpAddr) {
+        let mut hourly = self
+            .hourly
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = hourly.entry(ip).or_insert((0, std::time::Instant::now()));
+        if entry.1.elapsed() >= std::time::Duration::from_secs(3600) {
+            *entry = (0, std::time::Instant::now());
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
+
+    /// 记录一次注册成功（占当天名额）。
+    pub fn record_register_success(&self, ip: std::net::IpAddr) {
+        let mut daily = self
+            .daily
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = daily.entry(ip).or_insert((0, std::time::Instant::now()));
+        if entry.1.elapsed() >= std::time::Duration::from_secs(86_400) {
+            *entry = (0, std::time::Instant::now());
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
 }

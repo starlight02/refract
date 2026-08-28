@@ -60,6 +60,8 @@ export function blankChannel(): Channel {
     param_override: null,
     note: null,
     empty_response_retry: { window_secs: null, max_retries: null },
+    visibility: 'shared',
+    user_id: null,
   }
 }
 

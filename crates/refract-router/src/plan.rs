@@ -439,7 +439,7 @@ pub enum Diagnosis {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use refract_core::{ChannelKind, ProtocolSet, TranscodePolicy};
+    use refract_core::{ChannelKind, ChannelVisibility, ProtocolSet, TranscodePolicy};
 
     /// 确定性 RNG，让权重随机的测试可复现。
     fn rng() -> impl rand::RngExt {
@@ -502,6 +502,8 @@ mod tests {
             extra_headers: Vec::new(),
             test_model: None,
             empty_response_retry: Default::default(),
+            visibility: ChannelVisibility::Shared,
+            user_id: None,
         }
     }
 
@@ -1166,5 +1168,75 @@ mod tests {
         let chans = [ch];
         let route = native_route(Protocol::Chat, &chans);
         assert!(route.is_empty());
+    }
+
+    // ── Visibility-filtered candidate set (D7) ──
+
+    #[test]
+    fn visibility_filtered_candidates_keep_native_first_rank() {
+        struct Case {
+            name: &'static str,
+            user_id: i64,
+            native_first: bool,
+            expected: &'static [ChannelId],
+        }
+
+        let mut shared = channel(
+            1,
+            "shared-transcode",
+            100,
+            vec![endpoint(
+                Protocol::Messages,
+                0,
+                &["gpt-4o"],
+                ProtocolSet::from_iter_protocols([Protocol::Chat]),
+            )],
+        );
+        shared.visibility = ChannelVisibility::Shared;
+        shared.user_id = None;
+
+        let mut private = channel(
+            2,
+            "private-native",
+            0,
+            vec![endpoint(Protocol::Chat, 0, &["gpt-4o"], ProtocolSet::EMPTY)],
+        );
+        private.visibility = ChannelVisibility::Private;
+        private.user_id = Some(7);
+
+        let pool = [shared, private];
+        let cases = [
+            Case {
+                name: "user 7 sees private native first when native_first",
+                user_id: 7,
+                native_first: true,
+                expected: &[2, 1],
+            },
+            Case {
+                name: "user 7 ranks by priority when native_first off",
+                user_id: 7,
+                native_first: false,
+                expected: &[1, 2],
+            },
+            Case {
+                name: "other user only sees shared after filter",
+                user_id: 8,
+                native_first: true,
+                expected: &[1],
+            },
+        ];
+
+        for case in cases {
+            let visible: Vec<&Channel> = pool
+                .iter()
+                .filter(|ch| ch.visible_to(case.user_id))
+                .collect();
+            let planner = RoutePlanner::new(RoutingPolicy {
+                native_first: case.native_first,
+                ..Default::default()
+            });
+            let route = planner.plan(visible, "gpt-4o", Protocol::Chat, &mut rng());
+            assert_eq!(ids(&route), case.expected, "{}", case.name);
+        }
     }
 }

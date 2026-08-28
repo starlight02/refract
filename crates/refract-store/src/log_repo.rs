@@ -18,6 +18,9 @@ pub struct RequestLog {
     pub created_at: DateTime<Utc>,
     /// 使用的网关密钥。
     pub api_key_id: Option<i64>,
+    /// 发起请求的用户。历史日志可能为空。
+    #[serde(default)]
+    pub user_id: Option<i64>,
     /// 命中的渠道。
     pub channel_id: Option<ChannelId>,
     /// 渠道名快照（渠道被删后日志仍可读）。
@@ -81,6 +84,8 @@ pub struct NewRequestLog {
     pub request_id: String,
     /// 网关密钥 ID。
     pub api_key_id: Option<i64>,
+    /// 发起请求的用户。
+    pub user_id: Option<i64>,
     /// 渠道 ID。
     pub channel_id: Option<ChannelId>,
     /// 渠道名。
@@ -144,6 +149,7 @@ impl NewRequestLog {
             owner_id,
             request_id,
             api_key_id,
+            user_id: None,
             channel_id: None,
             channel_name: None,
             inbound_protocol,
@@ -252,6 +258,9 @@ pub struct LogFilter {
     /// 按网关密钥筛。
     #[serde(default)]
     pub api_key_id: Option<i64>,
+    /// 按用户筛。
+    #[serde(default)]
+    pub user_id: Option<i64>,
     /// 按请求 ID 精确检索 —— `x-refract-request-id` 响应头的排障动线。
     #[serde(default)]
     pub request_id: Option<String>,
@@ -378,7 +387,7 @@ pub struct LogRepo {
 }
 macro_rules! log_summary_cols {
     () => {
-        "id, request_id, created_at, api_key_id, channel_id, channel_name, \
+        "id, request_id, created_at, api_key_id, user_id, channel_id, channel_name, \
          inbound_protocol, upstream_protocol, transcoded, model, upstream_model, stream, \
          status, ttfb_ms, duration_ms, input_tokens, output_tokens, cached_tokens, \
          cache_write_tokens, reasoning_tokens, retries, cost, error_kind, error_message, \
@@ -388,7 +397,7 @@ macro_rules! log_summary_cols {
 
 macro_rules! log_detail_cols {
     () => {
-        "id, request_id, created_at, api_key_id, channel_id, channel_name, \
+        "id, request_id, created_at, api_key_id, user_id, channel_id, channel_name, \
          inbound_protocol, upstream_protocol, transcoded, model, upstream_model, stream, \
          status, ttfb_ms, duration_ms, input_tokens, output_tokens, cached_tokens, \
          cache_write_tokens, reasoning_tokens, retries, cost, error_kind, error_message, \
@@ -404,6 +413,7 @@ const QUERY_LOGS_SQL: &str = concat!(
        AND (? IS NULL OR model = ?) \
        AND (? IS NULL OR channel_id = ?) \
        AND (? IS NULL OR api_key_id = ?) \
+       AND (? IS NULL OR user_id = ?) \
        AND (? IS NULL OR request_id = ?) \
        AND (? IS NULL OR created_at >= ?) \
        AND (? IS NULL OR created_at <= ?) \
@@ -427,14 +437,15 @@ impl LogRepo {
     pub async fn append(&self, entry: &NewRequestLog) -> Result<i64, StoreError> {
         let id: i64 = sqlx::query(
             "INSERT INTO request_logs \
-             (owner_id, request_id, api_key_id, channel_id, channel_name, inbound_protocol, \
+             (owner_id, user_id, request_id, api_key_id, channel_id, channel_name, inbound_protocol, \
               upstream_protocol, transcoded, model, upstream_model, stream, status, ttfb_ms, \
               duration_ms, input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
               reasoning_tokens, retries, cost, error_kind, error_message, credential_hint, \
               affinity_rule, request_body, response_body) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(entry.owner_id)
+        .bind(entry.user_id)
         .bind(&entry.request_id)
         .bind(entry.api_key_id)
         .bind(entry.channel_id)
@@ -490,6 +501,8 @@ impl LogRepo {
             .bind(filter.channel_id)
             .bind(filter.api_key_id)
             .bind(filter.api_key_id)
+            .bind(filter.user_id)
+            .bind(filter.user_id)
             .bind(filter.request_id.as_deref())
             .bind(filter.request_id.as_deref())
             .bind(filter.since.as_deref())
@@ -706,6 +719,215 @@ impl LogRepo {
             .collect())
     }
 
+    /// 最近 N 小时汇总，限定 `user_id`（`None` 只匹配 `user_id IS NULL` 的行）。
+    pub async fn summary_for_user(
+        &self,
+        owner_id: i64,
+        user_id: Option<i64>,
+        hours: u32,
+    ) -> Result<StatsSummary, StoreError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS requests, \
+                    COALESCE(SUM(status >= 400), 0) AS failures, \
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                    COALESCE(AVG(duration_ms), 0.0) AS avg_duration, \
+                    AVG(ttfb_ms) AS avg_ttfb, \
+                    COALESCE(SUM(transcoded), 0) AS transcoded, \
+                    COALESCE(SUM(cost), 0.0) AS cost \
+             FROM request_logs \
+             WHERE owner_id = ? AND (user_id = ? OR (user_id IS NULL AND ? IS NULL)) \
+               AND created_at >= datetime('now', ?)",
+        )
+        .bind(owner_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(format!("-{hours} hours"))
+        .fetch_one(self.db.pool())
+        .await?;
+
+        Ok(StatsSummary {
+            requests: row.get("requests"),
+            failures: row.get("failures"),
+            input_tokens: row.get("input_tokens"),
+            output_tokens: row.get("output_tokens"),
+            avg_duration_ms: row.get("avg_duration"),
+            avg_ttfb_ms: row.get("avg_ttfb"),
+            transcoded: row.get("transcoded"),
+            cost: row.get("cost"),
+        })
+    }
+
+    /// 最近 N 小时按模型排行，限定用户。
+    pub async fn by_model_for_user(
+        &self,
+        owner_id: i64,
+        user_id: Option<i64>,
+        hours: u32,
+        limit: u32,
+    ) -> Result<Vec<ModelStat>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT model, COUNT(*) AS requests, \
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                    COALESCE(SUM(cost), 0.0) AS cost, \
+                    AVG(ttfb_ms) AS avg_ttfb, \
+                    COALESCE(AVG(duration_ms), 0.0) AS avg_duration, \
+                    CAST(SUM(output_tokens) AS REAL) * 1000.0 \
+                      / NULLIF(SUM(MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)), 0) AS tokens_per_sec \
+             FROM request_logs \
+             WHERE owner_id = ? AND (user_id = ? OR (user_id IS NULL AND ? IS NULL)) \
+               AND created_at >= datetime('now', ?) \
+             GROUP BY model ORDER BY requests DESC LIMIT ?",
+        )
+        .bind(owner_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(format!("-{hours} hours"))
+        .bind(i64::from(limit.clamp(1, 100)))
+        .fetch_all(self.db.pool())
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ModelStat {
+                model: r.get("model"),
+                requests: r.get("requests"),
+                input_tokens: r.get("input_tokens"),
+                output_tokens: r.get("output_tokens"),
+                cost: r.get("cost"),
+                avg_ttfb_ms: r.get("avg_ttfb"),
+                avg_duration_ms: r.get("avg_duration"),
+                tokens_per_sec: r.get("tokens_per_sec"),
+            })
+            .collect())
+    }
+
+    /// 最近 N 小时按渠道聚合，限定用户。
+    pub async fn by_channel_for_user(
+        &self,
+        owner_id: i64,
+        user_id: Option<i64>,
+        hours: u32,
+    ) -> Result<Vec<ChannelStat>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT channel_id, COALESCE(channel_name, '(未知渠道)') AS channel_name, \
+                    COUNT(*) AS requests, \
+                    COALESCE(SUM(status >= 400), 0) AS failures, \
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                    COALESCE(SUM(cost), 0.0) AS cost, \
+                    AVG(ttfb_ms) AS avg_ttfb, \
+                    COALESCE(AVG(duration_ms), 0.0) AS avg_duration \
+             FROM request_logs \
+             WHERE owner_id = ? AND (user_id = ? OR (user_id IS NULL AND ? IS NULL)) \
+               AND created_at >= datetime('now', ?) \
+             GROUP BY channel_id, channel_name ORDER BY requests DESC",
+        )
+        .bind(owner_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(format!("-{hours} hours"))
+        .fetch_all(self.db.pool())
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ChannelStat {
+                channel_id: r.get("channel_id"),
+                channel_name: r.get("channel_name"),
+                requests: r.get("requests"),
+                failures: r.get("failures"),
+                input_tokens: r.get("input_tokens"),
+                output_tokens: r.get("output_tokens"),
+                cost: r.get("cost"),
+                avg_ttfb_ms: r.get("avg_ttfb"),
+                avg_duration_ms: r.get("avg_duration"),
+            })
+            .collect())
+    }
+
+    /// 最近 N 小时时间序列，限定用户。
+    pub async fn timeseries_for_user(
+        &self,
+        owner_id: i64,
+        user_id: Option<i64>,
+        hours: u32,
+        daily: bool,
+    ) -> Result<Vec<TimeBucket>, StoreError> {
+        let format = if daily { "%Y-%m-%d" } else { "%Y-%m-%d %H:00" };
+        let rows = sqlx::query(
+            "SELECT strftime(?, created_at) AS bucket, \
+                    COUNT(*) AS requests, \
+                    COALESCE(SUM(status >= 400), 0) AS failures, \
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                    COALESCE(SUM(cost), 0.0) AS cost \
+             FROM request_logs \
+             WHERE owner_id = ? AND (user_id = ? OR (user_id IS NULL AND ? IS NULL)) \
+               AND created_at >= datetime('now', ?) \
+             GROUP BY bucket ORDER BY bucket",
+        )
+        .bind(format)
+        .bind(owner_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(format!("-{hours} hours"))
+        .fetch_all(self.db.pool())
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| TimeBucket {
+                bucket: r.get("bucket"),
+                requests: r.get("requests"),
+                failures: r.get("failures"),
+                input_tokens: r.get("input_tokens"),
+                output_tokens: r.get("output_tokens"),
+                cost: r.get("cost"),
+            })
+            .collect())
+    }
+
+    /// 最近 N 小时按密钥聚合，限定用户。
+    pub async fn by_key_for_user(
+        &self,
+        owner_id: i64,
+        user_id: Option<i64>,
+        hours: u32,
+    ) -> Result<Vec<KeyUsageStat>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT api_key_id, COUNT(*) AS requests, \
+                    COALESCE(SUM(status >= 400), 0) AS failures, \
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                    COALESCE(SUM(cost), 0.0) AS cost \
+             FROM request_logs \
+             WHERE owner_id = ? AND api_key_id IS NOT NULL \
+               AND (user_id = ? OR (user_id IS NULL AND ? IS NULL)) \
+               AND created_at >= datetime('now', ?) \
+             GROUP BY api_key_id ORDER BY requests DESC",
+        )
+        .bind(owner_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(format!("-{hours} hours"))
+        .fetch_all(self.db.pool())
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| KeyUsageStat {
+                api_key_id: r.get("api_key_id"),
+                requests: r.get("requests"),
+                failures: r.get("failures"),
+                input_tokens: r.get("input_tokens"),
+                output_tokens: r.get("output_tokens"),
+                cost: r.get("cost"),
+            })
+            .collect())
+    }
+
     /// 删除 N 天前的日志，返回删除条数。
     ///
     /// 分批删：一次性 DELETE 在大表上是分钟级长事务，WAL 模式下会阻塞
@@ -740,6 +962,7 @@ impl LogRepo {
             created_at: parse_ts(row.get::<Option<String>, _>("created_at"))
                 .unwrap_or_else(Utc::now),
             api_key_id: row.get("api_key_id"),
+            user_id: row.get("user_id"),
             channel_id: row.get("channel_id"),
             channel_name: row.get("channel_name"),
             inbound_protocol: row.get("inbound_protocol"),
@@ -783,6 +1006,7 @@ mod tests {
             owner_id: DEFAULT_OWNER_ID,
             request_id: uuid::Uuid::new_v4().to_string(),
             api_key_id: Some(1),
+            user_id: None,
             channel_id: Some(7),
             channel_name: Some("relay".into()),
             inbound_protocol: Protocol::Chat,
@@ -1092,5 +1316,68 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(repo.query(2, &LogFilter::default()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn filter_by_user_id() {
+        let repo = repo().await;
+        let mut a = entry("alice", 200);
+        a.user_id = Some(1);
+        let mut b = entry("bob", 200);
+        b.user_id = Some(2);
+        repo.append(&a).await.unwrap();
+        repo.append(&b).await.unwrap();
+
+        let logs = repo
+            .query(
+                DEFAULT_OWNER_ID,
+                &LogFilter {
+                    user_id: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].model, "alice");
+        assert_eq!(logs[0].user_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn stats_for_user_are_isolated() {
+        let repo = repo().await;
+        let mut a = entry("alice", 200);
+        a.user_id = Some(1);
+        a.input_tokens = 10;
+        let mut b = entry("bob", 200);
+        b.user_id = Some(2);
+        b.input_tokens = 99;
+        repo.append(&a).await.unwrap();
+        repo.append(&b).await.unwrap();
+
+        let s1 = repo
+            .summary_for_user(DEFAULT_OWNER_ID, Some(1), 24)
+            .await
+            .unwrap();
+        assert_eq!(s1.requests, 1);
+        assert_eq!(s1.input_tokens, 10);
+
+        let s2 = repo
+            .summary_for_user(DEFAULT_OWNER_ID, Some(2), 24)
+            .await
+            .unwrap();
+        assert_eq!(s2.requests, 1);
+        assert_eq!(s2.input_tokens, 99);
+
+        let all = repo.summary(DEFAULT_OWNER_ID, 24).await.unwrap();
+        assert_eq!(all.requests, 2);
+        assert_eq!(all.input_tokens, 109);
+
+        let models = repo
+            .by_model_for_user(DEFAULT_OWNER_ID, Some(1), 24, 10)
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "alice");
     }
 }

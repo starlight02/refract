@@ -32,6 +32,14 @@ pub enum StoreError {
         /// 标识。
         id: String,
     },
+    /// 唯一约束冲突。
+    #[error("{entity} `{id}` already exists")]
+    Conflict {
+        /// 实体名。
+        entity: &'static str,
+        /// 标识。
+        id: String,
+    },
     /// 违反业务不变量。
     #[error("{0}")]
     Invalid(String),
@@ -48,7 +56,13 @@ impl StoreError {
             id: id.to_string(),
         }
     }
-
+    /// 构造一个「已存在」错误。
+    pub fn conflict(entity: &'static str, id: impl std::fmt::Display) -> Self {
+        Self::Conflict {
+            entity,
+            id: id.to_string(),
+        }
+    }
     /// 标注 JSON 解析失败的列名。
     pub fn json(column: &'static str) -> impl FnOnce(serde_json::Error) -> Self {
         move |source| Self::Json { column, source }
@@ -57,12 +71,19 @@ impl StoreError {
 
 impl From<StoreError> for refract_core::GatewayError {
     fn from(err: StoreError) -> Self {
-        match err {
+        match &err {
             StoreError::NotFound { .. } => refract_core::GatewayError::not_found(err.to_string()),
-            StoreError::Invalid(msg) => refract_core::GatewayError::invalid_request(msg),
-            other => refract_core::GatewayError::internal(other.to_string()),
+            StoreError::Invalid(_) | StoreError::Conflict { .. } => {
+                refract_core::GatewayError::invalid_request(err.to_string())
+            }
+            _ => refract_core::GatewayError::internal(err.to_string()),
         }
     }
+}
+
+/// 是否为 SQLite 唯一约束冲突。
+pub(crate) fn is_unique_violation(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(e) if e.is_unique_violation())
 }
 
 /// 数据库句柄。
@@ -247,6 +268,10 @@ mod tests {
             "channels",
             "request_logs",
             "settings",
+            "users",
+            "verification_codes",
+            "wallet_ledger",
+            "wallets",
         ] {
             assert!(
                 names.contains(&expected),

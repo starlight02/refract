@@ -23,12 +23,32 @@ pub const SESSION_COOKIE_NAME: &str = "refract_session";
 /// Session Cookie 有效期（7天）。
 pub const SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 
-/// 生成 Session Ticket 字符串。
-/// 格式: `<issued_at>.<expiry>.<signature_hex>`
-/// 签名数据: `format!("{admin_token_hash}:{issued_at}:{expiry}")`
-pub fn create_session_ticket(
+/// 已验证会话的主体身份。
+///
+/// 两种来源：用户邮箱+密码登录（`User`），或管理令牌直登的紧急通道（`LegacyAdmin`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSubject {
+    /// 管理令牌直登（紧急恢复通道）。语义上等同于 bootstrap admin 用户。
+    LegacyAdmin,
+    /// 某个注册用户。
+    User(i64),
+}
+
+/// 已验证会话解析结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedSession {
+    /// 主体身份。
+    pub subject: SessionSubject,
+    /// 签发时间（unix 秒）。配合 `users.session_revoked_at` 判定失效。
+    pub iat: i64,
+}
+
+/// 生成用户 Session Ticket 字符串。
+/// 格式: `<issued_at>.<expiry>.<user_id>.<signature_hex>`
+/// 签名数据: `format!("{user_id}:{issued_at}:{expiry}")`
+pub fn create_user_session_ticket(
     session_secret: &[u8; 32],
-    admin_token_hash: &str,
+    user_id: i64,
     ttl_secs: u64,
 ) -> String {
     let now = std::time::SystemTime::now()
@@ -36,49 +56,65 @@ pub fn create_session_ticket(
         .unwrap_or_default()
         .as_secs();
     let expiry = now.saturating_add(ttl_secs);
-    let msg = format!("{admin_token_hash}:{now}:{expiry}");
+    let msg = format!("{user_id}:{now}:{expiry}");
     let sig_bytes = crate::notify::hmac_sha256(session_secret, msg.as_bytes());
     let sig = hex::encode(sig_bytes);
-    format!("{now}.{expiry}.{sig}")
+    format!("{now}.{expiry}.{user_id}.{sig}")
 }
 
-/// 验证 Session Ticket 字符串。
+/// 验证 Session Ticket，兼容新旧两种格式。
+///
+/// 新格式四段：`<iat>.<exp>.<user_id>.<sig>`；旧格式三段：`<iat>.<exp>.<sig>`，
+/// 旧格式按 `expected_legacy_hash`（管理令牌哈希）验证，对应 `LegacyAdmin` 主体。
 pub fn verify_session_ticket(
     ticket: &str,
     session_secret: &[u8; 32],
-    expected_token_hash: &str,
-) -> bool {
-    let mut parts = ticket.split('.');
-    let Some(issued_str) = parts.next() else {
-        return false;
-    };
-    let Some(expiry_str) = parts.next() else {
-        return false;
-    };
-    let Some(sig_hex) = parts.next() else {
-        return false;
-    };
-    if parts.next().is_some() {
-        return false;
-    }
-
-    let Ok(expiry) = expiry_str.parse::<u64>() else {
-        return false;
-    };
+    expected_legacy_hash: &str,
+) -> Option<VerifiedSession> {
+    let parts: Vec<&str> = ticket.split('.').collect();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if now >= expiry {
-        return false;
-    }
 
-    let Ok(expected_sig_bytes) = hex::decode(sig_hex) else {
-        return false;
-    };
-    let msg = format!("{expected_token_hash}:{issued_str}:{expiry_str}");
-    let computed_sig = crate::notify::hmac_sha256(session_secret, msg.as_bytes());
-    constant_time_eq(&computed_sig, &expected_sig_bytes)
+    match parts.as_slice() {
+        [issued_str, expiry_str, user_str, sig_hex] => {
+            let iat: i64 = issued_str.parse().ok()?;
+            let expiry: u64 = expiry_str.parse().ok()?;
+            let user_id: i64 = user_str.parse().ok()?;
+            if now >= expiry {
+                return None;
+            }
+            let expected_sig_bytes = hex::decode(sig_hex).ok()?;
+            let msg = format!("{user_id}:{issued_str}:{expiry_str}");
+            let computed_sig = crate::notify::hmac_sha256(session_secret, msg.as_bytes());
+            if !constant_time_eq(&computed_sig, &expected_sig_bytes) {
+                return None;
+            }
+            Some(VerifiedSession {
+                subject: SessionSubject::User(user_id),
+                iat,
+            })
+        }
+        [issued_str, expiry_str, sig_hex] => {
+            let iat: i64 = issued_str.parse().ok()?;
+            let expiry: u64 = expiry_str.parse().ok()?;
+            if now >= expiry {
+                return None;
+            }
+            let expected_sig_bytes = hex::decode(sig_hex).ok()?;
+            let msg = format!("{expected_legacy_hash}:{issued_str}:{expiry_str}");
+            let computed_sig = crate::notify::hmac_sha256(session_secret, msg.as_bytes());
+            if !constant_time_eq(&computed_sig, &expected_sig_bytes) {
+                return None;
+            }
+            Some(VerifiedSession {
+                subject: SessionSubject::LegacyAdmin,
+                iat,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// 从 Cookie 请求头中解析指定名称的 Cookie 值。
@@ -147,6 +183,8 @@ pub enum PrincipalScope {
 pub struct Principal {
     /// 业务数据所属 owner。
     pub owner_id: i64,
+    /// 该密钥/会话归属的用户。`None` 表示免鉴权本地模式（语义上等同 bootstrap admin）。
+    pub user_id: Option<i64>,
     /// 此身份拥有的能力。
     pub scopes: Vec<PrincipalScope>,
     /// 用于完成鉴权的网关 API 密钥；未要求鉴权时为空。
@@ -158,6 +196,17 @@ impl Principal {
     pub fn local(owner_id: i64) -> Self {
         Self {
             owner_id,
+            user_id: None,
+            scopes: vec![PrincipalScope::Gateway],
+            api_key: None,
+        }
+    }
+
+    /// 构造免鉴权模式下绑定到具体用户（bootstrap admin）的身份。
+    pub fn local_user(owner_id: i64, user_id: i64) -> Self {
+        Self {
+            owner_id,
+            user_id: Some(user_id),
             scopes: vec![PrincipalScope::Gateway],
             api_key: None,
         }
@@ -167,9 +216,16 @@ impl Principal {
     pub fn from_api_key(key: ApiKey) -> Self {
         Self {
             owner_id: key.owner_id,
+            user_id: key.user_id,
             scopes: vec![PrincipalScope::Gateway],
             api_key: Some(Box::new(key)),
         }
+    }
+
+    /// 该身份是否允许调用网关。pending_verification 的 key 已在鉴权层拦截，
+    /// 这里只处理 user_id 缺失的极端情况（如老库未回填）。
+    pub fn gateway_user_id(&self) -> i64 {
+        self.user_id.unwrap_or(self.owner_id)
     }
 
     /// 是否具备指定能力。
@@ -195,6 +251,10 @@ impl Principal {
     ///
     /// 密钥未限制标签时放行全部；限制后，渠道至少要有一个匹配标签。判断必须
     /// 在候选收集前完成，否则失败重试可能绕过首选渠道的权限限制。
+    ///
+    /// `channel.owner_id == self.owner_id` 检查的是 tenant（多用户期恒为 1），
+    /// 不是用户。私有渠与共享渠的 `owner_id` 都是 1；用户级可见性由
+    /// [`crate::state::AppState::channels_for`] 保证，这里不必再按 `user_id` 过滤。
     pub fn allows_channel(&self, channel: &Channel) -> bool {
         self.has_scope(PrincipalScope::Gateway)
             && channel.owner_id == self.owner_id
@@ -218,21 +278,43 @@ pub trait Authenticator: std::fmt::Debug + Send + Sync {
     async fn authenticate(&self, token: Option<&str>) -> Result<Principal, GatewayError>;
 }
 
-/// 当前个人部署使用的单用户认证器。
+/// 多用户网关认证器。
+///
+/// 校验链：API key 存在且可用 → 归属用户存在且 `active` → 钱包余额为正。
+/// 用户级状态与余额走内存缓存（见 [`AppState`]），避免热路径打库。
 #[derive(Debug, Clone)]
 pub struct SingleUserAuthenticator {
     key_repo: ApiKeyRepo,
+    user_repo: refract_store::UserRepo,
+    wallet_repo: refract_store::WalletRepo,
+    /// 余额预检缓存（与 AppState 共享同一份，充值/扣款后主动失效）。
+    balance_cache: crate::rate::TtlCache<i64, f64>,
     require_auth: bool,
     owner_id: i64,
+    /// 免鉴权模式下的身份归属（bootstrap admin 用户 ID）。
+    fallback_user_id: i64,
 }
 
 impl SingleUserAuthenticator {
-    /// 创建单用户认证器。
-    pub fn new(key_repo: ApiKeyRepo, require_auth: bool, owner_id: i64) -> Self {
+    /// 创建认证器。`balance_cache` 必须与 [`AppState`] 是同一份实例，
+    /// 否则充值/调整后的主动失效对预检不可见。
+    pub fn new(
+        key_repo: ApiKeyRepo,
+        user_repo: refract_store::UserRepo,
+        wallet_repo: refract_store::WalletRepo,
+        balance_cache: crate::rate::TtlCache<i64, f64>,
+        require_auth: bool,
+        owner_id: i64,
+        fallback_user_id: i64,
+    ) -> Self {
         Self {
             key_repo,
+            user_repo,
+            wallet_repo,
+            balance_cache,
             require_auth,
             owner_id,
+            fallback_user_id,
         }
     }
 }
@@ -241,7 +323,7 @@ impl SingleUserAuthenticator {
 impl Authenticator for SingleUserAuthenticator {
     async fn authenticate(&self, token: Option<&str>) -> Result<Principal, GatewayError> {
         if !self.require_auth {
-            return Ok(Principal::local(self.owner_id));
+            return Ok(Principal::local_user(self.owner_id, self.fallback_user_id));
         }
 
         let token = token.ok_or_else(|| {
@@ -263,6 +345,46 @@ impl Authenticator for SingleUserAuthenticator {
         }
         if key.owner_id != self.owner_id {
             return Err(GatewayError::unauthenticated("invalid API key"));
+        }
+
+        let user_id = key.user_id.unwrap_or(self.fallback_user_id);
+        let user = self
+            .user_repo
+            .find_by_id(user_id)
+            .await
+            .map_err(crate::error::store_to_gateway)?
+            .ok_or_else(|| GatewayError::unauthenticated("invalid API key"))?;
+        if user.status != refract_store::UserStatus::Active {
+            return Err(GatewayError::new(
+                ErrorKind::PermissionDenied,
+                "account is not active; verify your email or contact the administrator",
+            ));
+        }
+        // 余额预检走共享缓存（60s TTL）。topup/adjust/refund 后 AppState 主动
+        // 失效对应条目；余额为负的用户每 60s 最多打一次库，热路径不查 SQLite。
+        let balance = match self.balance_cache.get(&user_id) {
+            Some(cached) => cached,
+            None => {
+                let fresh = self
+                    .wallet_repo
+                    .balance(user_id)
+                    .await
+                    .map_err(crate::error::store_to_gateway)?;
+                self.balance_cache.insert(user_id, fresh);
+                fresh
+            }
+        };
+        if balance <= 0.0 {
+            // 协议错误体由 details 注入机器可判字段：OpenAI 形状下
+            // 客户端读到 {"error":{"type":"insufficient_balance","balance":...}}。
+            return Err(GatewayError::new(
+                ErrorKind::PermissionDenied,
+                format!("insufficient balance: {balance:.4}"),
+            )
+            .with_details(serde_json::json!({
+                "type": "insufficient_balance",
+                "balance": balance,
+            })));
         }
 
         Ok(Principal::from_api_key(key))
@@ -414,41 +536,196 @@ fn peer_ip(peer: Option<SocketAddr>) -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
-/// 管理接口鉴权。
+/// 通过管理面/自助面鉴权后的用户身份。
 ///
-/// 首次启动由 bootstrap 签发令牌，默认必须带会话。无哈希时放行只留给
-/// 设置页「关闭管理鉴权」这条显式退出路径。
-pub async fn require_admin(
+/// `user_id == None` 表示走的是「管理令牌直登」紧急通道，语义上等同 bootstrap admin。
+#[derive(Debug, Clone)]
+pub struct AuthUser {
+    /// 用户 ID；令牌直登时为 None。
+    pub user_id: Option<i64>,
+    /// 邮箱；令牌直登时为管理员账号邮箱。
+    pub email: String,
+    /// 角色。
+    pub role: refract_store::UserRole,
+    /// 账号状态（令牌直登视为 Active）。
+    pub status: refract_store::UserStatus,
+}
+
+impl AuthUser {
+    /// 是否管理员。
+    pub fn is_admin(&self) -> bool {
+        self.role == refract_store::UserRole::Admin
+    }
+
+    /// 自助面用的用户 ID。令牌直登时回落到 bootstrap admin 的 ID。
+    pub fn effective_user_id(&self, state: &AppState) -> i64 {
+        self.user_id.unwrap_or_else(|| state.bootstrap_admin_id())
+    }
+}
+
+/// 按「IP + 账号」二元组计数的登录防爆破守卫。
+///
+/// 规则与 IP 版一致：5 次失败锁定 60 秒，成功清零。键是 `(IpAddr, String)`——
+/// 账号键为小写邮箱，或字面量 `"__admin_token__"`（管理令牌通道）。
+#[derive(Debug, Default)]
+pub struct SubjectGuard {
+    failures: Mutex<HashMap<(IpAddr, String), (u32, Instant)>>,
+}
+
+impl SubjectGuard {
+    /// 创建空守卫。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock_failures(&self) -> MutexGuard<'_, HashMap<(IpAddr, String), (u32, Instant)>> {
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 封禁中返回剩余秒数。
+    pub fn check_locked(&self, ip: IpAddr, subject: &str) -> Option<u64> {
+        let key = (ip, subject.to_ascii_lowercase());
+        let now = Instant::now();
+        let mut guard = self.lock_failures();
+        let (failures, until) = guard.get(&key).copied()?;
+        if failures >= 5 {
+            if until > now {
+                return Some((until - now).as_secs().max(1));
+            }
+            guard.remove(&key);
+        }
+        None
+    }
+
+    /// 记录一次失败，返回是否触发封禁。
+    pub fn record_failure(&self, ip: IpAddr, subject: &str) -> bool {
+        let key = (ip, subject.to_ascii_lowercase());
+        let now = Instant::now();
+        let mut guard = self.lock_failures();
+        let entry = guard.entry(key).or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        if entry.0 >= 5 {
+            entry.1 = now + std::time::Duration::from_secs(60);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 成功后清零。
+    pub fn record_success(&self, ip: IpAddr, subject: &str) {
+        let key = (ip, subject.to_ascii_lowercase());
+        self.lock_failures().remove(&key);
+    }
+}
+
+/// 把会话 ticket 解析成当前用户。
+///
+/// 校验链：ticket 签名 → `users.session_revoked_at`（iat 必须晚于撤销点）→
+/// 用户存在且未 disabled。用户状态走 30 秒内存缓存，避免热路径每请求打库。
+async fn resolve_session_user(
+    state: &AppState,
+    ticket: &str,
+    legacy_hash: &str,
+) -> Result<AuthUser, AppError> {
+    let session =
+        verify_session_ticket(ticket, state.session_secret(), legacy_hash).ok_or_else(|| {
+            AppError::Admin(GatewayError::unauthenticated("invalid or expired session"))
+        })?;
+    match session.subject {
+        SessionSubject::LegacyAdmin => {
+            let email = state
+                .settings_repo()
+                .admin_username()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "admin@localhost".to_owned());
+            Ok(AuthUser {
+                user_id: None,
+                email,
+                role: refract_store::UserRole::Admin,
+                status: refract_store::UserStatus::Active,
+            })
+        }
+        SessionSubject::User(user_id) => {
+            let cached = state
+                .resolve_user_cached(user_id)
+                .await
+                .map_err(|error| AppError::Admin(crate::error::store_to_gateway(error)))?
+                .ok_or_else(|| {
+                    AppError::Admin(GatewayError::unauthenticated(
+                        "session user no longer exists",
+                    ))
+                })?;
+            if let Some(revoked_at) = cached.session_revoked_at
+                && session.iat <= revoked_at.timestamp()
+            {
+                return Err(AppError::Admin(GatewayError::unauthenticated(
+                    "session has been revoked",
+                )));
+            }
+            if cached.status == refract_store::UserStatus::Disabled {
+                return Err(AppError::Admin(GatewayError::new(
+                    ErrorKind::PermissionDenied,
+                    "account is disabled",
+                )));
+            }
+            Ok(AuthUser {
+                user_id: Some(user_id),
+                email: cached.email,
+                role: cached.role,
+                status: cached.status,
+            })
+        }
+    }
+}
+
+/// 解析请求里的用户身份：显式管理令牌（仅管理员）或会话 Cookie。
+///
+/// 所有 `/api` 路由共用。失败即 401/403。
+async fn authenticate_admin_surface(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
-) -> Result<(), AppError> {
+) -> Result<AuthUser, AppError> {
     let client_ip = peer_ip(peer);
     let repo = SettingsRepo::new(state.db().clone());
     let expected: Option<String> = repo
         .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
         .await
         .map_err(|error| AppError::Admin(crate::error::store_to_gateway(error)))?;
+    let expected_hash = expected.filter(|hash| !hash.trim().is_empty());
 
-    let Some(expected_hash) = expected.filter(|hash| !hash.trim().is_empty()) else {
-        // 用户在设置里关掉了管理鉴权。
-        return Ok(());
-    };
-
-    // 1. 优先检查请求头显式传递的令牌（CLI / 脚本）
-    if let Some(token) = extract_token(
-        header_string(headers, "authorization"),
-        header_string(headers, "x-admin-token"),
-        None,
-        None,
-        None,
-    ) {
+    // 1. 显式令牌头（CLI / 脚本 / 紧急通道）。只有哈希配置存在时才认。
+    if let Some(expected_hash) = expected_hash.as_deref()
+        && let Some(token) = extract_token(
+            header_string(headers, "authorization"),
+            header_string(headers, "x-admin-token"),
+            None,
+            None,
+            None,
+        )
+    {
         if constant_time_eq(
             ApiKeyRepo::hash(&token).as_bytes(),
             expected_hash.as_bytes(),
         ) {
             state.admin_guard().record_success(client_ip);
-            return Ok(());
+            let email = repo
+                .admin_username()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "admin@localhost".to_owned());
+            return Ok(AuthUser {
+                user_id: None,
+                email,
+                role: refract_store::UserRole::Admin,
+                status: refract_store::UserStatus::Active,
+            });
         }
         let _locked = state.admin_guard().record_failure(client_ip);
         if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
@@ -465,19 +742,69 @@ pub async fn require_admin(
         )));
     }
 
-    // 2. 检查 HttpOnly Session Cookie（Web 控制台）
+    // 2. HttpOnly Session Cookie（Web 控制台）
     if let Some(cookie_str) = header_string(headers, "cookie")
         && let Some(ticket) = extract_cookie_value(&cookie_str, SESSION_COOKIE_NAME)
-        && verify_session_ticket(&ticket, state.session_secret(), &expected_hash)
     {
-        state.admin_guard().record_success(client_ip);
-        return Ok(());
+        let legacy_hash = expected_hash.as_deref().unwrap_or("");
+        return resolve_session_user(state, &ticket, legacy_hash).await;
     }
 
-    // 3. 未提供有效凭据
+    // 3. 未配置任何凭据时，管理面显式关闭鉴权：以 bootstrap admin 身份放行。
+    if expected_hash.is_none() {
+        let email = repo
+            .admin_username()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "admin@localhost".to_owned());
+        return Ok(AuthUser {
+            user_id: None,
+            email,
+            role: refract_store::UserRole::Admin,
+            status: refract_store::UserStatus::Active,
+        });
+    }
+
     Err(AppError::Admin(GatewayError::unauthenticated(
         "missing admin token or session",
     )))
+}
+
+/// `/api/admin/*` 的鉴权：必须是管理员。
+pub async fn require_admin_user(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<AuthUser, AppError> {
+    let user = authenticate_admin_surface(state, headers, peer).await?;
+    if !user.is_admin() {
+        return Err(AppError::Admin(GatewayError::new(
+            ErrorKind::PermissionDenied,
+            "admin role required",
+        )));
+    }
+    Ok(user)
+}
+
+/// `/api/me/*` 的鉴权：任何已登录用户（user 与 admin 均可）。
+pub async fn require_me(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<AuthUser, AppError> {
+    authenticate_admin_surface(state, headers, peer).await
+}
+
+/// 管理接口鉴权（只校验，不返回身份）。
+///
+/// 委托 [`require_admin_user`]；需要身份的处理器应直接调用后者。
+pub async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<(), AppError> {
+    require_admin_user(state, headers, peer).await.map(|_| ())
 }
 
 /// 恒时字节比较。
@@ -504,16 +831,30 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
     }
 
-    async fn authenticator(require_auth: bool) -> (SingleUserAuthenticator, ApiKeyRepo) {
+    async fn authenticator(
+        require_auth: bool,
+    ) -> (SingleUserAuthenticator, ApiKeyRepo, refract_store::Database) {
         let db = Database::open_in_memory().await.unwrap();
-        let repo = ApiKeyRepo::new(db);
+        let repo = ApiKeyRepo::new(db.clone());
+        // 免鉴权路径回落到 bootstrap admin 用户。
+        let user_repo = refract_store::UserRepo::new(db.clone());
+        let admin = user_repo
+            .create_first_admin_if_empty("admin@localhost", "argon2-placeholder")
+            .await
+            .unwrap()
+            .expect("bootstrap admin created");
         (
             SingleUserAuthenticator::new(
                 repo.clone(),
+                refract_store::UserRepo::new(db.clone()),
+                refract_store::WalletRepo::new(db.clone()),
+                crate::rate::TtlCache::new(std::time::Duration::from_secs(60)),
                 require_auth,
                 refract_core::DEFAULT_OWNER_ID,
+                admin.id,
             ),
             repo,
+            db,
         )
     }
 
@@ -621,6 +962,7 @@ mod tests {
         let principal = Principal::from_api_key(ApiKey {
             id: 1,
             owner_id: refract_core::DEFAULT_OWNER_ID,
+            user_id: None,
             name: "restricted".into(),
             key_prefix: "rk-test".into(),
             enabled: true,
@@ -650,7 +992,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_user_authenticator_returns_local_principal_when_auth_is_optional() {
-        let (authenticator, _) = authenticator(false).await;
+        let (authenticator, _, _) = authenticator(false).await;
 
         let principal = authenticator.authenticate(None).await.unwrap();
 
@@ -661,12 +1003,29 @@ mod tests {
 
     #[tokio::test]
     async fn single_user_authenticator_validates_and_attaches_the_api_key() {
-        let (authenticator, repo) = authenticator(true).await;
+        let (authenticator, repo, db) = authenticator(true).await;
+        // 新用户默认 0 余额，网关会按 insufficient_balance 拒绝；先给 bootstrap admin 充值。
+        let admin = refract_store::UserRepo::new(db.clone())
+            .find_by_email("admin@localhost")
+            .await
+            .unwrap()
+            .expect("bootstrap admin exists (created by authenticator fixture)");
+        refract_store::WalletRepo::new(db)
+            .apply(
+                admin.id,
+                10.0,
+                refract_store::LedgerKind::Topup,
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
         let (key, plaintext) = repo
             .create(
                 refract_core::DEFAULT_OWNER_ID,
                 NewApiKey {
                     name: "client".into(),
+                    user_id: None,
                     allowed_models: vec!["gpt-4o".into()],
                     allowed_tags: vec!["private".into()],
                     quota: 10,
@@ -690,7 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_user_authenticator_rejects_missing_invalid_and_disabled_keys() {
-        let (authenticator, repo) = authenticator(true).await;
+        let (authenticator, repo, _) = authenticator(true).await;
         assert_eq!(
             authenticator.authenticate(None).await.unwrap_err().kind,
             ErrorKind::Unauthenticated
@@ -731,24 +1090,31 @@ mod tests {
     #[test]
     fn test_session_ticket_lifecycle() {
         let secret = [42u8; 32];
-        let token_hash = "hash_of_admin_token_123";
-        let ticket = create_session_ticket(&secret, token_hash, 3600);
 
-        assert!(verify_session_ticket(&ticket, &secret, token_hash));
-        // 密码被修改导致 token_hash 变化：已有 ticket 必须立即失效
-        assert!(!verify_session_ticket(
-            &ticket,
-            &secret,
-            "new_token_hash_456"
-        ));
+        // 新格式：用户 ticket
+        let ticket = create_user_session_ticket(&secret, 42, 3600);
+        let session = verify_session_ticket(&ticket, &secret, "ignored").unwrap();
+        assert_eq!(session.subject, SessionSubject::User(42));
         // 伪造签名：必须拒绝
-        assert!(!verify_session_ticket(
-            "100.200.bad_sig",
-            &secret,
-            token_hash
-        ));
+        assert!(verify_session_ticket("100.200.42.bad_sig", &secret, "ignored").is_none());
         // 格式非法：必须拒绝
-        assert!(!verify_session_ticket("invalid", &secret, token_hash));
+        assert!(verify_session_ticket("invalid", &secret, "ignored").is_none());
+
+        // 旧格式：管理令牌 ticket（紧急通道），令牌哈希变化立即失效。
+        let legacy = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let expiry = now + 3600;
+            let msg = format!("legacy_hash:{now}:{expiry}");
+            let sig = hex::encode(crate::notify::hmac_sha256(&secret, msg.as_bytes()));
+            format!("{now}.{expiry}.{sig}")
+        };
+        let session = verify_session_ticket(&legacy, &secret, "legacy_hash").unwrap();
+        assert_eq!(session.subject, SessionSubject::LegacyAdmin);
+        assert!(verify_session_ticket(&legacy, &secret, "new_token_hash_456").is_none());
+        assert!(verify_session_ticket("100.200.bad_sig", &secret, "legacy_hash").is_none());
     }
 
     #[test]

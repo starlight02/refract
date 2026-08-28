@@ -46,6 +46,12 @@ pub const KEY_WEBHOOK_SECRET: &str = "notify.webhook_secret";
 pub const KEY_BACKUP: &str = "backup.settings";
 /// 凭据静态加密主密钥(base64 编码的 32 字节)。
 pub const KEY_MASTER_KEY: &str = "auth.master_key";
+/// SMTP 外发地址（`smtp://user:pass@host:587`）。空 = 验证码走 log（dev mode）。
+pub const KEY_SMTP_URL: &str = "mail.smtp_url";
+/// 邮件发件人地址。
+pub const KEY_MAIL_FROM: &str = "mail.from";
+/// 是否暴露 per-user Prometheus 指标。默认关闭，避免高基数 label 伤害采集端。
+pub const KEY_METRICS_PER_USER: &str = "metrics.per_user";
 
 /// 网关级全局限制。密钥级限速在免鉴权模式下是零防护 ——
 /// 跑飞的本地 agent 迴圈会原样打穿上游账单，这层是最后的保险丝。
@@ -533,6 +539,19 @@ impl SettingsRepo {
         self.set(KEY_LOG_BODIES, &enabled).await
     }
 
+    /// 是否暴露 per-user Prometheus 指标。缺省关闭，防止用户 ID label 高基数。
+    pub async fn per_user_metrics(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .get::<bool>(KEY_METRICS_PER_USER)
+            .await?
+            .unwrap_or(false))
+    }
+
+    /// 设置 per-user Prometheus 指标开关。
+    pub async fn set_per_user_metrics(&self, enabled: bool) -> Result<(), StoreError> {
+        self.set(KEY_METRICS_PER_USER, &enabled).await
+    }
+
     /// 告警 webhook 地址。空或缺失表示不通知。
     pub async fn webhook_url(&self) -> Result<Option<String>, StoreError> {
         Ok(self
@@ -630,6 +649,38 @@ impl SettingsRepo {
     /// 凭据静态加密主密钥(base64)。未配置返回 `None`。
     pub async fn master_key(&self) -> Result<Option<String>, StoreError> {
         self.get::<String>(KEY_MASTER_KEY).await
+    }
+
+    /// 默认管理员账号邮箱。未配置返回 `None`。
+    pub async fn admin_username(&self) -> Result<Option<String>, StoreError> {
+        self.get::<String>(KEY_ADMIN_USERNAME).await
+    }
+
+    /// SMTP 外发地址。未配置返回 `None`（验证码走 log）。
+    pub async fn smtp_url(&self) -> Result<Option<String>, StoreError> {
+        self.get::<String>(KEY_SMTP_URL).await
+    }
+
+    /// 邮件发件人地址。未配置返回 `None`。
+    pub async fn mail_from(&self) -> Result<Option<String>, StoreError> {
+        self.get::<String>(KEY_MAIL_FROM).await
+    }
+
+    /// 保存 SMTP 配置（`None` = 清除）。
+    pub async fn set_mail(
+        &self,
+        smtp_url: Option<&str>,
+        from: Option<&str>,
+    ) -> Result<(), StoreError> {
+        match smtp_url {
+            Some(url) if !url.is_empty() => self.set(KEY_SMTP_URL, &url.to_owned()).await?,
+            _ => self.remove(KEY_SMTP_URL).await?,
+        }
+        match from {
+            Some(addr) if !addr.is_empty() => self.set(KEY_MAIL_FROM, &addr.to_owned()).await?,
+            _ => self.remove(KEY_MAIL_FROM).await?,
+        }
+        Ok(())
     }
 
     /// 设置或清除主密钥(`None` = 清除)。值必须是 32 字节的 base64。

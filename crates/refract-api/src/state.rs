@@ -17,7 +17,8 @@ use refract_core::{Channel, RoutingPolicy};
 use refract_protocol::codec::CodecSet;
 use refract_router::{RouteExecutor, RoutePlanner};
 use refract_store::{
-    ApiKeyRepo, ChannelRepo, Database, HealthRepo, LogRepo, SettingsRepo, StoreError,
+    ApiKeyRepo, ChannelRepo, Database, HealthRepo, LogRepo, SettingsRepo, StoreError, UserRepo,
+    VerificationRepo, WalletRepo,
 };
 use refract_upstream::UpstreamClient;
 
@@ -70,10 +71,40 @@ struct Inner {
     backup_settings: ArcSwap<refract_store::BackupSettings>,
     master_key: ArcSwap<Option<[u8; 32]>>,
     admin_guard: crate::auth::AdminGuard,
+    /// 按 (IP, 账号) 二元组计数的登录防爆破守卫。
+    login_guard: crate::auth::SubjectGuard,
+    /// 注册限流（每小时尝试次数 + 每天成功账号数两个窗口）。
+    auth_rate: crate::rate::AuthRateLimiter,
     transport_crypto: crate::crypto::TransportCrypto,
     session_secret: [u8; 32],
     /// 启用 HTTP/3 时的监听端口（0 = 不发 Alt-Svc）。启动后写入一次。
     alt_svc_port: std::sync::atomic::AtomicU16,
+    /// bootstrap admin 用户 ID（0 = 尚未解析/无用户）。启动时回填一次。
+    bootstrap_admin_id: std::sync::atomic::AtomicI64,
+    /// 用户状态/角色缓存，30 秒 TTL。会话校验与自助面共用。
+    user_cache: crate::rate::TtlCache<i64, CachedUser>,
+    /// 余额缓存，60 秒 TTL。充值/调整后主动失效。
+    balance_cache: crate::rate::TtlCache<i64, f64>,
+    /// 开发模式：验证码走 log 输出 + 开 `/api/auth/dev-codes` 钩子。
+    dev_mode: std::sync::atomic::AtomicBool,
+    /// 未验证账号可登录的宽限小时数（默认 24）。
+    unverified_grace_hours: i64,
+    /// 邮件外发器（SMTP 未配置时退化为 log）。
+    mailer: crate::mail::Mailer,
+}
+
+/// 缓存的用户快照。`session_revoked_at` 也必须缓存，用于会话撤销判定；
+/// 30 秒 TTL + 撤销后主动失效，保证改密码/禁用能快速生效。
+#[derive(Debug, Clone)]
+pub(crate) struct CachedUser {
+    /// 角色。
+    pub role: refract_store::UserRole,
+    /// 状态。
+    pub status: refract_store::UserStatus,
+    /// 会话撤销点（该时刻之前签发的 ticket 全部作废）。
+    pub session_revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 邮箱（会话/审计展示用）。
+    pub email: String,
 }
 
 /// 由限制值构造并发信号量。0 = 不限（None）。
@@ -120,14 +151,42 @@ impl AppState {
         };
         let channels = ChannelRepo::new(db.clone())
             .with_master_key(master_key)
-            .list(refract_core::DEFAULT_OWNER_ID)
+            .list_all()
             .await?;
         let policy = SettingsRepo::new(db.clone()).routing_policy().await?;
 
+        // bootstrap admin：首次启动创建，后续启动解析其 ID。
+        let user_repo = UserRepo::new(db.clone());
+        let bootstrap_admin_id = user_repo
+            .create_first_admin_if_empty("admin@localhost", "")
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.id)
+            .unwrap_or(0);
+        let bootstrap_admin_id = if bootstrap_admin_id == 0 {
+            user_repo
+                .find_by_email("admin@localhost")
+                .await
+                .ok()
+                .flatten()
+                .map(|u| u.id)
+                .unwrap_or(0)
+        } else {
+            bootstrap_admin_id
+        };
+
+        // 余额缓存在 AppState 与认证器之间共享同一份：认证器读、
+        // 充值/扣款路径写失效，两边永远看到一致视图。
+        let balance_cache = crate::rate::TtlCache::new(std::time::Duration::from_secs(60));
         let authenticator = Arc::new(SingleUserAuthenticator::new(
             ApiKeyRepo::new(db.clone()),
+            UserRepo::new(db.clone()),
+            WalletRepo::new(db.clone()),
+            balance_cache.clone(),
             require_auth,
             refract_core::DEFAULT_OWNER_ID,
+            bootstrap_admin_id,
         ));
         // 熔断缓存从库里预热：重启不能忘记「哪个端点还在熔断中」。
         // 熔断策略同样来自 settings —— 用户调过的阈值重启后必须还在。
@@ -143,21 +202,24 @@ impl AppState {
         let ip_limits = SettingsRepo::new(db.clone()).ip_limits().await?;
         let webhook_secret = SettingsRepo::new(db.clone()).webhook_secret().await?;
         let backup_settings = SettingsRepo::new(db.clone()).backup_settings().await?;
+        let per_user_metrics = SettingsRepo::new(db.clone()).per_user_metrics().await?;
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
         let affinity_settings = SettingsRepo::new(db.clone()).affinity().await?;
         let affinity_engine = refract_router::AffinityEngine::new();
         affinity_engine.load(affinity_settings);
+        let metrics = crate::metrics::GatewayMetrics::default();
+        metrics.set_per_user_enabled(per_user_metrics);
         let keys = refract_router::KeySelector::new();
         let state = Self {
             inner: Arc::new(Inner {
-                db,
+                db: db.clone(),
                 channels: ArcSwap::from_pointee(channels),
                 policy: ArcSwap::from_pointee(policy),
                 codecs: CodecSet::builtin(),
                 client,
                 authenticator,
                 route_cursors: refract_router::RoundRobinCursors::default(),
-                metrics: crate::metrics::GatewayMetrics::default(),
+                metrics,
                 health,
                 rate_limiter: crate::rate::RateLimiter::new(),
                 pricing: ArcSwap::from_pointee(pricing),
@@ -175,12 +237,35 @@ impl AppState {
                 backup_settings: ArcSwap::from_pointee(backup_settings),
                 master_key: ArcSwap::from_pointee(master_key),
                 admin_guard: crate::auth::AdminGuard::new(),
+                login_guard: crate::auth::SubjectGuard::new(),
+                auth_rate: crate::rate::AuthRateLimiter::new(),
                 transport_crypto: crate::crypto::TransportCrypto::new_random(),
                 session_secret: {
                     use rand::RngExt as _;
                     rand::rng().random()
                 },
                 alt_svc_port: std::sync::atomic::AtomicU16::new(0),
+                bootstrap_admin_id: std::sync::atomic::AtomicI64::new(bootstrap_admin_id),
+                user_cache: crate::rate::TtlCache::new(std::time::Duration::from_secs(30)),
+                balance_cache,
+                dev_mode: std::sync::atomic::AtomicBool::new(
+                    std::env::var("REFRACT_DEV_MODE").is_ok_and(|v| v == "1"),
+                ),
+                unverified_grace_hours: 24,
+                mailer: {
+                    let smtp_url = SettingsRepo::new(db.clone())
+                        .smtp_url()
+                        .await
+                        .ok()
+                        .flatten();
+                    let from = SettingsRepo::new(db.clone())
+                        .mail_from()
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "refract@localhost".to_owned());
+                    crate::mail::Mailer::new(smtp_url, from)
+                },
             }),
         };
         crate::notify::spawn_event_worker(state.clone(), receiver);
@@ -274,6 +359,13 @@ impl AppState {
         self.inner
             .capture_bodies
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 从库里重读 per-user Prometheus 开关。管理端保存后调用。
+    pub async fn reload_per_user_metrics(&self) -> Result<(), StoreError> {
+        let enabled = self.settings_repo().per_user_metrics().await?;
+        self.inner.metrics.set_per_user_enabled(enabled);
         Ok(())
     }
 
@@ -409,9 +501,113 @@ impl AppState {
         Ok(())
     }
 
-    /// 管理面防爆破守卫。
+    /// 管理面防爆破守卫（IP 维度，管理令牌通道）。
     pub fn admin_guard(&self) -> &crate::auth::AdminGuard {
         &self.inner.admin_guard
+    }
+
+    /// 登录防爆破守卫（IP + 账号二元组，邮箱登录通道）。
+    pub fn login_guard(&self) -> &crate::auth::SubjectGuard {
+        &self.inner.login_guard
+    }
+
+    /// 注册限流器。
+    pub fn auth_rate_limiter(&self) -> &crate::rate::AuthRateLimiter {
+        &self.inner.auth_rate
+    }
+
+    /// 是否处于开发模式（验证码走 log + dev-codes 钩子）。
+    pub fn dev_mode(&self) -> bool {
+        self.inner
+            .dev_mode
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 设置开发模式。仅启动时由 server 调用。
+    pub fn set_dev_mode(&self, enabled: bool) {
+        self.inner
+            .dev_mode
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 未验证账号可登录的宽限小时数。
+    pub fn unverified_grace_hours(&self) -> i64 {
+        self.inner.unverified_grace_hours
+    }
+
+    /// bootstrap admin 用户 ID。0 表示库中尚无用户（仅出现在首次启动 bootstrap 之前）。
+    pub fn bootstrap_admin_id(&self) -> i64 {
+        self.inner
+            .bootstrap_admin_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// bootstrap 完成后回填 admin 用户 ID。
+    pub fn set_bootstrap_admin_id(&self, id: i64) {
+        self.inner
+            .bootstrap_admin_id
+            .store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 用户仓储。
+    pub fn user_repo(&self) -> UserRepo {
+        UserRepo::new(self.inner.db.clone())
+    }
+
+    /// 钱包仓储。
+    pub fn wallet_repo(&self) -> WalletRepo {
+        WalletRepo::new(self.inner.db.clone())
+    }
+
+    /// 验证码仓储。
+    pub fn verification_repo(&self) -> VerificationRepo {
+        VerificationRepo::new(self.inner.db.clone())
+    }
+
+    /// 解析用户（带 30 秒缓存）。返回 None 表示用户不存在。
+    pub(crate) async fn resolve_user_cached(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<CachedUser>, StoreError> {
+        if let Some(hit) = self.inner.user_cache.get(&user_id) {
+            return Ok(Some(hit));
+        }
+        let Some(user) = self.user_repo().find_by_id(user_id).await? else {
+            return Ok(None);
+        };
+        let cached = CachedUser {
+            role: user.role,
+            status: user.status,
+            session_revoked_at: user.session_revoked_at,
+            email: user.email,
+        };
+        self.inner.user_cache.insert(user_id, cached.clone());
+        Ok(Some(cached))
+    }
+
+    /// 使某用户的缓存失效（角色/状态/会话撤销变化后调用）。
+    pub fn invalidate_user_cache(&self, user_id: i64) {
+        self.inner.user_cache.invalidate(&user_id);
+    }
+
+    /// 查询余额（带 60 秒缓存）。返回 None 表示缓存未命中且 caller 应自行查库。
+    pub async fn balance_cached(&self, user_id: i64) -> Result<f64, StoreError> {
+        if let Some(hit) = self.inner.balance_cache.get(&user_id) {
+            return Ok(hit);
+        }
+        let balance = self.wallet_repo().balance(user_id).await?;
+        self.inner.balance_cache.insert(user_id, balance);
+        Ok(balance)
+    }
+
+    /// 使某用户的余额缓存失效（充值/调整/扣款后调用）。
+    pub fn invalidate_balance_cache(&self, user_id: i64) {
+        self.inner.balance_cache.invalidate(&user_id);
+    }
+
+    /// 扣款成功后把新余额写回缓存，让预检立刻看到。
+    pub fn prime_balance_cache(&self, user_id: i64, balance: f64) {
+        self.inner.balance_cache.insert(user_id, balance);
     }
 
     /// 密钥仓储。
@@ -432,6 +628,11 @@ impl AppState {
     /// 健康仓储。返回共享实例的浅拷贝 —— 熔断内存缓存全进程只有一份。
     pub fn health_repo(&self) -> HealthRepo {
         self.inner.health.clone()
+    }
+
+    /// 邮件外发器。
+    pub fn mailer(&self) -> &crate::mail::Mailer {
+        &self.inner.mailer
     }
 
     /// 按当前策略构造规划器。
@@ -481,13 +682,26 @@ impl AppState {
     /// 从数据库重新载入渠道快照。
     ///
     /// 所有修改渠道的写操作**必须**在提交后调用它，否则路由还在用旧配置。
+    /// 快照含全部 visibility 的渠道；路由侧用 [`AppState::channels_for`] 按用户过滤。
     pub async fn reload_channels(&self) -> Result<(), StoreError> {
-        let channels = self
-            .channel_repo()
-            .list(refract_core::DEFAULT_OWNER_ID)
-            .await?;
+        let channels = self.channel_repo().list_all().await?;
         self.inner.channels.store(Arc::new(channels));
         Ok(())
+    }
+
+    /// 指定用户可见的渠道：全部共享渠 + 自己的私有渠。
+    ///
+    /// 热路径每次 filter 一次；渠道数量级 < 100 时 Vec clone 成本可忽略。
+    /// 若未来渠道 > 1000，可改为 `ArcSwap<HashMap<i64, Arc<Vec<Channel>>>>` 按用户预分组。
+    pub fn channels_for(&self, user_id: i64) -> Vec<Channel> {
+        self.channels()
+            .iter()
+            .filter(|channel| {
+                channel.visibility == refract_core::ChannelVisibility::Shared
+                    || channel.user_id == Some(user_id)
+            })
+            .cloned()
+            .collect()
     }
 
     /// 从数据库重新载入路由策略。
@@ -525,6 +739,8 @@ mod tests {
         Channel {
             id: 0,
             owner_id: refract_core::DEFAULT_OWNER_ID,
+            visibility: refract_core::ChannelVisibility::Shared,
+            user_id: None,
             name: "test".into(),
             kind: ChannelKind::Single(Protocol::Chat),
             enabled: true,

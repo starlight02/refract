@@ -41,6 +41,8 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 url = { workspace = true }
 quinn = { version = "0.11", features = ["ring"] }
 rustls-pemfile = "2"
+lettre = { workspace = true }
+argon2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

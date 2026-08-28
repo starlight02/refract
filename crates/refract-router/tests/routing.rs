@@ -87,6 +87,8 @@ fn channel(id: i64, name: &str, priority: i32, endpoints: Vec<ChannelEndpoint>) 
         extra_headers: Vec::new(),
         test_model: None,
         empty_response_retry: Default::default(),
+        visibility: Default::default(),
+        user_id: None,
     }
 }
 

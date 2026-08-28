@@ -42,3 +42,22 @@ export async function loginAsAdmin(page: Page): Promise<void> {
     `e2e login failed: ${response.status()} ${await response.text()}`,
   ).toBeTruthy()
 }
+
+/** 用邮箱密码换 Session Cookie。 */
+export async function loginAsUser(page: Page, email: string, password: string): Promise<void> {
+  await page.context().addCookies([
+    {
+      name: 'PARAGLIDE_LOCALE',
+      value: 'zh-Hans',
+      domain: '127.0.0.1',
+      path: '/',
+    },
+  ])
+  const response = await page.request.post('/api/auth/login', {
+    data: { email, password },
+  })
+  expect(
+    response.ok(),
+    `e2e user login failed: ${response.status()} ${await response.text()}`,
+  ).toBeTruthy()
+}

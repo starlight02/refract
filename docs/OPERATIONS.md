@@ -103,7 +103,7 @@ Balance refresh uses the common one-api/new-api billing endpoints where a relay 
 
 ## Request body capture
 
-Request and response bodies are **not** stored by default. Enabling the switch under **Settings → 日志保留** stores a snapshot of the request body and the response body per log row (streaming responses store the aggregated text; binary payloads such as audio and multipart uploads are skipped). Snapshots are truncated at 64 KB with an explicit marker. The list API never returns bodies — only `GET /api/logs/{id}` does, which backs the "查看完整请求" dialog in the logs page. Keep the switch off if conversation content must not touch disk; metadata logging is unaffected.
+Request and response bodies are **not** stored by default. Enabling the switch under **Settings → 日志保留** stores a snapshot of the request body and the response body per log row (streaming responses store the aggregated text; binary payloads such as audio and multipart uploads are skipped). Snapshots are truncated at 64 KB with an explicit marker. The list API never returns bodies — only `GET /api/admin/logs/{id}` does, which backs the "查看完整请求" dialog in the logs page. Keep the switch off if conversation content must not touch disk; metadata logging is unaffected.
 
 ## Pricing and spend
 
@@ -115,7 +115,7 @@ On SIGTERM/Ctrl-C Refract stops accepting new connections and waits up to `shutd
 
 ## Backup and restore
 
-Refract can schedule backups itself: **Settings → 自动备份** sets an interval (0 = off), a target directory, and a retention count. Each run executes an online `VACUUM INTO` into `<directory>/refract-<timestamp>.db` (mode 0600) and prunes to the newest N files. The same files appear under **Settings → 备份文件** with download and delete actions, and `POST /api/backups` triggers a manual run on demand. Backup files contain the full database — upstream credentials included — so treat them as secrets.
+Refract can schedule backups itself: **Settings → 自动备份** sets an interval (0 = off), a target directory, and a retention count. Each run executes an online `VACUUM INTO` into `<directory>/refract-<timestamp>.db` (mode 0600) and prunes to the newest N files. The same files appear under **Settings → 备份文件** with download and delete actions, and `POST /api/admin/backups` triggers a manual run on demand. Backup files contain the full database — upstream credentials included — so treat them as secrets.
 
 SQLite may use WAL files, so do not copy only `refract.db` while the service is writing. The simplest consistent Compose backup is a brief stop followed by an archive of the volume:
 
@@ -148,9 +148,9 @@ Set `REFRACT_MASTER_KEY` — the base64 encoding of 32 random bytes, e.g. `opens
 
 ### Configuration export/import
 
-For migrating configuration (not logs) between instances, prefer the built-in backup: **Settings → 数据备份** in the UI, or `GET /api/export` / `POST /api/import` with the admin token. The export is a single JSON document containing channels (with plaintext upstream credentials — guard the file like a key), gateway API keys (hash only; original plaintext keys keep working after restore), the routing policy, log retention, and the circuit-breaker policy. The webhook signing secret, master encryption key, and backup settings are deliberately excluded from exports. Import supports `merge` (skip channels with an existing name, skip known key hashes) and `replace` (wipe channels and keys first; the UI asks for confirmation). The import response lists the names of skipped channels and keys, not just counts. Request logs and live circuit-breaker state are not part of the export; importing into a running instance leaves its logs and breaker state untouched.
+For migrating configuration (not logs) between instances, prefer the built-in backup: **Settings → 数据备份** in the UI, or `GET /api/admin/export` / `POST /api/admin/import` with the admin token. The current export is document version 2: channels (plaintext upstream credentials — guard the file like a key — plus `visibility` and `user_email`), safe user fields with wallet balance (never password hashes), gateway API keys (hash only, with `user_email`; original plaintext keys keep working after restore), the routing policy, log retention, and the circuit-breaker policy. Version 1 backups still import: every channel becomes shared and keys belong to the bootstrap admin. Version 2 matches `user_email` case-insensitively; unknown emails fall back to the bootstrap admin. Users in the file are not created on import. The webhook signing secret, master encryption key, and backup settings are deliberately excluded from exports. Import supports `merge` (skip channels with an existing name, skip known key hashes) and `replace` (wipe channels and keys first; the UI asks for confirmation). The import response lists the names of skipped channels and keys, not just counts. Request logs and live circuit-breaker state are not part of the export; importing into a running instance leaves its logs and breaker state untouched.
 
-Feeding a redacted admin `GET /api/channels` response back as a backup is rejected before any data is touched — masked credentials (`sk-a…9f2c`) are not usable configuration.
+Feeding a redacted admin `GET /api/admin/channels` response back as a backup is rejected before any data is touched — masked credentials (`sk-a…9f2c`) are not usable configuration.
 
 ## Upgrade and rollback
 
@@ -162,7 +162,7 @@ docker compose up -d
 curl --fail http://127.0.0.1:3939/health/ready
 ```
 
-Database migrations run when Refract opens the database. To roll back across a schema change, restore the matching pre-upgrade backup together with the previous image; do not run an older binary against a newly migrated database unless that release explicitly documents compatibility.
+Database migrations run when Refract opens the database. An existing single-user database grows an `admin@localhost` user on first start after this release; previous channels, API keys, and request logs belong to that admin and keep working. The upgrade keeps your existing `adm_…` management token (a missing admin password is issued to `.admin_token` instead of rotating the token); only `--reset-admin` rotates both. To roll back across a schema change, restore the matching pre-upgrade backup together with the previous image; do not run an older binary against a newly migrated database unless that release explicitly documents compatibility.
 
 ## Release process and versioning
 

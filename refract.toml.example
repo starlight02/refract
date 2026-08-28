@@ -42,3 +42,12 @@ shutdown_grace_secs = 30
 # 出站代理，形如 "http://127.0.0.1:7890" 或 "socks5://127.0.0.1:1080"。
 # 留空或不写则直连。
 # proxy = "http://127.0.0.1:7890"
+
+# 开发模式：邮箱验证码/重置码写入日志，并开放 GET /api/auth/dev-codes 测试钩子。
+# 生产环境严禁开启。也可用 REFRACT_DEV_MODE=true（必须写布尔 true，写 1 会启动失败）。
+# dev_mode = false
+
+# 开放注册邮件。进程启动时若设置 REFRACT_SMTP_URL / REFRACT_MAIL_FROM，
+# 会在装配 AppState 之前写入 settings。未配置时验证码写入服务日志。
+# smtp_url = "smtp://user:pass@smtp.example.com:587"
+# mail_from = "Refract <noreply@example.com>"

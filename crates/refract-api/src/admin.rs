@@ -13,9 +13,10 @@
 //! 3. **密钥明文只在创建响应里出现一次**。库里只有哈希，取不回来。
 
 use refract_core::{
-    Action, Channel, ChannelId, Credential, GatewayError, Protocol, RoutingPolicy, UpstreamAddress,
+    Action, Channel, ChannelId, ChannelVisibility, Credential, GatewayError, Protocol,
+    RoutingPolicy, UpstreamAddress,
 };
-use refract_store::LogFilter;
+use refract_store::{LogFilter, UserRole, UserStatus};
 use serde::{Deserialize, Serialize};
 use xitca_web::body::{RequestBody, ResponseBody};
 use xitca_web::handler::body::Body;
@@ -27,7 +28,6 @@ use xitca_web::http::{HeaderMap, HeaderValue, StatusCode, WebResponse};
 use xitca_web::route::{get, post, put};
 use xitca_web::{App, NestApp};
 
-use crate::auth::require_admin;
 use crate::error::{AppError, collect_limited, json_response, store_to_gateway};
 use crate::extract::{AdminJson, decode_admin_json};
 use crate::state::AppState;
@@ -161,16 +161,13 @@ fn restore_unchanged_credentials(existing: &Channel, incoming: &mut Channel) {
     }
 }
 
-/// 装配管理路由。路径相对 `/api`（由外层 `App::at("/api", admin::nest())` 挂载）。
+/// 装配管理路由。路径相对 `/api/admin`（由外层 `App::at("/api/admin", admin::nest())` 挂载）。
 pub fn nest() -> NestApp<AppState> {
     App::new()
         .at(
             "/crypto/public-key",
             get(handler_service(crypto_public_key)),
         )
-        .at("/auth/login", post(handler_service(auth_login)))
-        .at("/auth/logout", post(handler_service(auth_logout)))
-        .at("/auth/session", get(handler_service(auth_session)))
         .at(
             "/channels",
             get(handler_service(list_channels)).post(handler_service(create_channel)),
@@ -245,6 +242,10 @@ pub fn nest() -> NestApp<AppState> {
             get(handler_service(get_log_bodies)).put(handler_service(set_log_bodies)),
         )
         .at(
+            "/settings/metrics",
+            get(handler_service(get_metrics_per_user)).put(handler_service(set_metrics_per_user)),
+        )
+        .at(
             "/settings/limits",
             get(handler_service(get_limits)).put(handler_service(set_limits)),
         )
@@ -307,6 +308,7 @@ pub fn nest() -> NestApp<AppState> {
         )
         .at("/playground/chat", post(handler_service(playground_chat)))
         .at("/models", get(handler_service(list_models)))
+        .at("", crate::users_admin::nest())
 }
 
 fn json_with_cookie<T: Serialize>(value: T, cookie: String) -> Result<WebResponse, AppError> {
@@ -340,186 +342,37 @@ async fn crypto_public_key(
     ok(state.transport_crypto().public_key_response())
 }
 
-#[derive(Debug, Deserialize)]
-struct LoginBody {
-    token: String,
-}
-
-async fn auth_login(
-    StateRef(state): StateRef<'_, AppState>,
-    AdminJson(body): AdminJson<LoginBody>,
-    headers: &HeaderMap,
-    peer: std::net::SocketAddr,
-) -> Result<WebResponse, AppError> {
-    let client_ip = peer.ip();
-
-    if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
-        let err = GatewayError::new(
-            refract_core::ErrorKind::PermissionDenied,
-            format!("too many failed login attempts, locked for {wait_secs}s"),
-        )
-        .with_retry_after(std::time::Duration::from_secs(wait_secs));
-        return Err(AppError::Admin(err));
-    }
-
-    let expected: Option<String> = state
-        .settings_repo()
-        .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
-        .await
-        .map_err(reject)?;
-    let Some(expected_hash) = expected.filter(|hash| !hash.trim().is_empty()) else {
-        return ok(serde_json::json!({
-            "authenticated": true,
-            "username": "admin@localhost"
-        }));
-    };
-
-    let token_hash = refract_store::ApiKeyRepo::hash(body.token.trim());
-    if crate::auth::constant_time_eq(token_hash.as_bytes(), expected_hash.as_bytes()) {
-        state.admin_guard().record_success(client_ip);
-        let ticket = crate::auth::create_session_ticket(
-            state.session_secret(),
-            &expected_hash,
-            crate::auth::SESSION_MAX_AGE_SECS,
-        );
-        let cookie = crate::auth::session_cookie(
-            &ticket,
-            crate::auth::SESSION_MAX_AGE_SECS,
-            crate::auth::request_is_https(headers),
-        );
-        return json_with_cookie(
-            serde_json::json!({
-                "authenticated": true,
-                "username": "admin@localhost"
-            }),
-            cookie,
-        );
-    }
-
-    let _locked = state.admin_guard().record_failure(client_ip);
-    if let Some(wait_secs) = state.admin_guard().check_locked(client_ip) {
-        let err = GatewayError::new(
-            refract_core::ErrorKind::PermissionDenied,
-            format!("too many failed login attempts, locked for {wait_secs}s"),
-        )
-        .with_retry_after(std::time::Duration::from_secs(wait_secs));
-        return Err(AppError::Admin(err));
-    }
-    Err(AppError::Admin(GatewayError::new(
-        refract_core::ErrorKind::Unauthenticated,
-        "invalid admin token",
-    )))
-}
-
-async fn auth_logout(headers: &HeaderMap) -> Result<WebResponse, AppError> {
-    let cookie = crate::auth::session_cookie("", 0, crate::auth::request_is_https(headers));
-    json_with_cookie(serde_json::json!({ "authenticated": false }), cookie)
-}
-
-async fn auth_session(
-    StateRef(state): StateRef<'_, AppState>,
-    headers: &HeaderMap,
-) -> Result<WebResponse, AppError> {
-    let expected: Option<String> = state
-        .settings_repo()
-        .get(refract_store::settings_repo::KEY_ADMIN_TOKEN_HASH)
-        .await
-        .map_err(reject)?;
-    let Some(_expected_hash) = expected.filter(|hash| !hash.trim().is_empty()) else {
-        return ok(serde_json::json!({
-            "authenticated": true,
-            "configured": false,
-            "username": "admin@localhost"
-        }));
-    };
-
-    if require_admin(state, headers, None).await.is_ok() {
-        return ok(serde_json::json!({
-            "authenticated": true,
-            "configured": true,
-            "username": "admin@localhost"
-        }));
-    }
-    ok(serde_json::json!({
-        "authenticated": false,
-        "configured": true,
-        "username": null
-    }))
-}
-
 async fn list_channels(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
-    let items = state
-        .channel_repo()
-        .list(refract_core::DEFAULT_OWNER_ID)
-        .await
-        .map_err(reject)?;
-    ok(items.into_iter().map(redact_channel).collect::<Vec<_>>())
+    list_channels_impl(state, None).await
 }
 
 async fn create_channel(
     StateRef(state): StateRef<'_, AppState>,
-    AdminJson(mut channel): AdminJson<Channel>,
+    AdminJson(channel): AdminJson<Channel>,
 ) -> Result<WebResponse, AppError> {
-    channel.owner_id = refract_core::DEFAULT_OWNER_ID;
-    channel.id = 0;
-    reject_masked_credentials(&channel)?;
-    validate(&channel)?;
-    let created = state
-        .channel_repo()
-        .create(&channel)
-        .await
-        .map_err(reject)?;
-    commit_channels(state).await?;
-    ok(redact_channel(created))
+    create_channel_impl(state, channel, None).await
 }
 
 async fn get_channel(
     StateRef(state): StateRef<'_, AppState>,
     Params(id): Params<ChannelId>,
 ) -> Result<WebResponse, AppError> {
-    let channel = state
-        .channel_repo()
-        .get(refract_core::DEFAULT_OWNER_ID, id)
-        .await
-        .map_err(reject)?;
-    ok(redact_channel(channel))
+    get_channel_impl(state, id, None).await
 }
 
 async fn update_channel(
     StateRef(state): StateRef<'_, AppState>,
     Params(id): Params<ChannelId>,
-    AdminJson(mut channel): AdminJson<Channel>,
+    AdminJson(channel): AdminJson<Channel>,
 ) -> Result<WebResponse, AppError> {
-    channel.id = id;
-    channel.owner_id = refract_core::DEFAULT_OWNER_ID;
-    let existing = state
-        .channel_repo()
-        .get(refract_core::DEFAULT_OWNER_ID, id)
-        .await
-        .map_err(reject)?;
-    restore_unchanged_credentials(&existing, &mut channel);
-    reject_masked_credentials(&channel)?;
-    validate(&channel)?;
-    let saved = state
-        .channel_repo()
-        .update(&channel)
-        .await
-        .map_err(reject)?;
-    commit_channels(state).await?;
-    ok(redact_channel(saved))
+    update_channel_impl(state, id, channel, None).await
 }
 
 async fn delete_channel(
     StateRef(state): StateRef<'_, AppState>,
     Params(id): Params<ChannelId>,
 ) -> Result<WebResponse, AppError> {
-    state
-        .channel_repo()
-        .delete(refract_core::DEFAULT_OWNER_ID, id)
-        .await
-        .map_err(reject)?;
-    commit_channels(state).await?;
-    ok(serde_json::json!({ "deleted": id }))
+    delete_channel_impl(state, id, None).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,13 +385,7 @@ async fn toggle_channel(
     Params(id): Params<ChannelId>,
     AdminJson(body): AdminJson<EnabledBody>,
 ) -> Result<WebResponse, AppError> {
-    state
-        .channel_repo()
-        .set_enabled(refract_core::DEFAULT_OWNER_ID, id, body.enabled)
-        .await
-        .map_err(reject)?;
-    commit_channels(state).await?;
-    ok(serde_json::json!({ "id": id, "enabled": body.enabled }))
+    toggle_channel_impl(state, id, body.enabled, None).await
 }
 
 async fn probe_channel(
@@ -673,24 +520,14 @@ async fn bulk_channels(
 }
 
 async fn list_keys(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
-    let items = state
-        .key_repo()
-        .list(refract_core::DEFAULT_OWNER_ID)
-        .await
-        .map_err(reject)?;
-    ok(items)
+    list_keys_impl(state, None).await
 }
 
 async fn create_key(
     StateRef(state): StateRef<'_, AppState>,
     AdminJson(spec): AdminJson<refract_store::NewApiKey>,
 ) -> Result<WebResponse, AppError> {
-    let (key, plaintext) = state
-        .key_repo()
-        .create(refract_core::DEFAULT_OWNER_ID, spec)
-        .await
-        .map_err(reject)?;
-    ok(serde_json::json!({ "key": key, "plaintext": plaintext }))
+    create_key_impl(state, spec, None).await
 }
 
 async fn update_key(
@@ -698,12 +535,7 @@ async fn update_key(
     Params(id): Params<i64>,
     AdminJson(spec): AdminJson<refract_store::NewApiKey>,
 ) -> Result<WebResponse, AppError> {
-    let key = state
-        .key_repo()
-        .update(refract_core::DEFAULT_OWNER_ID, id, &spec)
-        .await
-        .map_err(reject)?;
-    ok(key)
+    update_key_impl(state, id, spec, None).await
 }
 
 async fn toggle_key(
@@ -711,36 +543,21 @@ async fn toggle_key(
     Params(id): Params<i64>,
     AdminJson(body): AdminJson<EnabledBody>,
 ) -> Result<WebResponse, AppError> {
-    state
-        .key_repo()
-        .set_enabled(refract_core::DEFAULT_OWNER_ID, id, body.enabled)
-        .await
-        .map_err(reject)?;
-    ok(serde_json::json!({ "id": id, "enabled": body.enabled }))
+    toggle_key_impl(state, id, body.enabled, None).await
 }
 
 async fn reset_key_usage(
     StateRef(state): StateRef<'_, AppState>,
     Params(id): Params<i64>,
 ) -> Result<WebResponse, AppError> {
-    state
-        .key_repo()
-        .reset_usage(refract_core::DEFAULT_OWNER_ID, id)
-        .await
-        .map_err(reject)?;
-    ok(serde_json::json!({ "id": id, "used_quota": 0 }))
+    reset_key_usage_impl(state, id, None).await
 }
 
 async fn delete_key(
     StateRef(state): StateRef<'_, AppState>,
     Params(id): Params<i64>,
 ) -> Result<WebResponse, AppError> {
-    state
-        .key_repo()
-        .delete(refract_core::DEFAULT_OWNER_ID, id)
-        .await
-        .map_err(reject)?;
-    ok(serde_json::json!({ "deleted": id }))
+    delete_key_impl(state, id, None).await
 }
 
 async fn data_stats(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
@@ -988,6 +805,31 @@ async fn set_log_bodies(
     ok(serde_json::json!({ "enabled": body.enabled }))
 }
 
+/// per-user Prometheus 指标开关。默认关：user_id label 基数随注册数增长。
+async fn get_metrics_per_user(
+    StateRef(state): StateRef<'_, AppState>,
+) -> Result<WebResponse, AppError> {
+    let enabled = state
+        .settings_repo()
+        .per_user_metrics()
+        .await
+        .map_err(reject)?;
+    ok(serde_json::json!({ "enabled": enabled }))
+}
+
+async fn set_metrics_per_user(
+    StateRef(state): StateRef<'_, AppState>,
+    AdminJson(body): AdminJson<EnabledBody>,
+) -> Result<WebResponse, AppError> {
+    state
+        .settings_repo()
+        .set_per_user_metrics(body.enabled)
+        .await
+        .map_err(reject)?;
+    state.reload_per_user_metrics().await.map_err(reject)?;
+    ok(serde_json::json!({ "enabled": body.enabled }))
+}
+
 async fn get_limits(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
     ok(state
         .settings_repo()
@@ -1109,9 +951,9 @@ async fn set_admin_token(
         Some(token) => {
             let hash = refract_store::ApiKeyRepo::hash(&token);
             repo.set_admin_token(Some(&hash)).await.map_err(reject)?;
-            let ticket = crate::auth::create_session_ticket(
+            let ticket = crate::auth::create_user_session_ticket(
                 state.session_secret(),
-                &hash,
+                state.bootstrap_admin_id(),
                 crate::auth::SESSION_MAX_AGE_SECS,
             );
             let cookie =
@@ -1241,12 +1083,29 @@ async fn health_reset(
 
 async fn export_config(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
     let owner = refract_core::DEFAULT_OWNER_ID;
-    let channels = state.channel_repo().list(owner).await.map_err(reject)?;
-    let keys = state.key_repo().export(owner).await.map_err(reject)?;
+    let emails = user_email_index(state).await?;
+    let channels = state
+        .channel_repo()
+        .list(owner)
+        .await
+        .map_err(reject)?
+        .into_iter()
+        .map(|channel| ExportedChannel::from_channel(channel, &emails))
+        .collect();
+    let keys = state
+        .key_repo()
+        .export(owner)
+        .await
+        .map_err(reject)?
+        .into_iter()
+        .map(|key| ExportedKey::from_stored(key, &emails))
+        .collect();
+    let users = export_users(state).await?;
     ok(ExportDocument {
         version: EXPORT_VERSION,
         exported_at: Some(chrono::Utc::now().to_rfc3339()),
         channels,
+        users,
         keys,
         settings: ExportedSettings {
             routing_policy: state.policy(),
@@ -1338,18 +1197,7 @@ async fn playground_chat(
 }
 
 async fn list_models(StateRef(state): StateRef<'_, AppState>) -> Result<WebResponse, AppError> {
-    let channels = state.channels();
-    let mut names: Vec<&str> = channels
-        .iter()
-        .filter(|channel| channel.enabled)
-        .flat_map(|channel| channel.endpoints.iter())
-        .filter(|endpoint| endpoint.enabled)
-        .flat_map(|endpoint| endpoint.models.iter())
-        .map(|model| model.name.as_str())
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    ok(names)
+    ok(collect_enabled_model_names(state.channels().iter()))
 }
 
 /// 直接探测上游模型列表请求体。
@@ -1673,23 +1521,79 @@ struct MasterKeyBody {
     key: Option<String>,
 }
 
-/// 备份文档的当前版本号。导入时校验，未来格式变更靠它做兼容。
-const EXPORT_VERSION: u32 = 1;
+/// 备份文档的当前版本号。导入时接受 v1（全部归 admin + shared）与 v2。
+const EXPORT_VERSION: u32 = 2;
 
 /// 一份完整的配置备份。
 ///
 /// 渠道凭据**明文导出** —— 备份的意义就是可恢复；文件的保管责任与数据库
 /// 文件本身相同。网关自身的 API 密钥只有哈希，明文从未落库也就无从导出。
+/// 用户只导出安全字段与钱包余额，不含密码哈希。
 #[derive(Debug, Serialize, Deserialize)]
 struct ExportDocument {
     version: u32,
     #[serde(default)]
     exported_at: Option<String>,
     #[serde(default)]
-    channels: Vec<Channel>,
+    channels: Vec<ExportedChannel>,
     #[serde(default)]
-    keys: Vec<refract_store::ExportedApiKey>,
+    users: Vec<ExportedUser>,
+    #[serde(default)]
+    keys: Vec<ExportedKey>,
     settings: ExportedSettings,
+}
+
+/// 备份中的渠道：领域实体加上可跨实例解析的属主邮箱。
+#[derive(Debug, Serialize, Deserialize)]
+struct ExportedChannel {
+    #[serde(flatten)]
+    channel: Channel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_email: Option<String>,
+}
+
+impl ExportedChannel {
+    fn from_channel(mut channel: Channel, emails: &std::collections::HashMap<i64, String>) -> Self {
+        let user_email = channel.user_id.and_then(|id| emails.get(&id).cloned());
+        // 实例内 user_id 不能跨库复用；导入按 email 解析。
+        channel.user_id = None;
+        Self {
+            channel,
+            user_email,
+        }
+    }
+}
+
+/// 备份中的用户。不含密码哈希。
+#[derive(Debug, Serialize, Deserialize)]
+struct ExportedUser {
+    email: String,
+    #[serde(default)]
+    display_name: String,
+    role: UserRole,
+    status: UserStatus,
+    #[serde(default)]
+    wallet_balance: f64,
+}
+
+/// 备份中的网关密钥：哈希可恢复原明文，属主用 email 关联。
+#[derive(Debug, Serialize, Deserialize)]
+struct ExportedKey {
+    #[serde(flatten)]
+    key: refract_store::ExportedApiKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_email: Option<String>,
+}
+
+impl ExportedKey {
+    fn from_stored(
+        mut key: refract_store::ExportedApiKey,
+        emails: &std::collections::HashMap<i64, String>,
+    ) -> Self {
+        let user_email = key.user_id.and_then(|id| emails.get(&id).cloned());
+        key.user_id = None;
+        Self { key, user_email }
+    }
 }
 
 /// 备份中的运行时设置。
@@ -1726,25 +1630,170 @@ enum ImportMode {
     Replace,
 }
 
+fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+async fn user_email_index(
+    state: &AppState,
+) -> Result<std::collections::HashMap<i64, String>, AppError> {
+    Ok(list_export_users(state)
+        .await?
+        .into_iter()
+        .map(|user| (user.id, user.email))
+        .collect())
+}
+
+async fn list_export_users(state: &AppState) -> Result<Vec<refract_store::User>, AppError> {
+    let mut users = Vec::new();
+    let mut offset = 0_u32;
+    loop {
+        let page = state
+            .user_repo()
+            .list_filtered(None, None, 200, offset)
+            .await
+            .map_err(reject)?;
+        if page.is_empty() {
+            break;
+        }
+        let n = u32::try_from(page.len()).unwrap_or(u32::MAX);
+        users.extend(page);
+        offset = offset.saturating_add(n);
+        if n < 200 {
+            break;
+        }
+    }
+    Ok(users)
+}
+
+async fn export_users(state: &AppState) -> Result<Vec<ExportedUser>, AppError> {
+    let wallets = state.wallet_repo().all_wallets().await.map_err(reject)?;
+    let balances: std::collections::HashMap<i64, f64> = wallets
+        .into_iter()
+        .map(|wallet| (wallet.user_id, wallet.balance))
+        .collect();
+    Ok(list_export_users(state)
+        .await?
+        .into_iter()
+        .map(|user| ExportedUser {
+            email: user.email,
+            display_name: user.display_name,
+            role: user.role,
+            status: user.status,
+            wallet_balance: balances.get(&user.id).copied().unwrap_or(0.0),
+        })
+        .collect())
+}
+
+async fn resolve_import_user_id(
+    state: &AppState,
+    email: Option<&str>,
+    admin_id: i64,
+) -> Result<i64, AppError> {
+    let Some(email) = email.map(normalize_email).filter(|s| !s.is_empty()) else {
+        return Ok(admin_id);
+    };
+    Ok(state
+        .user_repo()
+        .find_by_email(&email)
+        .await
+        .map_err(reject)?
+        .map(|user| user.id)
+        .unwrap_or(admin_id))
+}
+
+async fn prepare_imported_channel(
+    mut channel: Channel,
+    user_email: Option<&str>,
+    v1: bool,
+    admin_id: i64,
+    state: &AppState,
+) -> Result<Channel, AppError> {
+    channel.id = 0;
+    channel.owner_id = refract_core::DEFAULT_OWNER_ID;
+    reject_masked_credentials(&channel)?;
+    if v1 {
+        channel.visibility = ChannelVisibility::Shared;
+        channel.user_id = None;
+        return Ok(channel);
+    }
+    let uid = resolve_import_user_id(state, user_email, admin_id).await?;
+    if channel.visibility == ChannelVisibility::Private {
+        channel.user_id = Some(uid);
+    } else {
+        channel.user_id = None;
+    }
+    Ok(channel)
+}
+
+async fn prepare_imported_key(
+    mut key: refract_store::ExportedApiKey,
+    user_email: Option<&str>,
+    v1: bool,
+    admin_id: i64,
+    state: &AppState,
+) -> Result<refract_store::ExportedApiKey, AppError> {
+    let uid = if v1 {
+        admin_id
+    } else {
+        resolve_import_user_id(state, user_email, admin_id).await?
+    };
+    key.user_id = Some(uid);
+    Ok(key)
+}
+
 /// 执行导入。
 ///
 /// 先全量校验再写入：一个坏渠道不应该让备份导到一半 —— 那比导入失败更糟，
 /// 用户会拿到一个自己都说不清状态的实例。
+/// v1 备份全部归 bootstrap admin + shared；v2 按规范化 email 匹配用户，
+/// 匹配不到则回落到 bootstrap admin。不根据备份创建用户，也不恢复密码。
 async fn import_document(req: ImportRequest, state: &AppState) -> Result<WebResponse, AppError> {
     let owner = refract_core::DEFAULT_OWNER_ID;
-    if req.data.version != EXPORT_VERSION {
-        return Err(AppError::Admin(GatewayError::invalid_request(format!(
-            "unsupported backup version {}; this build accepts version {EXPORT_VERSION}",
-            req.data.version
-        ))));
+    match req.data.version {
+        1 | 2 => {}
+        other => {
+            return Err(AppError::Admin(GatewayError::invalid_request(format!(
+                "unsupported backup version {other}; this build accepts versions 1 and 2"
+            ))));
+        }
     }
-    for channel in &req.data.channels {
-        channel.validate().map_err(|e| {
+    let v1 = req.data.version == 1;
+    let admin_id = state.bootstrap_admin_id();
+    for exported in &req.data.channels {
+        exported.channel.validate().map_err(|e| {
             AppError::Admin(GatewayError::invalid_request(format!(
                 "channel `{}` in the backup is invalid: {e}",
-                channel.name
+                exported.channel.name
             )))
         })?;
+    }
+
+    let mut channels = Vec::with_capacity(req.data.channels.len());
+    for exported in req.data.channels {
+        channels.push(
+            prepare_imported_channel(
+                exported.channel,
+                exported.user_email.as_deref(),
+                v1,
+                admin_id,
+                state,
+            )
+            .await?,
+        );
+    }
+    let mut keys = Vec::with_capacity(req.data.keys.len());
+    for exported in req.data.keys {
+        keys.push(
+            prepare_imported_key(
+                exported.key,
+                exported.user_email.as_deref(),
+                v1,
+                admin_id,
+                state,
+            )
+            .await?,
+        );
     }
 
     let channel_repo = state.channel_repo();
@@ -1761,22 +1810,11 @@ async fn import_document(req: ImportRequest, state: &AppState) -> Result<WebResp
         // 提交的话，中途失败会留下「渠道被清空但只导入了一半」的实例。
         // 渠道与密钥分属两个事务：跨域仍非严格原子，但每个域内不会半途而废，
         // 且失败后重导（merge 或 replace）都能收敛到完整状态。
-        let mut channels = req.data.channels;
-        for channel in &mut channels {
-            channel.id = 0;
-            channel.owner_id = owner;
-            // 有人会把管理 API 的 GET 响应（凭据已脱敏）当备份喂回来 ——
-            // 那不是可用的配置，必须在覆盖现有数据**之前**拒绝。
-            reject_masked_credentials(channel)?;
-        }
         channels_imported = channel_repo
             .replace_all(owner, &channels)
             .await
             .map_err(reject)?;
-        (keys_imported, skipped_keys) = key_repo
-            .replace_all(owner, &req.data.keys)
-            .await
-            .map_err(reject)?;
+        (keys_imported, skipped_keys) = key_repo.replace_all(owner, &keys).await.map_err(reject)?;
     } else {
         // merge 模式按名字判重：同名渠道视为已存在。名字是用户视角的身份，
         // 数据库 id 在两个实例之间没有意义。
@@ -1788,21 +1826,18 @@ async fn import_document(req: ImportRequest, state: &AppState) -> Result<WebResp
             .map(|c| c.name)
             .collect();
 
-        for mut channel in req.data.channels {
+        for channel in channels {
             if existing_names.contains(&channel.name) {
                 skipped_channels.push(channel.name);
                 continue;
             }
-            channel.id = 0;
-            channel.owner_id = owner;
-            reject_masked_credentials(&channel)?;
             channel_repo.create(&channel).await.map_err(reject)?;
             channels_imported += 1;
         }
 
         let mut imported = 0_u32;
         let mut skipped = Vec::new();
-        for key in &req.data.keys {
+        for key in &keys {
             if key_repo.restore(owner, key).await.map_err(reject)? {
                 imported += 1;
             } else {
@@ -1841,9 +1876,309 @@ async fn import_document(req: ImportRequest, state: &AppState) -> Result<WebResp
 }
 
 // ---------------------------------------------------------------------------
-// 健康与模型
+// 自助面复用的内部实现
 // ---------------------------------------------------------------------------
 
+fn channel_owned_by(channel: &Channel, user_id: i64) -> bool {
+    channel.user_id == Some(user_id)
+}
+
+async fn require_owned_channel(
+    state: &AppState,
+    id: ChannelId,
+    user_id: Option<i64>,
+) -> Result<Channel, AppError> {
+    let channel = state
+        .channel_repo()
+        .get(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    if let Some(uid) = user_id
+        && !channel_owned_by(&channel, uid)
+    {
+        return Err(AppError::Admin(GatewayError::not_found(format!(
+            "channel `{id}` not found"
+        ))));
+    }
+    Ok(channel)
+}
+
+/// 列出渠道。`user_id = Some` 时只返回该用户的私有渠。
+pub(crate) async fn list_channels_impl(
+    state: &AppState,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    let items = state
+        .channel_repo()
+        .list(refract_core::DEFAULT_OWNER_ID)
+        .await
+        .map_err(reject)?;
+    let items: Vec<_> = match user_id {
+        Some(uid) => items
+            .into_iter()
+            .filter(|channel| {
+                channel.visibility == ChannelVisibility::Private && channel_owned_by(channel, uid)
+            })
+            .map(redact_channel)
+            .collect(),
+        None => items.into_iter().map(redact_channel).collect(),
+    };
+    ok(items)
+}
+
+/// 创建渠道。`user_id = Some` 时强制 visibility=private。
+pub(crate) async fn create_channel_impl(
+    state: &AppState,
+    mut channel: Channel,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    channel.owner_id = refract_core::DEFAULT_OWNER_ID;
+    channel.id = 0;
+    if let Some(uid) = user_id {
+        channel.visibility = ChannelVisibility::Private;
+        channel.user_id = Some(uid);
+    }
+    reject_masked_credentials(&channel)?;
+    validate(&channel)?;
+    let created = state
+        .channel_repo()
+        .create(&channel)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(redact_channel(created))
+}
+
+/// 读取渠道。自助面越权返回 404。
+pub(crate) async fn get_channel_impl(
+    state: &AppState,
+    id: ChannelId,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    ok(redact_channel(
+        require_owned_channel(state, id, user_id).await?,
+    ))
+}
+
+/// 更新渠道。自助面强制保持 private + 属主。
+pub(crate) async fn update_channel_impl(
+    state: &AppState,
+    id: ChannelId,
+    mut channel: Channel,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    channel.id = id;
+    channel.owner_id = refract_core::DEFAULT_OWNER_ID;
+    let existing = require_owned_channel(state, id, user_id).await?;
+    if let Some(uid) = user_id {
+        channel.visibility = ChannelVisibility::Private;
+        channel.user_id = Some(uid);
+    }
+    restore_unchanged_credentials(&existing, &mut channel);
+    reject_masked_credentials(&channel)?;
+    validate(&channel)?;
+    let saved = state
+        .channel_repo()
+        .update(&channel)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(redact_channel(saved))
+}
+
+/// 删除渠道。
+pub(crate) async fn delete_channel_impl(
+    state: &AppState,
+    id: ChannelId,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    let _ = require_owned_channel(state, id, user_id).await?;
+    state
+        .channel_repo()
+        .delete(refract_core::DEFAULT_OWNER_ID, id)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(serde_json::json!({ "deleted": id }))
+}
+
+/// 启用/停用渠道。
+pub(crate) async fn toggle_channel_impl(
+    state: &AppState,
+    id: ChannelId,
+    enabled: bool,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    let _ = require_owned_channel(state, id, user_id).await?;
+    state
+        .channel_repo()
+        .set_enabled(refract_core::DEFAULT_OWNER_ID, id, enabled)
+        .await
+        .map_err(reject)?;
+    commit_channels(state).await?;
+    ok(serde_json::json!({ "id": id, "enabled": enabled }))
+}
+
+/// 列出密钥。`user_id = Some` 时只返回该用户的密钥。
+pub(crate) async fn list_keys_impl(
+    state: &AppState,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    let items = match user_id {
+        Some(uid) => {
+            state
+                .key_repo()
+                .list_for_user(refract_core::DEFAULT_OWNER_ID, uid)
+                .await
+        }
+        None => state.key_repo().list(refract_core::DEFAULT_OWNER_ID).await,
+    }
+    .map_err(reject)?;
+    ok(items)
+}
+
+/// 创建密钥。
+pub(crate) async fn create_key_impl(
+    state: &AppState,
+    spec: refract_store::NewApiKey,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    let (key, plaintext) = match user_id {
+        Some(uid) => {
+            state
+                .key_repo()
+                .create_for_user(refract_core::DEFAULT_OWNER_ID, uid, spec)
+                .await
+        }
+        None => {
+            state
+                .key_repo()
+                .create(refract_core::DEFAULT_OWNER_ID, spec)
+                .await
+        }
+    }
+    .map_err(reject)?;
+    ok(serde_json::json!({ "key": key, "plaintext": plaintext }))
+}
+
+/// 更新密钥。
+pub(crate) async fn update_key_impl(
+    state: &AppState,
+    id: i64,
+    spec: refract_store::NewApiKey,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    let key = match user_id {
+        Some(uid) => {
+            state
+                .key_repo()
+                .update_for_user(refract_core::DEFAULT_OWNER_ID, uid, id, &spec)
+                .await
+        }
+        None => {
+            state
+                .key_repo()
+                .update(refract_core::DEFAULT_OWNER_ID, id, &spec)
+                .await
+        }
+    }
+    .map_err(reject)?;
+    ok(key)
+}
+
+/// 启用/停用密钥。
+pub(crate) async fn toggle_key_impl(
+    state: &AppState,
+    id: i64,
+    enabled: bool,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    match user_id {
+        Some(uid) => {
+            state
+                .key_repo()
+                .set_enabled_for_user(refract_core::DEFAULT_OWNER_ID, uid, id, enabled)
+                .await
+        }
+        None => {
+            state
+                .key_repo()
+                .set_enabled(refract_core::DEFAULT_OWNER_ID, id, enabled)
+                .await
+        }
+    }
+    .map_err(reject)?;
+    ok(serde_json::json!({ "id": id, "enabled": enabled }))
+}
+
+/// 清零密钥用量。
+pub(crate) async fn reset_key_usage_impl(
+    state: &AppState,
+    id: i64,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    match user_id {
+        Some(uid) => {
+            state
+                .key_repo()
+                .reset_usage_for_user(refract_core::DEFAULT_OWNER_ID, uid, id)
+                .await
+        }
+        None => {
+            state
+                .key_repo()
+                .reset_usage(refract_core::DEFAULT_OWNER_ID, id)
+                .await
+        }
+    }
+    .map_err(reject)?;
+    ok(serde_json::json!({ "id": id, "used_quota": 0 }))
+}
+
+/// 删除密钥。
+pub(crate) async fn delete_key_impl(
+    state: &AppState,
+    id: i64,
+    user_id: Option<i64>,
+) -> Result<WebResponse, AppError> {
+    match user_id {
+        Some(uid) => {
+            state
+                .key_repo()
+                .delete_for_user(refract_core::DEFAULT_OWNER_ID, uid, id)
+                .await
+        }
+        None => {
+            state
+                .key_repo()
+                .delete(refract_core::DEFAULT_OWNER_ID, id)
+                .await
+        }
+    }
+    .map_err(reject)?;
+    ok(serde_json::json!({ "deleted": id }))
+}
+
+/// 从渠道列表收集启用端点上的对外模型名。
+pub(crate) fn collect_enabled_model_names<'a>(
+    channels: impl IntoIterator<Item = &'a Channel>,
+) -> Vec<String> {
+    let mut names: Vec<&str> = channels
+        .into_iter()
+        .filter(|channel| channel.enabled)
+        .flat_map(|channel| channel.endpoints.iter())
+        .filter(|endpoint| endpoint.enabled)
+        .flat_map(|endpoint| endpoint.models.iter())
+        .map(|model| model.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.into_iter().map(str::to_owned).collect()
+}
+
+// ---------------------------------------------------------------------------
+// 健康与模型
+// ---------------------------------------------------------------------------
 #[cfg(test)]
 #[path = "admin_tests.rs"]
 mod tests;

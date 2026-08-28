@@ -23,22 +23,34 @@ import type {
   EmptyResponseRetryPolicy,
   EndpointHealth,
   GlobalLimits,
+  ImportResult,
   IpLimits,
   KeyUsageStat,
+  LedgerEntry,
+  LedgerKind,
   LogFilter,
   LogRetentionSetting,
+  LoginResponse,
   ModelPrice,
   ModelStat,
   NewApiKey,
   NotifySettings,
   ProbeResult,
   Protocol,
+  RegisterResponse,
   RequestLog,
   RoutingPolicy,
   SecretConfigured,
+  SessionResponse,
+  SessionUser,
   StatsSummary,
   TimeBucket,
   UpstreamAddress,
+  User,
+  UserListItem,
+  UserRole,
+  UserStatus,
+  Wallet,
 } from '@refract/contracts'
 import * as m from '@/paraglide/messages'
 import { encryptPayload } from './crypto'
@@ -152,10 +164,15 @@ function fetchFailure(error: unknown): ApiError | BackendUnavailable | DOMExcept
   return api
 }
 
-/** 非 2xx 响应 → 带标签的失败。 */
-function httpFailure(response: Response): Effect<never, ApiError | BackendUnavailable> {
+function httpFailure(
+  response: Response,
+  path: string,
+): Effect<never, ApiError | BackendUnavailable> {
   return gen(function* () {
-    if (response.status === 401 || response.status === 403) announce(AUTH_REQUIRED_EVENT)
+    const skipAuthEvent = path.startsWith('/api/auth/') || path === '/api/me/password'
+    if (response.status === 401 && !skipAuthEvent) {
+      announce(AUTH_REQUIRED_EVENT)
+    }
 
     const envelope = readErrorEnvelope(
       yield* promise(() => response.text()),
@@ -197,7 +214,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       catch: fetchFailure,
     })
 
-    if (!response.ok) return yield* httpFailure(response)
+    if (!response.ok) return yield* httpFailure(response, path)
     announce(BACKEND_RESTORED_EVENT)
 
     if (response.status === 204) return undefined as T
@@ -242,7 +259,7 @@ export function download(path: string, fallbackName: string): Promise<void> {
       try: (signal) => fetch(path, { credentials: 'same-origin', signal }),
       catch: fetchFailure,
     })
-    if (!response.ok) return yield* httpFailure(response)
+    if (!response.ok) return yield* httpFailure(response, path)
 
     const disposition = response.headers.get('content-disposition') ?? ''
     const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1] ?? fallbackName
@@ -272,194 +289,249 @@ function query(params: object): string {
   return encoded ? `?${encoded}` : ''
 }
 
-/** 渠道管理。 */
-export const channels = {
-  list: () => request<Channel[]>('GET', '/api/channels'),
-  get: (id: number) => request<Channel>('GET', `/api/channels/${id}`),
-  create: (channel: Channel) => request<Channel>('POST', '/api/channels', channel),
-  update: (channel: Channel) => request<Channel>('PUT', `/api/channels/${channel.id}`, channel),
-  remove: (id: number) => request<{ deleted: number }>('DELETE', `/api/channels/${id}`),
-  setEnabled: (id: number, enabled: boolean) =>
-    request<{ id: number; enabled: boolean }>('POST', `/api/channels/${id}/enabled`, { enabled }),
-  /** 拉取上游真实模型列表，用于一键同步。`protocol` 省略时用首选端点。 */
-  probe: (id: number, protocol?: Protocol) =>
-    request<ProbeResult>('POST', `/api/channels/${id}/probe`, { protocol: protocol ?? null }),
-  /** 在未保存时直接按草稿参数探测上游真实模型列表。 */
-  probeDirect: (spec: {
-    protocol: Protocol
-    address?: UpstreamAddress
-    credential?: string | null
-    proxy?: string | null
-  }) => request<ProbeResult>('POST', '/api/channels/probe-direct', spec),
-  test: (id: number, protocol?: Protocol, model?: string) =>
-    request<ChannelTestResult>('POST', `/api/channels/${id}/test`, {
-      protocol: protocol ?? null,
-      model: model ?? null,
-    }),
-  /** 复制渠道。副本以禁用状态创建。 */
-  duplicate: (id: number) => request<Channel>('POST', `/api/channels/${id}/duplicate`),
-  /** 批量启用/禁用/删除。 */
-  bulk: (ids: number[], action: 'enable' | 'disable' | 'delete') =>
-    request<{ affected: number }>('POST', '/api/channels/bulk', { ids, action }),
-  /** 查询上游余额（OpenAI 兼容 billing 端点）并缓存。 */
-  balance: (id: number) =>
-    request<{ id: number; balance: number }>('POST', `/api/channels/${id}/balance`),
+/** 管理区走 `/api/admin`；自助区走 `/api/me`。 */
+export type ApiScope = 'admin' | 'me'
+
+export function scopePrefix(scope: ApiScope): string {
+  return scope === 'me' ? '/api/me' : '/api/admin'
 }
 
-/** 网关自身的 API 密钥。 */
-export const keys = {
-  list: () => request<ApiKey[]>('GET', '/api/keys'),
-  /** 返回值里的 `plaintext` 只在创建时出现一次，之后无法再取回。 */
-  create: (spec: NewApiKey) => request<CreatedApiKey>('POST', '/api/keys', spec),
-  /** 编辑治理属性；密钥本体不变，客户端无需换钥匙。 */
-  update: (id: number, spec: NewApiKey) => request<ApiKey>('PUT', `/api/keys/${id}`, spec),
-  /** 已用配额清零。 */
-  resetUsage: (id: number) =>
-    request<{ id: number; used_quota: number }>('POST', `/api/keys/${id}/reset-usage`),
-  remove: (id: number) => request<{ deleted: number }>('DELETE', `/api/keys/${id}`),
-  setEnabled: (id: number, enabled: boolean) =>
-    request<{ id: number; enabled: boolean }>('POST', `/api/keys/${id}/enabled`, { enabled }),
+function makeChannelsApi(base: string) {
+  return {
+    list: () => request<Channel[]>('GET', `${base}/channels`),
+    get: (id: number) => request<Channel>('GET', `${base}/channels/${id}`),
+    create: (channel: Channel) => request<Channel>('POST', `${base}/channels`, channel),
+    update: (channel: Channel) =>
+      request<Channel>('PUT', `${base}/channels/${channel.id}`, channel),
+    remove: (id: number) => request<{ deleted: number }>('DELETE', `${base}/channels/${id}`),
+    setEnabled: (id: number, enabled: boolean) =>
+      request<{ id: number; enabled: boolean }>('POST', `${base}/channels/${id}/enabled`, {
+        enabled,
+      }),
+    probe: (id: number, protocol?: Protocol) =>
+      request<ProbeResult>('POST', `${base}/channels/${id}/probe`, { protocol: protocol ?? null }),
+    probeDirect: (spec: {
+      protocol: Protocol
+      address?: UpstreamAddress
+      credential?: string | null
+      proxy?: string | null
+    }) => request<ProbeResult>('POST', `${base}/channels/probe-direct`, spec),
+    test: (id: number, protocol?: Protocol, model?: string) =>
+      request<ChannelTestResult>('POST', `${base}/channels/${id}/test`, {
+        protocol: protocol ?? null,
+        model: model ?? null,
+      }),
+    duplicate: (id: number) => request<Channel>('POST', `${base}/channels/${id}/duplicate`),
+    bulk: (ids: number[], action: 'enable' | 'disable' | 'delete') =>
+      request<{ affected: number }>('POST', `${base}/channels/bulk`, { ids, action }),
+    balance: (id: number) =>
+      request<{ id: number; balance: number }>('POST', `${base}/channels/${id}/balance`),
+  }
 }
 
-/** 请求日志与统计。 */
-export const logs = {
-  query: (filter: LogFilter = {}) => request<RequestLog[]>('GET', `/api/logs${query(filter)}`),
-  /** 单条完整记录，含请求/响应正文快照。 */
-  get: (id: number) => request<RequestLog>('GET', `/api/logs/${id}`),
-  prune: (days: number) => request<{ removed: number }>('POST', '/api/logs/prune', { days }),
-  summary: (hours = 24) => request<StatsSummary>('GET', `/api/stats${query({ hours })}`),
-  byModel: (hours = 24) => request<ModelStat[]>('GET', `/api/stats/models${query({ hours })}`),
-  byKey: (hours = 24) => request<KeyUsageStat[]>('GET', `/api/stats/keys${query({ hours })}`),
-  byChannel: (hours = 24) =>
-    request<ChannelStat[]>('GET', `/api/stats/channels${query({ hours })}`),
-  timeseries: (hours = 24, bucket: 'hour' | 'day' = 'hour') =>
-    request<TimeBucket[]>('GET', `/api/stats/timeseries${query({ hours, bucket })}`),
-  /** 按当前筛选导出 NDJSON（带鉴权下载）。 */
-  export: (filter: LogFilter = {}) =>
-    download(`/api/logs/export${query(filter)}`, 'refract-logs.ndjson'),
+function makeKeysApi(base: string) {
+  return {
+    list: () => request<ApiKey[]>('GET', `${base}/keys`),
+    create: (spec: NewApiKey) => request<CreatedApiKey>('POST', `${base}/keys`, spec),
+    update: (id: number, spec: NewApiKey) => request<ApiKey>('PUT', `${base}/keys/${id}`, spec),
+    resetUsage: (id: number) =>
+      request<{ id: number; used_quota: number }>('POST', `${base}/keys/${id}/reset-usage`),
+    remove: (id: number) => request<{ deleted: number }>('DELETE', `${base}/keys/${id}`),
+    setEnabled: (id: number, enabled: boolean) =>
+      request<{ id: number; enabled: boolean }>('POST', `${base}/keys/${id}/enabled`, { enabled }),
+  }
+}
+
+function makeLogsApi(base: string) {
+  return {
+    query: (filter: LogFilter = {}) => request<RequestLog[]>('GET', `${base}/logs${query(filter)}`),
+    get: (id: number) => request<RequestLog>('GET', `${base}/logs/${id}`),
+    prune: (days: number) => request<{ removed: number }>('POST', `${base}/logs/prune`, { days }),
+    summary: (hours = 24) => request<StatsSummary>('GET', `${base}/stats${query({ hours })}`),
+    byModel: (hours = 24) => request<ModelStat[]>('GET', `${base}/stats/models${query({ hours })}`),
+    byKey: (hours = 24) => request<KeyUsageStat[]>('GET', `${base}/stats/keys${query({ hours })}`),
+    byChannel: (hours = 24) =>
+      request<ChannelStat[]>('GET', `${base}/stats/channels${query({ hours })}`),
+    timeseries: (hours = 24, bucket: 'hour' | 'day' = 'hour') =>
+      request<TimeBucket[]>('GET', `${base}/stats/timeseries${query({ hours, bucket })}`),
+    export: (filter: LogFilter = {}) =>
+      download(`${base}/logs/export${query(filter)}`, 'refract-logs.ndjson'),
+  }
+}
+
+/** 渠道管理（管理区）。 */
+export const channels = makeChannelsApi('/api/admin')
+/** 网关自身的 API 密钥（管理区）。 */
+export const keys = makeKeysApi('/api/admin')
+/** 请求日志与统计（管理区）。 */
+export const logs = makeLogsApi('/api/admin')
+
+export function scopedChannels(scope: ApiScope) {
+  return makeChannelsApi(scopePrefix(scope))
+}
+export function scopedKeys(scope: ApiScope) {
+  return makeKeysApi(scopePrefix(scope))
+}
+export function scopedLogs(scope: ApiScope) {
+  return makeLogsApi(scopePrefix(scope))
 }
 
 /** 运行时设置。 */
 export const settings = {
-  routingPolicy: () => request<RoutingPolicy>('GET', '/api/settings/routing'),
+  routingPolicy: () => request<RoutingPolicy>('GET', '/api/admin/settings/routing'),
   setRoutingPolicy: (policy: RoutingPolicy) =>
-    request<RoutingPolicy>('PUT', '/api/settings/routing', policy),
-  logRetention: () => request<LogRetentionSetting>('GET', '/api/settings/log-retention'),
+    request<RoutingPolicy>('PUT', '/api/admin/settings/routing', policy),
+  logRetention: () => request<LogRetentionSetting>('GET', '/api/admin/settings/log-retention'),
   setLogRetention: (days: number) =>
-    request<LogRetentionSetting>('PUT', '/api/settings/log-retention', { days }),
-  breakerPolicy: () => request<BreakerPolicy>('GET', '/api/settings/breaker'),
+    request<LogRetentionSetting>('PUT', '/api/admin/settings/log-retention', { days }),
+  breakerPolicy: () => request<BreakerPolicy>('GET', '/api/admin/settings/breaker'),
   setBreakerPolicy: (policy: BreakerPolicy) =>
-    request<BreakerPolicy>('PUT', '/api/settings/breaker', policy),
-  pricing: () => request<ModelPrice[]>('GET', '/api/settings/pricing'),
+    request<BreakerPolicy>('PUT', '/api/admin/settings/breaker', policy),
+  pricing: () => request<ModelPrice[]>('GET', '/api/admin/settings/pricing'),
   setPricing: (prices: ModelPrice[]) =>
-    request<ModelPrice[]>('PUT', '/api/settings/pricing', prices),
-  logBodies: () => request<{ enabled: boolean }>('GET', '/api/settings/log-bodies'),
+    request<ModelPrice[]>('PUT', '/api/admin/settings/pricing', prices),
+  logBodies: () => request<{ enabled: boolean }>('GET', '/api/admin/settings/log-bodies'),
   setLogBodies: (enabled: boolean) =>
-    request<{ enabled: boolean }>('PUT', '/api/settings/log-bodies', { enabled }),
-  globalLimits: () => request<GlobalLimits>('GET', '/api/settings/limits'),
+    request<{ enabled: boolean }>('PUT', '/api/admin/settings/log-bodies', { enabled }),
+  globalLimits: () => request<GlobalLimits>('GET', '/api/admin/settings/limits'),
   setGlobalLimits: (limits: GlobalLimits) =>
-    request<GlobalLimits>('PUT', '/api/settings/limits', limits),
-  ipLimits: () => request<IpLimits>('GET', '/api/settings/ip-limits'),
-  setIpLimits: (limits: IpLimits) => request<IpLimits>('PUT', '/api/settings/ip-limits', limits),
+    request<GlobalLimits>('PUT', '/api/admin/settings/limits', limits),
+  ipLimits: () => request<IpLimits>('GET', '/api/admin/settings/ip-limits'),
+  setIpLimits: (limits: IpLimits) =>
+    request<IpLimits>('PUT', '/api/admin/settings/ip-limits', limits),
   emptyResponseRetry: () =>
-    request<EmptyResponseRetryPolicy>('GET', '/api/settings/empty-response-retry'),
+    request<EmptyResponseRetryPolicy>('GET', '/api/admin/settings/empty-response-retry'),
   setEmptyResponseRetry: (policy: EmptyResponseRetryPolicy) =>
-    request<EmptyResponseRetryPolicy>('PUT', '/api/settings/empty-response-retry', policy),
-  notify: () => request<NotifySettings>('GET', '/api/settings/notify'),
+    request<EmptyResponseRetryPolicy>('PUT', '/api/admin/settings/empty-response-retry', policy),
+  notify: () => request<NotifySettings>('GET', '/api/admin/settings/notify'),
   setNotify: (settings: NotifySettings) =>
-    request<NotifySettings>('PUT', '/api/settings/notify', settings),
-  testNotify: () => request<{ sent: boolean }>('POST', '/api/settings/notify/test'),
-  /** Webhook 签名密钥；只回是否已配置，不回明文。传 null 清除。 */
-  webhookSecret: () => request<SecretConfigured>('GET', '/api/settings/webhook-secret'),
+    request<NotifySettings>('PUT', '/api/admin/settings/notify', settings),
+  testNotify: () => request<{ sent: boolean }>('POST', '/api/admin/settings/notify/test'),
+  webhookSecret: () => request<SecretConfigured>('GET', '/api/admin/settings/webhook-secret'),
   setWebhookSecret: (secret: string | null) =>
-    request<SecretConfigured>('PUT', '/api/settings/webhook-secret', { secret }),
-  /** 渠道亲和性设置；缺失时后端返回全默认（功能关闭）。 */
-  affinity: () => request<AffinitySettings>('GET', '/api/settings/affinity'),
+    request<SecretConfigured>('PUT', '/api/admin/settings/webhook-secret', { secret }),
+  affinity: () => request<AffinitySettings>('GET', '/api/admin/settings/affinity'),
   setAffinity: (settings: AffinitySettings) =>
-    request<AffinitySettings>('PUT', '/api/settings/affinity', settings),
-  /** 清空已建立的绑定缓存；返回被清除的条目数。 */
-  clearAffinity: () => request<{ cleared: number }>('POST', '/api/settings/affinity/clear'),
-  /** 命中/未命中/记录/遗忘次数与活跃绑定数。 */
-  affinityStats: () => request<AffinityStatsResponse>('GET', '/api/settings/affinity/stats'),
-  /** 自动备份设置：目录、间隔（0 关闭）、保留份数。 */
-  backupSettings: () => request<BackupSettings>('GET', '/api/settings/backup'),
+    request<AffinitySettings>('PUT', '/api/admin/settings/affinity', settings),
+  clearAffinity: () => request<{ cleared: number }>('POST', '/api/admin/settings/affinity/clear'),
+  affinityStats: () => request<AffinityStatsResponse>('GET', '/api/admin/settings/affinity/stats'),
+  backupSettings: () => request<BackupSettings>('GET', '/api/admin/settings/backup'),
   setBackupSettings: (settings: BackupSettings) =>
-    request<BackupSettings>('PUT', '/api/settings/backup', settings),
-  /** 凭据静态加密的主密钥；只回是否已配置，不回明文。传 null 清除。 */
-  masterKey: () => request<SecretConfigured>('GET', '/api/settings/master-key'),
+    request<BackupSettings>('PUT', '/api/admin/settings/backup', settings),
+  masterKey: () => request<SecretConfigured>('GET', '/api/admin/settings/master-key'),
   setMasterKey: (key: string | null) =>
-    request<SecretConfigured>('PUT', '/api/settings/master-key', { key }),
-  /** 传 null 关闭管理鉴权。设置后无法读回，只能覆盖或清除。 */
+    request<SecretConfigured>('PUT', '/api/admin/settings/master-key', { key }),
   setAdminToken: (token: string | null) =>
-    request<{ configured: boolean }>('PUT', '/api/settings/admin-token', { token }),
+    request<{ configured: boolean }>('PUT', '/api/admin/settings/admin-token', { token }),
 }
 
 /**
- * 管理身份与会话认证。
+ * 身份与会话认证。
  *
  * 采用 HttpOnly Session Cookie 进行会话保持，前端 JS 不在本地持久化明文令牌。
  */
 export const auth = {
-  session: () =>
-    request<{ authenticated: boolean; configured: boolean; username: string | null }>(
-      'GET',
-      '/api/auth/session',
-    ),
-  login: (token: string) =>
-    request<{ authenticated: boolean; username: string }>('POST', '/api/auth/login', { token }),
+  session: () => request<SessionResponse>('GET', '/api/auth/session'),
+  login: (body: { token: string } | { email: string; password: string }) =>
+    request<LoginResponse>('POST', '/api/auth/login', body),
   logout: () => request<{ authenticated: boolean }>('POST', '/api/auth/logout'),
-}
-/**
- * 备份文件管理（自动备份与手动备份的产物）。
- *
- * 与 `data.backup`（在线 VACUUM INTO 热备、直接吐文件）不同：这里管理的是
- * 已落盘的备份文件列表 —— 可以按需下载或删除某一份。
- */
-export const backups = {
-  list: () => request<BackupFile[]>('GET', '/api/backups'),
-  /** 立即生成一份备份。 */
-  create: () => request<{ name: string }>('POST', '/api/backups'),
-  /** 带管理令牌的下载；文件名由服务端 content-disposition 给出。 */
-  download: (name: string) => download(`/api/backups/${encodeURIComponent(name)}`, name),
-  remove: (name: string) =>
-    request<{ deleted: boolean }>('DELETE', `/api/backups/${encodeURIComponent(name)}`),
+  register: (body: { email: string; password: string; display_name?: string }) =>
+    request<RegisterResponse>('POST', '/api/auth/register', body),
+  verifyEmail: (body: { email: string; code: string }) =>
+    request<{ verified: boolean }>('POST', '/api/auth/verify-email', body),
+  resendVerification: (email: string) =>
+    request<{ sent: boolean }>('POST', '/api/auth/resend-verification', { email }),
+  requestPasswordReset: (email: string) =>
+    request<{ sent: boolean }>('POST', '/api/auth/password-reset/request', { email }),
+  confirmPasswordReset: (body: { email: string; code: string; new_password: string }) =>
+    request<{ reset: boolean }>('POST', '/api/auth/password-reset/confirm', body),
+  devCodes: (email: string) =>
+    request<{ code: string | null }>('GET', `/api/auth/dev-codes${query({ email })}`),
 }
 
-/** 渠道健康度与熔断。 */
+export const me = {
+  profile: () => request<User>('GET', '/api/me/profile'),
+  updateProfile: (display_name: string) =>
+    request<User>('PUT', '/api/me/profile', { display_name }),
+  changePassword: (old_password: string, new_password: string) =>
+    request<{ ok: boolean }>('POST', '/api/me/password', { old_password, new_password }),
+  wallet: () => request<Wallet>('GET', '/api/me/wallet'),
+  ledger: (
+    params: {
+      limit?: number
+      offset?: number
+      kind?: LedgerKind
+      since?: string
+      until?: string
+    } = {},
+  ) => request<LedgerEntry[]>('GET', `/api/me/wallet/ledger${query(params)}`),
+  exportLedger: (format: 'csv' | 'ndjson' = 'csv') =>
+    download(`/api/me/wallet/ledger/export${query({ format })}`, `refract-ledger.${format}`),
+  models: () => request<string[]>('GET', '/api/me/models'),
+}
+
+export const users = {
+  list: (params: { status?: UserStatus; email?: string; limit?: number; offset?: number } = {}) =>
+    request<UserListItem[]>('GET', `/api/admin/users${query(params)}`),
+  get: (id: number) => request<UserListItem>('GET', `/api/admin/users/${id}`),
+  create: (body: {
+    email: string
+    password: string
+    display_name?: string
+    role?: UserRole
+    initial_balance?: number
+  }) => request<UserListItem>('POST', '/api/admin/users', body),
+  update: (id: number, body: { display_name?: string; role?: UserRole; status?: UserStatus }) =>
+    request<UserListItem>('PUT', `/api/admin/users/${id}`, body),
+  disable: (id: number) =>
+    request<{ id: number; status: UserStatus }>('POST', `/api/admin/users/${id}/disable`),
+  enable: (id: number) =>
+    request<{ id: number; status: UserStatus }>('POST', `/api/admin/users/${id}/enable`),
+  wallet: (id: number) => request<Wallet>('GET', `/api/admin/users/${id}/wallet`),
+  ledger: (id: number, params: { limit?: number; offset?: number; kind?: LedgerKind } = {}) =>
+    request<LedgerEntry[]>('GET', `/api/admin/users/${id}/wallet/ledger${query(params)}`),
+  topup: (id: number, amount: number, note: string) =>
+    request<{ balance: number }>('POST', `/api/admin/users/${id}/wallet/topup`, { amount, note }),
+  adjust: (id: number, delta: number, note: string) =>
+    request<{ balance: number }>('POST', `/api/admin/users/${id}/wallet/adjust`, { delta, note }),
+  refund: (id: number, amount: number, note: string) =>
+    request<{ balance: number }>('POST', `/api/admin/users/${id}/wallet/refund`, { amount, note }),
+}
+
+export const backups = {
+  list: () => request<BackupFile[]>('GET', '/api/admin/backups'),
+  create: () => request<{ name: string }>('POST', '/api/admin/backups'),
+  download: (name: string) => download(`/api/admin/backups/${encodeURIComponent(name)}`, name),
+  remove: (name: string) =>
+    request<{ deleted: boolean }>('DELETE', `/api/admin/backups/${encodeURIComponent(name)}`),
+}
+
 export const data = {
   stats: () =>
     request<{ db_bytes: number; log_rows: number; oldest_log_at: string | null }>(
       'GET',
-      '/api/data/stats',
+      '/api/admin/data/stats',
     ),
-  /** 在线备份（带鉴权下载，VACUUM INTO 产物）。 */
-  backup: () => download('/api/data/backup', 'refract-backup.db'),
+  backup: () => download('/api/admin/data/backup', 'refract-backup.db'),
 }
 
 export const health = {
-  channels: () => request<EndpointHealth[]>('GET', '/api/health/channels'),
+  channels: () => request<EndpointHealth[]>('GET', '/api/admin/health/channels'),
   reset: (channelId: number, protocol: Protocol) =>
     request<{ reset: number; protocol: Protocol }>(
       'POST',
-      `/api/health/channels/${channelId}/${protocol}/reset`,
+      `/api/admin/health/channels/${channelId}/${protocol}/reset`,
     ),
 }
 
-/** 派生的可用模型清单。 */
 export const models = {
-  list: () => request<string[]>('GET', '/api/models'),
+  list: (scope: ApiScope = 'admin') => request<string[]>('GET', `${scopePrefix(scope)}/models`),
 }
 
-/**
- * 模型调试台。
- *
- * 不走统一的 `request()`：流式响应需要调用方直接消费 ReadableStream，
- * JSON 拆包在这里没有意义。鉴权失败仍派发全局事件，让令牌弹窗出现。
- */
 export const playground = {
   chat: (body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> => {
     const headers: Record<string, string> = { 'content-type': 'application/json' }
-    return fetch('/api/playground/chat', {
+    return fetch('/api/admin/playground/chat', {
       method: 'POST',
       headers,
       credentials: 'same-origin',
@@ -474,25 +546,10 @@ export const playground = {
   },
 }
 
-/** 导入结果统计。 */
-export interface ImportResult {
-  channels_imported: number
-  channels_skipped: number
-  keys_imported: number
-  keys_skipped: number
-  /** 因同名/同哈希被跳过的名单 —— 用户要知道的是「哪些没进来」。 */
-  skipped_channels: string[]
-  skipped_keys: string[]
-}
+export type { ImportResult, SessionUser }
 
-/**
- * 配置备份。
- *
- * 导出文档在前端是不透明的：内容形状由后端定义并演进（带 version 字段），
- * 前端只负责下载与回传，不应该对其中的字段做任何假设。
- */
 export const backup = {
-  export: () => request<Record<string, unknown>>('GET', '/api/export'),
+  export: () => request<Record<string, unknown>>('GET', '/api/admin/export'),
   import: (data: unknown, mode: 'merge' | 'replace') =>
-    request<ImportResult>('POST', '/api/import', { mode, data }),
+    request<ImportResult>('POST', '/api/admin/import', { mode, data }),
 }

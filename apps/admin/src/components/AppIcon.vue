@@ -38,6 +38,9 @@ import {
   Trash2,
   TriangleAlert,
   Upload,
+  User,
+  Users,
+  Wallet,
   X,
   Zap,
 } from '@lucide/vue'
@@ -102,6 +105,12 @@ const ICONS = {
   danger: CircleAlert,
   /** 提示 / 信息。 */
   info: Info,
+  /** 钱包。 */
+  wallet: Wallet,
+  /** 个人资料。 */
+  user: User,
+  /** 用户管理。 */
+  users: Users,
 }
 export type IconName = keyof typeof ICONS
 
