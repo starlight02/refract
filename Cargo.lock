@@ -2249,6 +2249,7 @@ dependencies = [
  "figment",
  "mimalloc",
  "rand",
+ "rcgen",
  "refract-api",
  "refract-core",
  "refract-store",

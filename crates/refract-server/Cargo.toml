@@ -24,5 +24,6 @@ xitca-web = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rcgen = "0.14"
 [lints]
 workspace = true

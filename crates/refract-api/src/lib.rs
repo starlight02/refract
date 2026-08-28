@@ -155,7 +155,7 @@ pub(crate) async fn dispatch_test(
 }
 
 /// TLS 身份。同一套 PEM 用于 TCP 上的 HTTPS（HTTP/1.1 + HTTP/2）和 UDP 上的 HTTP/3。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlsListen {
     /// TCP/UDP 绑定地址，通常与明文 `listen` 相同。
     pub addr: SocketAddr,
@@ -163,6 +163,15 @@ pub struct TlsListen {
     pub cert_pem: PathBuf,
     /// PEM 私钥路径。
     pub key_pem: PathBuf,
+}
+impl TlsListen {
+    /// 提前读证书、构造 TLS 配置。在 bind 前把「文件缺失 / PEM 损坏 /
+    /// 密钥与证书不匹配」拦在启动第一屏，而不是在 `listen` 失败时才报错。
+    pub fn validate(&self) -> std::io::Result<()> {
+        let _ = load_rustls_config(&self.cert_pem, &self.key_pem)?;
+        let _ = load_quic_config(&self.cert_pem, &self.key_pem)?;
+        Ok(())
+    }
 }
 
 /// 监听并启动 xitca-server。调用方负责 `wait` 与优雅关闭。
@@ -388,6 +397,12 @@ where
         }
     };
 
+    let alt_svc_port = ctx.state().alt_svc_port();
+    if alt_svc_port != 0
+        && let Ok(value) = HeaderValue::from_str(&format!("h3=\":{alt_svc_port}\"; ma=86400"))
+    {
+        response.headers_mut().insert("alt-svc", value);
+    }
     if cors_eligible(&path) {
         apply_cors(&mut response);
     }
@@ -670,6 +685,7 @@ mod tests {
             .expect("http/1.1");
         assert_eq!(h1.status(), reqwest::StatusCode::OK);
         assert_eq!(h1.version(), reqwest::Version::HTTP_11);
+        assert!(h1.headers().get("alt-svc").is_none());
         handle.stop(true);
         let _ = join.join();
     }
@@ -686,7 +702,11 @@ mod tests {
         std_listener.set_nonblocking(true).unwrap();
 
         let (handle, wait) = super::start_server(
-            test_state().await,
+            {
+                let state = test_state().await;
+                state.set_alt_svc_port(addr.port());
+                state
+            },
             std_listener,
             Some(TlsListen {
                 addr,
@@ -714,6 +734,10 @@ mod tests {
             .expect("https h2");
         assert_eq!(h2.status(), reqwest::StatusCode::OK);
         assert_eq!(h2.version(), reqwest::Version::HTTP_2);
+        assert_eq!(
+            h2.headers().get("alt-svc").and_then(|v| v.to_str().ok()),
+            Some(format!("h3=\":{}\"; ma=86400", addr.port()).as_str()),
+        );
 
         let h1 = reqwest::Client::builder()
             .add_root_certificate(ca)
@@ -775,6 +799,227 @@ mod tests {
         tokio::select! {
             error = driver.wait_idle() => panic!("h3 driver closed: {error}"),
             status = request => status,
+        }
+    }
+
+    fn sse_stream() -> &'static str {
+        "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+    }
+
+    async fn state_with_sse_channel(upstream: &str) -> AppState {
+        let db = refract_store::Database::open_in_memory().await.unwrap();
+        let channel = refract_core::Channel {
+            id: 0,
+            owner_id: refract_core::DEFAULT_OWNER_ID,
+            name: "sse-upstream".into(),
+            kind: refract_core::ChannelKind::Single(refract_core::Protocol::Chat),
+            enabled: true,
+            priority: 0,
+            weight: 1,
+            credential: refract_core::Credential::new("k"),
+            credentials: Vec::new(),
+            key_strategy: Default::default(),
+            address: refract_core::UpstreamAddress {
+                unofficial: true,
+                full_address: false,
+                base_url: Some(upstream.to_owned()),
+                version_prefix: None,
+                path: None,
+            },
+            endpoints: vec![refract_core::ChannelEndpoint {
+                models: vec![refract_core::ModelEntry::plain("gpt-4o")],
+                ..refract_core::ChannelEndpoint::new(refract_core::Protocol::Chat)
+            }],
+            tags: Vec::new(),
+            timeout_secs: 0,
+            proxy: None,
+            param_override: None,
+            note: None,
+            auto_disabled: false,
+            balance: None,
+            balance_updated_at: None,
+            extra_headers: Vec::new(),
+            test_model: None,
+            empty_response_retry: Default::default(),
+        };
+        refract_store::ChannelRepo::new(db.clone())
+            .create(&channel)
+            .await
+            .unwrap();
+        let client = refract_upstream::UpstreamClient::new(Default::default()).unwrap();
+        AppState::bootstrap(db, client, false).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn h2c_post_chat_streams_sse() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_stream()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_listener = listener.into_std().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let (handle, wait) = super::start_server(
+            state_with_sse_channel(&upstream.uri()).await,
+            std_listener,
+            None,
+        )
+        .expect("listen");
+        let join = std::thread::spawn(move || {
+            let _ = wait();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let output = std::process::Command::new("curl")
+            .args([
+                "--http2-prior-knowledge",
+                "-sS",
+                "-D",
+                "-",
+                "--header",
+                "content-type: application/json",
+                "--data",
+                &serde_json::to_string(&body).unwrap(),
+                &format!("http://{addr}/v1/chat/completions"),
+            ])
+            .output()
+            .expect("curl h2c");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "h2c POST failed: status={} stderr={stderr} stdout={stdout}",
+            output.status
+        );
+        assert!(
+            stdout.contains("HTTP/2 200") || stdout.contains("HTTP/2.0 200"),
+            "expected h2 response, got {stdout}"
+        );
+        assert!(
+            stdout.contains("data:"),
+            "expected SSE body over h2, got {stdout}"
+        );
+        assert!(
+            stdout.contains("[DONE]"),
+            "SSE stream must terminate over h2, got {stdout}"
+        );
+        handle.stop(true);
+        let _ = join.join();
+    }
+
+    #[tokio::test]
+    async fn h3_post_chat_streams_sse() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_stream()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, cert) = write_self_signed(dir.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_listener = listener.into_std().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+
+        let (handle, wait) = super::start_server(
+            state_with_sse_channel(&upstream.uri()).await,
+            std_listener,
+            Some(TlsListen {
+                addr,
+                cert_pem: cert_path,
+                key_pem: key_path,
+            }),
+        )
+        .expect("listen");
+        let join = std::thread::spawn(move || {
+            let _ = wait();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let (status, body) = h3_post_sse(addr, cert.der().clone()).await;
+        assert_eq!(status, http::StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("data:"), "h3 SSE body: {text}");
+        assert!(text.contains("[DONE]"), "h3 SSE must terminate: {text}");
+
+        handle.stop(true);
+        let _ = join.join();
+    }
+
+    async fn h3_post_sse(
+        addr: SocketAddr,
+        root: quinn::rustls::pki_types::CertificateDer<'static>,
+    ) -> (http::StatusCode, bytes::Bytes) {
+        let mut roots = quinn::rustls::RootCertStore::empty();
+        roots.add(root).expect("trust self-signed cert");
+        let mut tls = quinn::rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            quinn::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        )));
+
+        let conn = endpoint
+            .connect(addr, "localhost")
+            .unwrap()
+            .await
+            .expect("QUIC handshake");
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .expect("h3 client");
+
+        let request = async {
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-4o",
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .unwrap();
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("https://localhost/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
+            let mut stream = send_request.send_request(request).await.unwrap();
+            stream.send_data(payload.into()).await.unwrap();
+            stream.finish().await.unwrap();
+            let response = stream.recv_response().await.unwrap();
+            let status = response.status();
+            let mut body = bytes::BytesMut::new();
+            while let Some(chunk) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(bytes::Buf::chunk(&chunk));
+            }
+            (status, body.freeze())
+        };
+        tokio::select! {
+            error = driver.wait_idle() => panic!("h3 driver closed: {error}"),
+            result = request => result,
         }
     }
 }

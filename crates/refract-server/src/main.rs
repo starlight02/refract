@@ -102,11 +102,15 @@ impl Config {
             nonempty_path(self.tls_key.as_deref()),
         ) {
             (None, None) => Ok(None),
-            (Some(cert), Some(key)) => Ok(Some(refract_api::TlsListen {
-                addr,
-                cert_pem: PathBuf::from(cert),
-                key_pem: PathBuf::from(key),
-            })),
+            (Some(cert), Some(key)) => {
+                let tls = refract_api::TlsListen {
+                    addr,
+                    cert_pem: PathBuf::from(cert),
+                    key_pem: PathBuf::from(key),
+                };
+                tls.validate().context("invalid TLS certificate/key")?;
+                Ok(Some(tls))
+            }
             _ => anyhow::bail!("tls_cert and tls_key must both be set to enable HTTPS/HTTP/3"),
         }
     }
@@ -206,32 +210,111 @@ fn main() -> Result<()> {
     let tls = config.tls(local)?;
     if tls.is_some() {
         tracing::info!(address = %local, "HTTPS (HTTP/1.1+HTTP/2) and HTTP/3 enabled");
+        state.set_alt_svc_port(local.port());
     }
 
-    // 优雅关闭必须有上限：挂着的 SSE 长连接可以合法地存活几分钟，无上限的
-    // drain 会让 systemd/docker 在超时后直接 SIGKILL —— 那比我们主动截断更糟。
-    let (handle, wait) = refract_api::start_server(state, std_listener, tls)
-        .context("failed to start xitca-server")?;
-    let force = handle.clone();
-    let grace = Duration::from_secs(config.shutdown_grace_secs);
-    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
-    rt.spawn(async move {
-        shutdown_signal().await;
-        handle.stop(true);
-        tokio::select! {
-            _ = drained_rx => {}
-            () = tokio::time::sleep(grace) => {
-                tracing::warn!(
-                    grace_secs = grace.as_secs(),
-                    "in-flight requests did not drain in time; forcing shutdown"
-                );
-                force.stop(false);
+    // 证书热更新：mtime 变了 → 优雅排空 → 原地址重绑。新连接用新证书；
+    // 在途请求最多等 `shutdown_grace_secs`，和长流式会话的合理存活期一致。
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let mut tls = tls;
+        let mut listener = std_listener;
+        loop {
+            let cert_paths = tls
+                .as_ref()
+                .map(|tls| (tls.cert_pem.clone(), tls.key_pem.clone()));
+            let (handle, wait) =
+                match refract_api::start_server(state.clone(), listener, tls.clone()) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        tracing::error!(?error, "xitca-server failed to start");
+                        std::thread::sleep(Duration::from_secs(1));
+                        listener = match bind_tcp(config.listen) {
+                            Ok(listener) => listener,
+                            Err(error) => {
+                                tracing::error!(?error, "failed to re-bind listener");
+                                std::process::exit(1);
+                            }
+                        };
+                        continue;
+                    }
+                };
+
+            let baseline = cert_paths
+                .as_ref()
+                .map(|(cert, key)| (mtime_of(cert), mtime_of(key)));
+            let mut elapsed = 0u64;
+            let result = loop {
+                match shutdown_rx.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break "shutdown";
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+
+                elapsed += 1;
+                if let Some((cert, key)) = cert_paths.as_ref()
+                    && elapsed >= 30
+                    && (mtime_of(cert), mtime_of(key)) != baseline.unwrap()
+                {
+                    break "reload";
+                }
+
+                std::thread::sleep(Duration::from_secs(1));
+            };
+
+            handle.stop(true);
+
+            // 排空有上限：到点强行截断，不无限等长流式。
+            let force = handle.clone();
+            let waiter = std::thread::spawn(wait);
+            let drain_secs = config.shutdown_grace_secs;
+            let mut waited = 0u64;
+            let drained = loop {
+                if waiter.is_finished() {
+                    break true;
+                }
+                if waited >= drain_secs {
+                    force.stop(false);
+                    break false;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                waited += 1;
+            };
+            let _ = waiter.join();
+            let _ = drained;
+
+            if result == "reload" {
+                listener = match bind_tcp(config.listen) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        tracing::error!(?error, "failed to re-bind listener");
+                        std::process::exit(1);
+                    }
+                };
+
+                let new_tls = match config.tls(local) {
+                    Ok(tls) => tls,
+                    Err(error) => {
+                        tracing::error!(?error, "failed to reload TLS config; keeping old cert");
+                        tls.clone()
+                    }
+                };
+                if new_tls.is_some() {
+                    tls = new_tls;
+                    tracing::info!("TLS certificate reloaded");
+                }
+            } else {
+                break;
             }
         }
     });
 
-    wait().context("xitca-server exited with error")?;
-    let _ = drained_tx.send(());
+    rt.block_on(async {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(());
+    });
+    let _ = server.join();
 
     maintenance.abort();
     retest.abort();
@@ -245,6 +328,27 @@ fn main() -> Result<()> {
     });
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+fn bind_tcp(addr: SocketAddr) -> Result<std::net::TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    let _ = socket.set_reuseport(true);
+    socket.bind(addr)?;
+    let listener = socket.listen(1024)?;
+    let std_listener = listener.into_std()?;
+    std_listener.set_nonblocking(true)?;
+    Ok(std_listener)
+}
+
+fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 #[cfg(unix)]
@@ -699,14 +803,32 @@ mod tests {
     #[test]
     fn tls_binds_same_addr_when_both_paths_set() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 3939));
+        let dir = tempfile::tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
         let config = Config {
-            tls_cert: Some("/data/cert.pem".into()),
-            tls_key: Some("/data/key.pem".into()),
+            tls_cert: Some(cert_path.to_string_lossy().into_owned()),
+            tls_key: Some(key_path.to_string_lossy().into_owned()),
             ..Config::default()
         };
         let tls = config.tls(addr).unwrap().expect("enabled");
         assert_eq!(tls.addr, addr);
-        assert_eq!(tls.cert_pem.as_os_str(), "/data/cert.pem");
-        assert_eq!(tls.key_pem.as_os_str(), "/data/key.pem");
+        assert_eq!(tls.cert_pem, cert_path);
+        assert_eq!(tls.key_pem, key_path);
+    }
+
+    #[test]
+    fn tls_rejects_missing_cert_file() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 3939));
+        let config = Config {
+            tls_cert: Some("/no/such/cert.pem".into()),
+            tls_key: Some("/no/such/key.pem".into()),
+            ..Config::default()
+        };
+        let error = config.tls(addr).expect_err("missing cert");
+        assert!(error.to_string().contains("invalid TLS certificate/key"));
     }
 }

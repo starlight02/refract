@@ -72,6 +72,8 @@ struct Inner {
     admin_guard: crate::auth::AdminGuard,
     transport_crypto: crate::crypto::TransportCrypto,
     session_secret: [u8; 32],
+    /// 启用 HTTP/3 时的监听端口（0 = 不发 Alt-Svc）。启动后写入一次。
+    alt_svc_port: std::sync::atomic::AtomicU16,
 }
 
 /// 由限制值构造并发信号量。0 = 不限（None）。
@@ -178,6 +180,7 @@ impl AppState {
                     use rand::RngExt as _;
                     rand::rng().random()
                 },
+                alt_svc_port: std::sync::atomic::AtomicU16::new(0),
             }),
         };
         crate::notify::spawn_event_worker(state.clone(), receiver);
@@ -187,6 +190,19 @@ impl AppState {
     /// 传输层端到端加密管理器。
     pub fn transport_crypto(&self) -> &crate::crypto::TransportCrypto {
         &self.inner.transport_crypto
+    }
+    /// 启用 HTTP/3 时写入端口；0 表示不发 Alt-Svc。
+    pub fn set_alt_svc_port(&self, port: u16) {
+        self.inner
+            .alt_svc_port
+            .store(port, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 当前 Alt-Svc 目标端口。0 = 未启用 HTTP/3。
+    pub fn alt_svc_port(&self) -> u16 {
+        self.inner
+            .alt_svc_port
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 会话签名密钥。

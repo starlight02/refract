@@ -266,6 +266,9 @@ permit 持有到整个会话结束，连接时长和异常状态写入统一请�
 Realtime 事件是有状态会话协议，不进入对话 IR，也不做跨协议转换。地址由同一
 Chat 端点的 `{base}{prefix}` 推导为 `/realtime`；完整地址只接受明确的
 `/chat/completions` 或 `/realtime` 后缀，模型别名通过 URL query builder 编码。
+Realtime 入口只走 HTTP/1.1（明文）或 HTTPS 的 Upgrade。xitca 的 HTTP/2 栈支持
+RFC 8441 extended CONNECT，但 WebSocket 桥接不在 h2/h3 上传输；h3 dispatcher
+明确禁止 upgrade/expect 服务。
 
 ## 5. Crate 划分
 
