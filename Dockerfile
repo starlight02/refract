@@ -10,7 +10,7 @@ ARG ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 ARG admin_src=admin-builder
 ARG bin_src=rust-builder
 
-FROM node:24.19-alpine AS admin-builder
+FROM node:24.20-alpine AS admin-builder
 ARG NPM_REGISTRY
 WORKDIR /build
 RUN npm install -g pnpm@12 --registry="$NPM_REGISTRY" && \
