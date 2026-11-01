@@ -14,7 +14,7 @@ updateNotifier: false
 
 catalog:
   vite: npm:@voidzero-dev/vite-plus-core@~0.2.9
-  vite-plus: ~0.2.9
+  vite-plus: ~0.3.3
 
 overrides:
   '@vue/compat': ~3.6.0-rc.3
